@@ -1,3 +1,30 @@
+[package]
+name = "szmcp"
+version = "0.1.0"
+edition = "2021"
+description = "Sultan's ZIM MCP - an MCP server that serves content from ZIM files"
+
 [workspace]
 members = ["xapian2"]
 resolver = "2"
+
+[dependencies]
+clap = { version = "4.4", features = ["derive"] }
+rmcp = { version = "1.7.0", features = ["server", "schemars", "transport-streamable-http-server"] }
+tokio = { version = "1.35", features = ["full"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+thiserror = "2.0"
+schemars = "1.0"
+tracing = "0.1"
+tracing-subscriber = "0.3"
+axum = "0.7"
+tower-http = { version = "0.5", features = ["cors"] }
+xapian2 = { path = "xapian2" }
+memmap2 = "0.9"
+zstd = "0.13"
+xz2 = "0.1"
+base64 = "0.22"
+
+[dev-dependencies]
+tempfile = "3"
