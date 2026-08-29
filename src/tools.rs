@@ -133,11 +133,18 @@ pub struct SearchHit {
     pub intro: String,
 }
 
+/// The search result set (best matches first).
+#[derive(Serialize, JsonSchema)]
+pub struct SearchResults {
+    /// The search results
+    pub results: Vec<SearchHit>,
+}
+
 pub struct ZimSearchTool;
 
 impl ToolBase for ZimSearchTool {
     type Parameter = ZimSearchParams;
-    type Output = Vec<SearchHit>;
+    type Output = SearchResults;
     type Error = ToolError;
 
     fn name() -> Cow<'static, str> {
@@ -145,10 +152,10 @@ impl ToolBase for ZimSearchTool {
     }
     fn description() -> Option<Cow<'static, str>> {
         Some(
-            "Full-text search through all articles in all ZIM files. Returns a JSON array of \
-             results (best matches first), each with the ZIM file name, the article path \
-             inside the ZIM file, the page title, and a short intro. Use the returned ZIM name \
-             and path with the zim_get and zim_get_section tools."
+            "Full-text search through all articles in all ZIM files. Returns an object with a \
+             \"results\" array (best matches first); each result has the ZIM file name, the \
+             article path inside the ZIM file, the page title, and a short intro. Use the \
+             returned ZIM name and path with the zim_get and zim_get_section tools."
                 .into(),
         )
     }
@@ -160,7 +167,7 @@ impl SyncTool<ZimMcpServer> for ZimSearchTool {
     }
 }
 
-fn search_impl(library: &ZimLibrary, query: &str) -> Result<Vec<SearchHit>, ToolError> {
+fn search_impl(library: &ZimLibrary, query: &str) -> Result<SearchResults, ToolError> {
     if query.trim().is_empty() {
         return Err(ToolError::InvalidArgument("query must not be empty".into()));
     }
@@ -218,7 +225,7 @@ fn search_impl(library: &ZimLibrary, query: &str) -> Result<Vec<SearchHit>, Tool
         };
         hits.push(SearchHit { zim: arc.name.clone(), path, title, intro });
     }
-    Ok(hits)
+    Ok(SearchResults { results: hits })
 }
 
 // ---------------------------------------------------------------------------
@@ -297,7 +304,7 @@ mod tests {
             serde_json::json!({ "query": "apple" }),
         )
         .unwrap();
-        let hits = ZimSearchTool::invoke(&server, params).unwrap();
+        let hits = ZimSearchTool::invoke(&server, params).unwrap().results;
         assert!(!hits.is_empty(), "search must return hits");
         let first = &hits[0];
         assert_eq!(first.zim, "test.zim");
@@ -310,7 +317,7 @@ mod tests {
             serde_json::json!({ "query": "computing" }),
         )
         .unwrap();
-        let hits = ZimSearchTool::invoke(&server, params).unwrap();
+        let hits = ZimSearchTool::invoke(&server, params).unwrap().results;
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].path, "C/Apple");
 
@@ -319,7 +326,7 @@ mod tests {
             serde_json::json!({ "query": "zzzzz" }),
         )
         .unwrap();
-        let hits = ZimSearchTool::invoke(&server, params).unwrap();
+        let hits = ZimSearchTool::invoke(&server, params).unwrap().results;
         assert!(hits.is_empty());
 
         // OR semantics: two terms from different articles.
@@ -327,7 +334,7 @@ mod tests {
             serde_json::json!({ "query": "banana apple" }),
         )
         .unwrap();
-        let hits = ZimSearchTool::invoke(&server, params).unwrap();
+        let hits = ZimSearchTool::invoke(&server, params).unwrap().results;
         assert_eq!(hits.len(), 2);
     }
 
