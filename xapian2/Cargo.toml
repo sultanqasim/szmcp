@@ -1,0 +1,12 @@
+[package]
+name = "xapian2"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.70"
+license = "MIT"
+description = "Minimal, hand-written Rust bindings for the Xapian 2.x search engine (read-only search focus, ZIM-friendly)"
+
+[dependencies]
+
+[build-dependencies]
+cc = "1"
