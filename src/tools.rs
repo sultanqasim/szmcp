@@ -81,6 +81,19 @@ impl ServerHandler for ZimMcpServer {
     }
 }
 
+/// Map a "article not found" I/O error to a proper MCP invalid-params error.
+fn not_found_if_missing(
+    result: std::result::Result<crate::zim::Article, std::io::Error>,
+) -> Result<crate::zim::Article, ToolError> {
+    result.map_err(|e| {
+        if e.kind() == std::io::ErrorKind::NotFound {
+            ToolError::NotFound(e.to_string())
+        } else {
+            ToolError::Io(e)
+        }
+    })
+}
+
 /// Find the archive with the given name (relative to the ZIM directory).
 fn find_archive(library: &ZimLibrary, name: &str) -> Result<Arc<Archive>, ToolError> {
     let wanted = name.trim().trim_start_matches("./");
@@ -209,6 +222,199 @@ fn search_impl(library: &ZimLibrary, query: &str) -> Result<Vec<SearchHit>, Tool
 }
 
 // ---------------------------------------------------------------------------
+// Tests: end-to-end over a synthetic archive carrying a real Xapian index
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::zim::testutil::{build_archive, TestEntry};
+    use xapian2::{Document, WritableDatabase};
+
+    const APPLE_HTML: &str = "<html><head><title>Apple</title></head><body>\
+        <h1>Apple</h1>\
+        <p>An <b>apple</b> is the fruit of &lt;rosaceae&gt; trees.</p>\
+        <h2 id=\"History\">History</h2>\
+        <p>Apples have been cultivated for 10,000 years.</p>\
+        <h3>Domestication</h3><p>Wild apples grew in Kazakhstan.</p>\
+        <h2 id=\"Computers\">Computers</h2>\
+        <p>Computing devices also go by that name.</p>\
+        </body></html>";
+
+    const BANANA_HTML: &str = "<html><body><h1>Banana</h1>\
+        <h2 id=\"Growth\">Growth</h2>\
+        <p>Banana trees are actually tall herbaceous plants.</p>\
+        </body></html>";
+
+    /// Build a single-file glass Xapian index, the way openZIM does: the
+    /// document data is the article's full path inside the archive.
+    fn make_index() -> Vec<u8> {
+        let dir = tempfile::tempdir().unwrap();
+        let db_dir = dir.path().join("db");
+        {
+            let mut wdb = WritableDatabase::create(&db_dir).unwrap();
+            let docs = [
+                // "comput" is the Porter2 stem of "computing" - exercises the
+                // query-side stemmer.
+                ("C/Apple", "apple histori 10 000 year domest wild kazakhstan comput devic nam".to_string()),
+                ("C/Banana", "banana banan tree tall herbaceou plant growth".to_string()),
+            ];
+            for (path, terms) in docs {
+                let mut doc = Document::new().unwrap();
+                doc.set_data(path).unwrap();
+                for t in terms.split_whitespace() {
+                    doc.add_term(t, 1).unwrap();
+                }
+                wdb.add_document(&doc).unwrap();
+            }
+            wdb.commit().unwrap();
+        }
+        let single = dir.path().join("single.xdb");
+        let db = xapian2::Database::open(&db_dir).unwrap();
+        db.compact_single_file(&single).unwrap();
+        std::fs::read(&single).unwrap()
+    }
+
+    fn test_server() -> (ZimMcpServer, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        let index = make_index();
+        let content = [
+            TestEntry { namespace: b'C', url: "Apple", title: "Apple", mime: 0, body: APPLE_HTML.as_bytes() },
+            TestEntry { namespace: b'C', url: "Banana", title: "Banana", mime: 0, body: BANANA_HTML.as_bytes() },
+        ];
+        let bytes = build_archive(&["text/html"], &content, &[], 0, Some(&index));
+        std::fs::write(dir.path().join("test.zim"), &bytes).unwrap();
+        let library = Arc::new(ZimLibrary::scan(dir.path()).unwrap());
+        assert!(library.archives[0].searchable());
+        (ZimMcpServer::new(library), dir)
+    }
+
+    #[test]
+    fn e2e_search() {
+        let (server, _keep) = test_server();
+
+        let params = serde_json::from_value::<ZimSearchParams>(
+            serde_json::json!({ "query": "apple" }),
+        )
+        .unwrap();
+        let hits = ZimSearchTool::invoke(&server, params).unwrap();
+        assert!(!hits.is_empty(), "search must return hits");
+        let first = &hits[0];
+        assert_eq!(first.zim, "test.zim");
+        assert_eq!(first.path, "C/Apple");
+        assert_eq!(first.title, "Apple");
+        assert!(first.intro.contains("apple is the fruit of"), "{:?}", first.intro);
+
+        // Stemmed query ("computing" -> "comput").
+        let params = serde_json::from_value::<ZimSearchParams>(
+            serde_json::json!({ "query": "computing" }),
+        )
+        .unwrap();
+        let hits = ZimSearchTool::invoke(&server, params).unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].path, "C/Apple");
+
+        // Unrelated term: no hits.
+        let params = serde_json::from_value::<ZimSearchParams>(
+            serde_json::json!({ "query": "zzzzz" }),
+        )
+        .unwrap();
+        let hits = ZimSearchTool::invoke(&server, params).unwrap();
+        assert!(hits.is_empty());
+
+        // OR semantics: two terms from different articles.
+        let params = serde_json::from_value::<ZimSearchParams>(
+            serde_json::json!({ "query": "banana apple" }),
+        )
+        .unwrap();
+        let hits = ZimSearchTool::invoke(&server, params).unwrap();
+        assert_eq!(hits.len(), 2);
+    }
+
+    #[test]
+    fn e2e_search_empty_query_is_invalid() {
+        let (server, _keep) = test_server();
+        let params = ZimSearchParams { query: "   ".into() };
+        assert!(matches!(
+            ZimSearchTool::invoke(&server, params),
+            Err(ToolError::InvalidArgument(_))
+        ));
+    }
+
+    #[test]
+    fn e2e_get() {
+        let (server, _keep) = test_server();
+
+        let params = serde_json::from_value::<ZimGetParams>(
+            serde_json::json!({ "zim": "test.zim", "path": "C/Apple" }),
+        )
+        .unwrap();
+        let result = ZimGetTool::invoke(&server, params).unwrap();
+        assert_eq!(result.title, "Apple");
+        assert_eq!(result.path, "C/Apple");
+        assert_eq!(result.mime_type.as_deref(), Some("text/html"));
+        assert_eq!(result.content_encoding, "utf-8");
+        assert!(result.content.contains("10,000 years"));
+
+        // Bare path also works.
+        let params = serde_json::from_value::<ZimGetParams>(
+            serde_json::json!({ "zim": "test.zim", "path": "Banana" }),
+        )
+        .unwrap();
+        let result = ZimGetTool::invoke(&server, params).unwrap();
+        assert!(result.content.contains("herbaceous plants"));
+
+        // Unknown article / unknown archive.
+        let params = serde_json::from_value::<ZimGetParams>(
+            serde_json::json!({ "zim": "test.zim", "path": "Nope" }),
+        )
+        .unwrap();
+        assert!(matches!(ZimGetTool::invoke(&server, params), Err(ToolError::NotFound(_))));
+        let params = serde_json::from_value::<ZimGetParams>(
+            serde_json::json!({ "zim": "other.zim", "path": "Apple" }),
+        )
+        .unwrap();
+        assert!(matches!(ZimGetTool::invoke(&server, params), Err(ToolError::NotFound(_))));
+    }
+
+    #[test]
+    fn e2e_get_section() {
+        let (server, _keep) = test_server();
+
+        let params = serde_json::from_value::<ZimGetSectionParams>(
+            serde_json::json!({ "zim": "test.zim", "path": "Apple", "section": "History" }),
+        )
+        .unwrap();
+        let result = ZimGetSectionTool::invoke(&server, params).unwrap();
+        assert_eq!(result.title, "Apple");
+        assert_eq!(result.section, "History");
+        assert!(result.content.contains("10,000 years"), "{:?}", result.content);
+        // Includes the subsection, stops at the next h2.
+        assert!(result.content.contains("Kazakhstan"));
+        assert!(!result.content.contains("Computing devices"));
+
+        // Case-insensitive name match; the actual heading text is reported.
+        let params = serde_json::from_value::<ZimGetSectionParams>(
+            serde_json::json!({ "zim": "test.zim", "path": "Banana", "section": "growth" }),
+        )
+        .unwrap();
+        let result = ZimGetSectionTool::invoke(&server, params).unwrap();
+        assert_eq!(result.section, "Growth");
+        assert!(result.content.contains("herbaceous plants"));
+
+        // Missing section.
+        let params = serde_json::from_value::<ZimGetSectionParams>(
+            serde_json::json!({ "zim": "test.zim", "path": "Banana", "section": "Nope" }),
+        )
+        .unwrap();
+        assert!(matches!(
+            ZimGetSectionTool::invoke(&server, params),
+            Err(ToolError::SectionNotFound(_))
+        ));
+    }
+}
+
+// ---------------------------------------------------------------------------
 // zim_get
 // ---------------------------------------------------------------------------
 
@@ -259,7 +465,7 @@ impl ToolBase for ZimGetTool {
 impl SyncTool<ZimMcpServer> for ZimGetTool {
     fn invoke(server: &ZimMcpServer, params: Self::Parameter) -> Result<Self::Output, Self::Error> {
         let arc = find_archive(&server.library, &params.zim)?;
-        let article = arc.get_article(&params.path)?;
+        let article = not_found_if_missing(arc.get_article(&params.path))?;
         let (content, encoding) = match std::str::from_utf8(&article.bytes) {
             Ok(text) => (text.to_string(), "utf-8"),
             Err(_) => (
@@ -324,7 +530,7 @@ impl ToolBase for ZimGetSectionTool {
 impl SyncTool<ZimMcpServer> for ZimGetSectionTool {
     fn invoke(server: &ZimMcpServer, params: Self::Parameter) -> Result<Self::Output, Self::Error> {
         let arc = find_archive(&server.library, &params.zim)?;
-        let article = arc.get_article(&params.path)?;
+        let article = not_found_if_missing(arc.get_article(&params.path))?;
         let text = std::str::from_utf8(&article.bytes).map_err(|_| {
             ToolError::Internal(format!(
                 "article content of {} is not UTF-8 text; section extraction requires text",

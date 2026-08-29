@@ -722,25 +722,25 @@ fn scan_dir(dir: &Path, root: &Path, out: &mut Vec<String>) -> io::Result<()> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod testutil {
+    //! Synthetic ZIM archive builder for tests (adapted from zxr).
+
     use super::*;
     use std::io::Write;
 
-    // --- Synthetic archive builder (adapted from zxr) ----------------------
-
-    struct TestEntry {
-        namespace: u8,
-        url: &'static str,
-        title: &'static str,
-        mime: u16,
-        body: &'static [u8],
+    pub struct TestEntry {
+        pub namespace: u8,
+        pub url: &'static str,
+        pub title: &'static str,
+        pub mime: u16,
+        pub body: &'static [u8],
     }
 
-    struct TestRedirect {
-        namespace: u8,
-        url: &'static str,
-        title: &'static str,
-        target_content: usize,
+    pub struct TestRedirect {
+        pub namespace: u8,
+        pub url: &'static str,
+        pub title: &'static str,
+        pub target_content: usize,
     }
 
     fn push_zstring(buf: &mut Vec<u8>, s: &str) {
@@ -759,15 +759,19 @@ mod tests {
         c
     }
 
-    /// Assemble a complete in-memory ZIM.
-    fn build_archive(
+    /// Assemble a complete in-memory ZIM. `index`, when given, is stored as
+    /// an uncompressed `X/fulltext/xapian` content entry (a single-blob
+    /// cluster), like a real archive's embedded Xapian full-text index.
+    pub fn build_archive(
         mime_types: &[&str],
         content: &[TestEntry],
         redirects: &[TestRedirect],
         main_page_content: usize,
+        index: Option<&[u8]>,
     ) -> Vec<u8> {
-        let entry_count = (content.len() + redirects.len()) as u32;
-        let cluster_count = content.len() as u32;
+        let has_index = index.is_some();
+        let entry_count = (content.len() + redirects.len() + has_index as usize) as u32;
+        let cluster_count = (content.len() + has_index as usize) as u32;
 
         let mut mime_blob = Vec::new();
         for m in mime_types {
@@ -778,6 +782,7 @@ mod tests {
         enum Logical<'a> {
             Content { e: &'a TestEntry, cluster: u32 },
             Redirect { r: &'a TestRedirect },
+            Index { bytes: &'a [u8], cluster: u32 },
         }
         let mut logical: Vec<(u8, &str, Logical)> = Vec::new();
         for (ci, e) in content.iter().enumerate() {
@@ -785,6 +790,13 @@ mod tests {
         }
         for r in redirects {
             logical.push((r.namespace, r.url, Logical::Redirect { r }));
+        }
+        if let Some(ix) = index {
+            logical.push((
+                b'X',
+                "fulltext/xapian",
+                Logical::Index { bytes: ix, cluster: content.len() as u32 },
+            ));
         }
         logical.sort_by(|a, b| (a.0, a.1).cmp(&(b.0, b.1)));
 
@@ -820,11 +832,25 @@ mod tests {
                     push_zstring(&mut b, r.url);
                     push_zstring(&mut b, r.title);
                 }
+                Logical::Index { bytes, cluster } => {
+                    b.extend_from_slice(&0u16.to_le_bytes());
+                    b.push(0);
+                    b.push(*ns);
+                    b.extend_from_slice(&0u32.to_le_bytes());
+                    b.extend_from_slice(&cluster.to_le_bytes());
+                    b.extend_from_slice(&0u32.to_le_bytes());
+                    push_zstring(&mut b, "fulltext/xapian");
+                    push_zstring(&mut b, "Xapian index");
+                    let _ = bytes;
+                }
             }
             entry_bodies.push(b);
         }
 
-        let clusters: Vec<Vec<u8>> = content.iter().map(|e| build_cluster(e.body)).collect();
+        let mut clusters: Vec<Vec<u8>> = content.iter().map(|e| build_cluster(e.body)).collect();
+        if let Some(ix) = index {
+            clusters.push(build_cluster(ix));
+        }
 
         let mime_pos = 80u64;
         let url_ptr_pos = mime_pos + mime_blob.len() as u64;
@@ -924,7 +950,7 @@ mod tests {
             title: "Apple (fruit)",
             target_content: 0,
         }];
-        let bytes = build_archive(&["text/html", "text/css"], &content, &redirects, 0);
+        let bytes = build_archive(&["text/html", "text/css"], &content, &redirects, 0, None);
         let (z, f) = open_bytes(&bytes);
         (Archive::new("sample.zim".to_string(), z), f)
     }
@@ -989,7 +1015,7 @@ mod tests {
             mime: 0,
             body: b"<p>hello old world</p>",
         }];
-        let bytes = build_archive(&["text/html"], &content, &[], 0);
+        let bytes = build_archive(&["text/html"], &content, &[], 0, None);
         let (z, _f) = open_bytes(&bytes);
         let a = Archive::new("old.zim".to_string(), z);
         let art = a.get_article("index.html").unwrap();
