@@ -144,7 +144,9 @@ pub(crate) fn normalize(s: &str) -> String {
 
 /// Find all `<h1>`..`<h6>` headings and the text range each one governs
 /// (up to the next heading of the same or higher prominence, else end of
-/// document).
+/// document). The range starts after the heading's own `</hN>` and ends
+/// before the next heading's markup, so it never spills heading tags into
+/// the section content.
 fn collect_headings(html: &str) -> Vec<Heading> {
     let bytes = html.as_bytes();
     let mut out = Vec::new();
@@ -185,17 +187,20 @@ fn collect_headings(html: &str) -> Vec<Heading> {
             level,
             name_norm: normalize(&name),
             name,
+            start: lt,
             content_start,
             content_end: html.len(),
         });
         i = content_start;
     }
     // Each heading governs up to the next heading of the same or higher
-    // prominence (smaller or equal level number).
+    // prominence (smaller or equal level number). End the range at that
+    // heading's own start (its `<hN>` tag), not at its content, so the
+    // next section's heading markup stays out of this section's content.
     for i in 0..out.len() {
         for j in (i + 1)..out.len() {
             if out[j].level <= out[i].level {
-                out[i].content_end = out[j].content_start;
+                out[i].content_end = out[j].start;
                 break;
             }
         }
@@ -207,8 +212,30 @@ struct Heading {
     level: u8,
     name_norm: String,
     name: String,
+    /// Offset of the heading tag's opening `<`.
+    start: usize,
     content_start: usize,
     content_end: usize,
+}
+
+/// Trim trailing markup that belongs to what follows the section, e.g. the
+/// `<div class="mw-heading">` wrapper MediaWiki opens right before the next
+/// `<h2>`. Leaves closing tags (a normal section ends with `</p>` or `</ul>`)
+/// in place.
+fn trim_trailing_open_tag(s: &str) -> &str {
+    let mut s = s.trim_end();
+    while let Some(lt) = s.rfind('<') {
+        let tail = &s[lt..];
+        let single_tag = tail.len() > 1
+            && tail[1..].ends_with('>')
+            && !tail[1..].contains('<');
+        if single_tag && tail.as_bytes()[1].is_ascii_alphabetic() {
+            s = s[..lt].trim_end();
+        } else {
+            break;
+        }
+    }
+    s
 }
 
 /// Find the content of the named section in an HTML document.
@@ -230,7 +257,8 @@ pub fn section_content(html: &str, name: &str) -> Option<(String, String)> {
         .filter(|(_, h)| h.name_norm == target)
         .min_by_key(|(i, h)| (h.level, *i))?;
     let h = best.1;
-    Some((h.name.clone(), html[h.content_start..h.content_end].trim().to_string()))
+    let content = trim_trailing_open_tag(&html[h.content_start..h.content_end]);
+    Some((h.name.clone(), content.trim_start().to_string()))
 }
 
 #[cfg(test)]
@@ -240,10 +268,10 @@ mod tests {
     const WIKI: &str = "<html><head><title>Apple</title><style>p{}</style></head>\
         <body><script>var x=1;</script><h1>Apple</h1>\
         <p>An <b>apple</b> is the fruit of &lt;rosaceae&gt; trees.</p>\
-        <h2 id=\"History\">History</h2>\
+        <div class=\"mw-heading mw-heading2\"><h2 id=\"History\">History</h2></div>\
         <p>Apples have been grown for 10,000 years.</p>\
-        <h3>Domestication</h3><p>Wild apples grew in Kazakhstan.</p>\
-        <h2 id=\"Uses\">Uses</h2><p>Eaten fresh, cooked, or pressed into juice.</p>\
+        <div class=\"mw-heading mw-heading3\"><h3>Domestication</h3></div><p>Wild apples grew in Kazakhstan.</p>\
+        <div class=\"mw-heading mw-heading2\"><h2 id=\"Uses\">Uses</h2></div><p>Eaten fresh, cooked, or pressed into juice.</p>\
         </body></html>";
 
     #[test]
@@ -268,6 +296,11 @@ mod tests {
         // Includes the h3 subsection, stops at the next h2.
         assert!(hist.contains("Kazakhstan"), "{hist:?}");
         assert!(!hist.contains("pressed into juice"), "{hist:?}");
+        // The next section's heading markup (including its mw-heading
+        // wrapper div) stays out of the content.
+        assert!(!hist.contains("<h2"), "{hist:?}");
+        assert!(!hist.contains("Uses"), "{hist:?}");
+        assert!(!hist.contains("mw-heading2"), "{hist:?}");
 
         let (uses_name, uses) = section_content(WIKI, "uses").unwrap();
         assert_eq!(uses_name, "Uses");
@@ -279,6 +312,7 @@ mod tests {
         assert_eq!(dom_name, "Domestication");
         assert!(dom.contains("Kazakhstan"), "{dom:?}");
         assert!(!dom.contains("10,000 years"), "{dom:?}");
+        assert!(dom.ends_with("</p>"), "{dom:?}");
 
         assert!(section_content(WIKI, "Nope").is_none());
         assert!(section_content(WIKI, "").is_none());
