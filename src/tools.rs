@@ -14,7 +14,7 @@ use serde::{Deserialize, Serialize};
 use std::borrow::Cow;
 use std::sync::Arc;
 use thiserror::Error;
-use xapian2::{Enquire, Operator, QueryParser};
+use xapian2::{Enquire, Operator, QueryParser, StemStrategy};
 
 /// Number of results `zim_search` returns in total (across all archives).
 const SEARCH_LIMIT: u32 = 20;
@@ -173,8 +173,12 @@ fn search_impl(library: &ZimLibrary, query: &str) -> Result<SearchResults, ToolE
     }
 
     let mut qp = QueryParser::new()?;
-    // openZIM indexes store Porter2/English stems; default combining op is OR.
+    // openZIM's full-text indexes contain unprefixed Porter2/English stems
+    // (libzim indexes with STEM_ALL), so queries must be stemmed the same
+    // way - Xapian's default strategy would turn lowercase terms into
+    // "Z"-prefixed stem terms that never match. Default combining op is OR.
     qp.set_stemmer("english")?;
+    qp.set_stemming_strategy(StemStrategy::All)?;
     qp.set_default_op(Operator::Or)?;
     let xquery = qp
         .parse_query(query)
@@ -261,10 +265,12 @@ mod tests {
         {
             let mut wdb = WritableDatabase::create(&db_dir).unwrap();
             let docs = [
-                // "comput" is the Porter2 stem of "computing" - exercises the
-                // query-side stemmer.
-                ("C/Apple", "apple histori 10 000 year domest wild kazakhstan comput devic nam".to_string()),
-                ("C/Banana", "banana banan tree tall herbaceou plant growth".to_string()),
+                // Terms are unprefixed Porter2 stems, exactly as libzim
+                // indexes openZIM full-text indexes with STEM_ALL: "appl" is
+                // the stem of "apple", "comput" of "computing" - both exercise
+                // the query-side stemmer.
+                ("C/Apple", "appl histori 10 000 year domest wild kazakhstan comput devic nam".to_string()),
+                ("C/Banana", "banana tree tall herbaceou plant growth".to_string()),
             ];
             for (path, terms) in docs {
                 let mut doc = Document::new().unwrap();

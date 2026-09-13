@@ -296,6 +296,17 @@ int xapian2_qp_set_stemmer(Xapian::QueryParser *qp, const char *language) {
     return -1;
 }
 
+int xapian2_qp_set_stemming_strategy(Xapian::QueryParser *qp, int strategy) {
+    try {
+        qp->set_stemming_strategy(
+            static_cast<Xapian::QueryParser::stem_strategy>(strategy));
+        return 0;
+    } catch (const Xapian::Error &e) {
+        g_error = describe(e);
+    }
+    return -1;
+}
+
 int xapian2_qp_set_database(Xapian::QueryParser *qp, const Xapian::Database *db) {
     try {
         qp->set_database(*db);

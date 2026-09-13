@@ -104,6 +104,7 @@ mod ffi {
         pub fn xapian2_qp_add_prefix(qp: *mut c_void, field: *const c_char, prefix: *const c_char) -> c_int;
         pub fn xapian2_qp_add_boolean_prefix(qp: *mut c_void, field: *const c_char, prefix: *const c_char) -> c_int;
         pub fn xapian2_qp_set_stemmer(qp: *mut c_void, language: *const c_char) -> c_int;
+        pub fn xapian2_qp_set_stemming_strategy(qp: *mut c_void, strategy: c_int) -> c_int;
         pub fn xapian2_qp_set_database(qp: *mut c_void, db: *mut c_void) -> c_int;
         pub fn xapian2_qp_parse_query(
             qp: *mut c_void,
@@ -308,6 +309,26 @@ pub mod parse_flags {
     pub const FLAG_AUTO_SYNONYMS: u32 = 512;
     /// Xapian 2.x default: phrases, booleans and love/hate.
     pub const FLAG_DEFAULT: u32 = FLAG_PHRASE | FLAG_BOOLEAN | FLAG_LOVEHATE;
+}
+
+/// How the [`QueryParser`] stems query terms, matching
+/// `Xapian::QueryParser::stem_strategy`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(i32)]
+pub enum StemStrategy {
+    /// Don't stem query terms.
+    None = 0,
+    /// Xapian's default: stem lowercase terms to `Z`-prefixed stems, leave
+    /// capitalized terms unstemmed.
+    Some = 1,
+    /// Stem all terms to *unprefixed* stems.
+    ///
+    /// This is how libzim builds the full-text indexes embedded in openZIM
+    /// archives (a TermGenerator with `STEM_ALL`), so queries against those
+    /// indexes must be parsed with this strategy too.
+    All = 2,
+    /// Stem all terms to `Z`-prefixed stems.
+    AllZ = 3,
 }
 
 // ---------------------------------------------------------------------------
@@ -713,6 +734,15 @@ impl QueryParser {
         let lang = cstr(language)?;
         // SAFETY: see add_prefix.
         let status = unsafe { ffi::xapian2_qp_set_stemmer(self.handle(), lang.as_ptr()) };
+        Error::from_status(status)
+    }
+
+    /// Set how query terms are stemmed (default: [`StemStrategy::Some`]).
+    pub fn set_stemming_strategy(&mut self, strategy: StemStrategy) -> Result<()> {
+        // SAFETY: the handle is valid for the lifetime of the call.
+        let status = unsafe {
+            ffi::xapian2_qp_set_stemming_strategy(self.handle(), strategy as c_int)
+        };
         Error::from_status(status)
     }
 
