@@ -218,6 +218,39 @@ struct Heading {
     content_end: usize,
 }
 
+/// Remove `<style>`/`<script>` elements (including their contents) from an
+/// HTML fragment. Wikipedia sections open with TemplateStyles CSS blocks
+/// that are not part of the visible section text.
+pub(crate) fn strip_style_script(html: &str) -> String {
+    let mut out = String::new();
+    let mut rest = html;
+    while let Some(lt) = rest.find('<') {
+        out.push_str(&rest[..lt]);
+        let after = &rest[lt + 1..];
+        let name_end = after
+            .find(|c: char| !c.is_ascii_alphanumeric())
+            .unwrap_or(after.len());
+        let name = after[..name_end].to_ascii_lowercase();
+        let opens_element = !after.starts_with('/') && !after.starts_with('!');
+        if opens_element && matches!(name.as_str(), "style" | "script") {
+            // Skip to the matching close tag, or drop the rest if unclosed.
+            let close = format!("</{}", name);
+            match find_ci(after.as_bytes(), name_end, close.as_bytes()) {
+                Some(cp) => {
+                    let end = after[cp..].find('>').map_or(after.len(), |g| cp + g + 1);
+                    rest = &after[end..];
+                }
+                None => return out,
+            }
+        } else {
+            out.push('<');
+            rest = after;
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
 /// Trim trailing markup that belongs to what follows the section, e.g. the
 /// `<div class="mw-heading">` wrapper MediaWiki opens right before the next
 /// `<h2>`. Leaves closing tags (a normal section ends with `</p>` or `</ul>`)
@@ -257,8 +290,9 @@ pub fn section_content(html: &str, name: &str) -> Option<(String, String)> {
         .filter(|(_, h)| h.name_norm == target)
         .min_by_key(|(i, h)| (h.level, *i))?;
     let h = best.1;
-    let content = trim_trailing_open_tag(&html[h.content_start..h.content_end]);
-    Some((h.name.clone(), content.trim_start().to_string()))
+    let content = strip_style_script(&html[h.content_start..h.content_end]);
+    let content = trim_trailing_open_tag(&content);
+    Some((h.name.clone(), content.trim().to_string()))
 }
 
 #[cfg(test)]
@@ -271,7 +305,9 @@ mod tests {
         <div class=\"mw-heading mw-heading2\"><h2 id=\"History\">History</h2></div>\
         <p>Apples have been grown for 10,000 years.</p>\
         <div class=\"mw-heading mw-heading3\"><h3>Domestication</h3></div><p>Wild apples grew in Kazakhstan.</p>\
-        <div class=\"mw-heading mw-heading2\"><h2 id=\"Uses\">Uses</h2></div><p>Eaten fresh, cooked, or pressed into juice.</p>\
+        <div class=\"mw-heading mw-heading2\"><h2 id=\"Uses\">Uses</h2></div>\
+        <style data-mw-deduplicate=\"x\">.portalbox{padding:0}</style>\
+        <p>Eaten fresh, cooked, or pressed into juice.</p>\
         </body></html>";
 
     #[test]
@@ -306,6 +342,9 @@ mod tests {
         assert_eq!(uses_name, "Uses");
         assert!(uses.contains("juice"), "{uses:?}");
         assert!(!uses.contains("Kazakhstan"), "{uses:?}");
+        // TemplateStyles CSS blocks are not part of the visible section.
+        assert!(!uses.contains("portalbox"), "{uses:?}");
+        assert!(!uses.contains("<style"), "{uses:?}");
 
         // Subsection on its own.
         let (dom_name, dom) = section_content(WIKI, "Domestication").unwrap();
