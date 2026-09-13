@@ -610,18 +610,24 @@ impl Archive {
     }
 
     /// Resolve `path`, following redirects, reading at most `max_bytes` of
-    /// content (for lightweight previews such as search intros).
-    pub fn article_preview(&self, path: &str, max_bytes: u64) -> io::Result<Option<(String, Vec<u8>)>> {
+    /// content (for lightweight previews such as search intros). Returns the
+    /// raw entry title (may be empty - the caller applies fallbacks), the
+    /// MIME type, and the content prefix.
+    pub fn article_preview(
+        &self,
+        path: &str,
+        max_bytes: u64,
+    ) -> io::Result<Option<(String, Option<String>, Vec<u8>)>> {
         let Some(idx) = self.zim.resolve_path(path)? else {
             return Ok(None);
         };
         let entry = self.resolve_entry(idx)?;
-        let title = if entry.title.is_empty() { full_path(&entry) } else { entry.title.clone() };
+        let mime = self.zim.mime_type(entry.mime).map(String::from);
         let bytes = match entry.target {
             Target::Cluster(c, b) => self.zim.read_blob_prefix(c, b, max_bytes)?,
             _ => return Ok(None),
         };
-        Ok(Some((title, bytes)))
+        Ok(Some((entry.title, mime, bytes)))
     }
 
     /// Follow a redirect chain to the terminal entry (bounded).
@@ -1000,8 +1006,9 @@ pub(crate) mod testutil {
     #[test]
     fn preview_reads_only_prefix() {
         let (a, _f) = sample_archive();
-        let (title, bytes) = a.article_preview("Apple", 64).unwrap().unwrap();
+        let (title, mime, bytes) = a.article_preview("Apple", 64).unwrap().unwrap();
         assert_eq!(title, "Apple");
+        assert_eq!(mime.as_deref(), Some("text/html"));
         assert_eq!(bytes.len(), 64);
     }
 

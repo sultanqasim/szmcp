@@ -246,14 +246,23 @@ fn search_impl(library: &ZimLibrary, query: &str) -> Result<SearchResults, ToolE
     merged.truncate(SEARCH_LIMIT as usize);
 
     let mut hits = Vec::with_capacity(merged.len());
-    for (arc, path, _) in &merged {
-        let (title, intro) = match arc.article_preview(path, INTRO_READ_BYTES) {
-            Ok(Some((title, bytes))) => {
-                let text = String::from_utf8_lossy(&bytes);
-                (title, html::intro_from_html(&text, INTRO_CHARS))
-            }
-            _ => (String::new(), String::new()),
+    for (arc, path, idx_title) in &merged {
+        let (entry_title, bytes) = match arc.article_preview(path, INTRO_READ_BYTES) {
+            Ok(Some((entry_title, _mime, bytes))) => (entry_title, bytes),
+            _ => (String::new(), Vec::new()),
         };
+        // Prefer the entry's own title; many openZIM archives leave the
+        // directory-entry title empty and only carry the title in the
+        // index (which we already read as `idx_title`).
+        let title = if !entry_title.is_empty() {
+            entry_title
+        } else if !idx_title.is_empty() {
+            idx_title.clone()
+        } else {
+            path.clone()
+        };
+        let text = String::from_utf8_lossy(&bytes);
+        let intro = html::intro_from_html(&text, INTRO_CHARS);
         hits.push(SearchHit { zim: arc.name.clone(), path: path.clone(), title, intro });
     }
     Ok(SearchResults { results: hits })
@@ -288,18 +297,26 @@ mod tests {
         <p>A cherry is the fruit of trees of the genus <i>Prunus</i>.</p>\
         </body></html>";
 
+    const NITROGEN_HTML: &str = "<html><body><h1>Nitrogen</h1>\
+        <p>Nitrogen is a colorless, odorless gas.</p>\
+        </body></html>";
+
     /// Build a single-file glass Xapian index, the way openZIM does: the
-    /// document data is the article's full path inside the archive, and the
-    /// terms are unprefixed Porter2 stems, exactly as libzim indexes with
-    /// STEM_ALL ("appl" is the stem of "apple", "comput" of "computing").
-    fn make_index(docs: &[(&str, &str)]) -> Vec<u8> {
+    /// document data is the article's full path inside the archive, the
+    /// title sits in value slot 0, and the terms are unprefixed Porter2
+    /// stems, exactly as libzim indexes with STEM_ALL ("appl" is the stem
+    /// of "apple", "comput" of "computing").
+    fn make_index(docs: &[(&str, &str, &str)]) -> Vec<u8> {
         let dir = tempfile::tempdir().unwrap();
         let db_dir = dir.path().join("db");
         {
             let mut wdb = WritableDatabase::create(&db_dir).unwrap();
-            for (path, terms) in docs {
+            for (path, terms, title) in docs {
                 let mut doc = Document::new().unwrap();
                 doc.set_data(*path).unwrap();
+                if !title.is_empty() {
+                    doc.set_value(0, *title).unwrap();
+                }
                 for t in terms.split_whitespace() {
                     doc.add_term(t, 1).unwrap();
                 }
@@ -316,8 +333,8 @@ mod tests {
     fn test_server() -> (ZimMcpServer, tempfile::TempDir) {
         let dir = tempfile::tempdir().unwrap();
         let index = make_index(&[
-            ("C/Apple", "appl histori 10 000 year domest wild kazakhstan comput devic nam"),
-            ("C/Banana", "banana tree tall herbaceou plant growth"),
+            ("C/Apple", "appl histori 10 000 year domest wild kazakhstan comput devic nam", "Apple"),
+            ("C/Banana", "banana tree tall herbaceou plant growth", "Banana"),
         ]);
         let content = [
             TestEntry { namespace: b'C', url: "Apple", title: "Apple", mime: 0, body: APPLE_HTML.as_bytes() },
@@ -383,18 +400,44 @@ mod tests {
     }
 
     #[test]
+    fn e2e_search_title_falls_back_to_index_title() {
+        let dir = tempfile::tempdir().unwrap();
+        let index = make_index(&[
+            ("C/Nitrogen", "nitrogen gas inert", "Nitrogen"),
+            ("C/Banana", "banana tree tall herbaceou plant growth", "Banana"),
+        ]);
+        let content = [
+            // Empty directory-entry title, as in modern openZIM archives.
+            TestEntry { namespace: b'C', url: "Nitrogen", title: "", mime: 0, body: NITROGEN_HTML.as_bytes() },
+            TestEntry { namespace: b'C', url: "Banana", title: "Banana", mime: 0, body: BANANA_HTML.as_bytes() },
+        ];
+        let bytes = build_archive(&["text/html"], &content, &[], 0, Some(&index));
+        std::fs::write(dir.path().join("test.zim"), &bytes).unwrap();
+        let library = Arc::new(ZimLibrary::scan(dir.path()).unwrap());
+        let server = ZimMcpServer::new(library);
+
+        let params = serde_json::from_value::<ZimSearchParams>(
+            serde_json::json!({ "query": "nitrogen" }),
+        )
+        .unwrap();
+        let hits = ZimSearchTool::invoke(&server, params).unwrap().results;
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].title, "Nitrogen", "{hits:?}");
+    }
+
+    #[test]
     fn e2e_search_interleaves_archives_and_dedupes() {
         let dir = tempfile::tempdir().unwrap();
         // Two archives; both carry an "Apple" article (same article, as in an
         // HTML and a Markdown edition of the same ZIM), plus one exclusive
         // article each.
         let index_a = make_index(&[
-            ("C/Apple", "appl histori 10 000 year domest wild kazakhstan comput devic nam"),
-            ("C/Banana", "banana tree tall herbaceou plant growth"),
+            ("C/Apple", "appl histori 10 000 year domest wild kazakhstan comput devic nam", "Apple"),
+            ("C/Banana", "banana tree tall herbaceou plant growth", "Banana"),
         ]);
         let index_b = make_index(&[
-            ("C/Apple", "appl comput devic nam"),
-            ("C/Cherry", "cherri pie fruit tree"),
+            ("C/Apple", "appl comput devic nam", "Apple"),
+            ("C/Cherry", "cherri pie fruit tree", "Cherry"),
         ]);
         let content_a = [
             TestEntry { namespace: b'C', url: "Apple", title: "Apple", mime: 0, body: APPLE_HTML.as_bytes() },
