@@ -2,6 +2,7 @@
 //! ZIM tools (`zim_search`, `zim_get`, `zim_get_section`).
 
 use crate::html;
+use crate::markdown;
 use crate::zim::{Archive, ZimLibrary};
 use base64::Engine as _;
 use rmcp::handler::server::router::tool::{SyncTool, ToolBase, ToolRouter};
@@ -249,9 +250,9 @@ fn search_impl(library: &ZimLibrary, query: &str) -> Result<SearchResults, ToolE
 
     let mut hits = Vec::with_capacity(merged.len());
     for (arc, path, idx_title) in &merged {
-        let (entry_title, bytes) = match arc.article_preview(path, INTRO_READ_BYTES) {
-            Ok(Some((entry_title, _mime, bytes))) => (entry_title, bytes),
-            _ => (String::new(), Vec::new()),
+        let (entry_title, mime, bytes) = match arc.article_preview(path, INTRO_READ_BYTES) {
+            Ok(Some((entry_title, mime, bytes))) => (entry_title, mime, bytes),
+            _ => (String::new(), None, Vec::new()),
         };
         // Prefer the entry's own title; many openZIM archives leave the
         // directory-entry title empty and only carry the title in the
@@ -264,7 +265,13 @@ fn search_impl(library: &ZimLibrary, query: &str) -> Result<SearchResults, ToolE
             path.clone()
         };
         let text = String::from_utf8_lossy(&bytes);
-        let intro = html::intro_from_html(&text, INTRO_CHARS);
+        // Markdown editions carry plain Markdown, not HTML: pick the matching
+        // extractor so the intro is clean text, free of markup.
+        let intro = if mime.as_deref().is_some_and(|m| m.contains("markdown")) {
+            markdown::intro_from_markdown(&text, INTRO_CHARS)
+        } else {
+            html::intro_from_html(&text, INTRO_CHARS)
+        };
         hits.push(SearchHit { zim: arc.name.clone(), path: path.clone(), title, intro });
     }
     Ok(SearchResults { results: hits })
@@ -474,6 +481,86 @@ mod tests {
         assert_eq!(hits.len(), 2, "{hits:?}");
         assert_eq!((hits[0].zim.as_str(), hits[0].path.as_str()), ("a.zim", "C/Banana"));
         assert_eq!((hits[1].zim.as_str(), hits[1].path.as_str()), ("b.zim", "C/Cherry"));
+    }
+
+    /// An article in the shape wikizim_parser emits (`text/markdown`).
+    const ZINC_MD: &str = "\
+# Zinc
+
+*This article is about the element. For other uses, see [[Zinc (disambiguation)]].*
+
+**Zinc** is a [[Chemical element|chemical element]] with the symbol **Zn**.
+
+## History
+
+Zinc smelting is documented in ancient times.
+
+### India
+
+Ancient India smelted zinc early.
+";
+
+    #[test]
+    fn e2e_search_and_section_markdown() {
+        let dir = tempfile::tempdir().unwrap();
+        let index = make_index(&[("C/Zinc", "zinc chemic element symbol smelt ancient india", "Zinc")]);
+        let content = [TestEntry {
+            namespace: b'C',
+            url: "Zinc",
+            title: "Zinc",
+            mime: 0,
+            body: ZINC_MD.as_bytes(),
+        }];
+        let bytes = build_archive(&["text/markdown"], &content, &[], 0, Some(&index));
+        std::fs::write(dir.path().join("md.zim"), &bytes).unwrap();
+        let library = Arc::new(ZimLibrary::scan(dir.path()).unwrap());
+        assert!(library.archives[0].searchable());
+        let server = ZimMcpServer::new(library);
+
+        // Search: the intro is plain text derived from the Markdown, free of
+        // markup (title, hatnote, then the lead paragraph).
+        let params = serde_json::from_value::<ZimSearchParams>(
+            serde_json::json!({ "query": "zinc" }),
+        )
+        .unwrap();
+        let hits = ZimSearchTool::invoke(&server, params).unwrap().results;
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].zim, "md.zim");
+        assert_eq!(hits[0].path, "C/Zinc");
+        assert!(
+            hits[0].intro.starts_with(
+                "Zinc This article is about the element. For other uses, see Zinc (disambiguation). \
+                 Zinc is a chemical element with the symbol Zn."
+            ),
+            "{:?}",
+            hits[0].intro
+        );
+        assert!(
+            !hits[0].intro.contains("**") && !hits[0].intro.contains("[[") && !hits[0].intro.contains('#'),
+            "{:?}",
+            hits[0].intro
+        );
+
+        // Section extraction on the Markdown article: case-insensitive,
+        // includes the subsection, reports the heading as written.
+        let params = serde_json::from_value::<ZimGetSectionParams>(
+            serde_json::json!({ "zim": "md.zim", "path": "Zinc", "section": "history" }),
+        )
+        .unwrap();
+        let result = ZimGetSectionTool::invoke(&server, params).unwrap();
+        assert_eq!(result.section, "History");
+        assert!(result.content.contains("ancient times"), "{:?}", result.content);
+        assert!(result.content.contains("Ancient India smelted zinc early"));
+
+        // Missing section: same error shape as the HTML path.
+        let params = serde_json::from_value::<ZimGetSectionParams>(
+            serde_json::json!({ "zim": "md.zim", "path": "Zinc", "section": "Nope" }),
+        )
+        .unwrap();
+        assert!(matches!(
+            ZimGetSectionTool::invoke(&server, params),
+            Err(ToolError::SectionNotFound(_))
+        ));
     }
 
     #[test]
@@ -687,7 +774,7 @@ pub struct ZimGetSectionResult {
     pub title: String,
     /// The section name (heading) that was found
     pub section: String,
-    /// Content of the section (HTML)
+    /// Content of the section (HTML, or Markdown for Markdown articles)
     pub content: String,
 }
 
@@ -721,7 +808,14 @@ impl SyncTool<ZimMcpServer> for ZimGetSectionTool {
                 params.path
             ))
         })?;
-        match html::section_content(text, &params.section) {
+        // Markdown editions carry plain Markdown, not HTML: pick the matching
+        // extractor; anything without a Markdown MIME type takes the HTML path.
+        let found = if article.mime_type.as_deref().is_some_and(|m| m.contains("markdown")) {
+            markdown::section_content(text, &params.section)
+        } else {
+            html::section_content(text, &params.section)
+        };
+        match found {
             Some((section, content)) => Ok(ZimGetSectionResult {
                 title: article.title,
                 section,

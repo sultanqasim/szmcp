@@ -1,4 +1,5 @@
 mod html;
+mod markdown;
 mod tools;
 mod zim;
 

@@ -20,6 +20,14 @@ headers so it can be used from browsers.
   its heading text (e.g. `"History"`). Returns the page title, the section
   name, and the section content.
 
+## HTML and Markdown archives
+
+Both classic HTML Wikipedia ZIMs and Markdown ZIMs (as produced by
+`wikizim_parser`, articles with MIME type `text/markdown`) are supported.
+Search intros and section extraction use an HTML or a Markdown parser
+depending on the article's MIME type, so Markdown articles yield clean plain
+text intros and Markdown section content; everything else behaves the same.
+
 ## Build
 
 Requires a [Xapian 2.x](https://xapian.org/) installation (e.g. `brew install
