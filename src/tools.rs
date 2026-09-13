@@ -513,6 +513,38 @@ mod tests {
     }
 
     #[test]
+    fn e2e_get_guards_internal_and_oversized() {
+        let (server, _keep) = test_server();
+
+        // The embedded full-text index is an internal entry, not an article.
+        let params = serde_json::from_value::<ZimGetParams>(
+            serde_json::json!({ "zim": "test.zim", "path": "X/fulltext/xapian" }),
+        )
+        .unwrap();
+        assert!(matches!(
+            ZimGetTool::invoke(&server, params),
+            Err(ToolError::InvalidArgument(_))
+        ));
+
+        // Content larger than the response cap is rejected cleanly.
+        let dir = tempfile::tempdir().unwrap();
+        let big: &'static [u8] = Box::leak(vec![b'a'; 17 * 1024 * 1024].into_boxed_slice());
+        let content = [TestEntry { namespace: b'C', url: "Big", title: "Big", mime: 0, body: big }];
+        let bytes = build_archive(&["text/html"], &content, &[], 0, None);
+        std::fs::write(dir.path().join("big.zim"), &bytes).unwrap();
+        let library = Arc::new(ZimLibrary::scan(dir.path()).unwrap());
+        let server = ZimMcpServer::new(library);
+        let params = serde_json::from_value::<ZimGetParams>(
+            serde_json::json!({ "zim": "big.zim", "path": "C/Big" }),
+        )
+        .unwrap();
+        assert!(matches!(
+            ZimGetTool::invoke(&server, params),
+            Err(ToolError::InvalidArgument(msg)) if msg.contains("too large")
+        ));
+    }
+
+    #[test]
     fn e2e_get_section() {
         let (server, _keep) = test_server();
 
@@ -578,6 +610,10 @@ pub struct ZimGetResult {
 
 pub struct ZimGetTool;
 
+/// Entries in the `X` namespace are internal (embedded full-text search
+/// indexes), not article content, and can run to hundreds of megabytes.
+const MAX_ZIM_GET_BYTES: usize = 16 * 1024 * 1024;
+
 impl ToolBase for ZimGetTool {
     type Parameter = ZimGetParams;
     type Output = ZimGetResult;
@@ -601,6 +637,19 @@ impl SyncTool<ZimMcpServer> for ZimGetTool {
     fn invoke(server: &ZimMcpServer, params: Self::Parameter) -> Result<Self::Output, Self::Error> {
         let arc = find_archive(&server.library, &params.zim)?;
         let article = not_found_if_missing(arc.get_article(&params.path))?;
+        if article.full_path.starts_with("X/") {
+            return Err(ToolError::InvalidArgument(format!(
+                "{} is an internal entry (embedded search index); article content lives under C/ or A/",
+                article.full_path
+            )));
+        }
+        if article.bytes.len() > MAX_ZIM_GET_BYTES {
+            return Err(ToolError::InvalidArgument(format!(
+                "content of {} is {} bytes, too large for one response (max {MAX_ZIM_GET_BYTES})",
+                article.full_path,
+                article.bytes.len()
+            )));
+        }
         let (content, encoding) = match std::str::from_utf8(&article.bytes) {
             Ok(text) => (text.to_string(), "utf-8"),
             Err(_) => (
