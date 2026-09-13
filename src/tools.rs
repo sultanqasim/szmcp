@@ -20,8 +20,10 @@ use xapian2::{Enquire, Operator, QueryParser, StemStrategy};
 const SEARCH_LIMIT: u32 = 20;
 /// Maximum characters of intro text reported per search hit.
 const INTRO_CHARS: usize = 300;
-/// How many raw bytes of an article are read to derive its intro.
-const INTRO_READ_BYTES: u64 = 16 * 1024;
+/// How many raw bytes of an article are read to derive its intro. Modern
+/// MediaWiki pages carry kilobytes of template CSS and infobox markup before
+/// the lead paragraph, so this needs generous headroom.
+const INTRO_READ_BYTES: u64 = 64 * 1024;
 
 #[derive(Error, Debug)]
 pub enum ToolError {

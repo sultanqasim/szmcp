@@ -16,13 +16,6 @@ fn find_ci(hay: &[u8], from: usize, needle: &[u8]) -> Option<usize> {
     None
 }
 
-/// Push a separating single space, collapsing consecutive whitespace.
-fn push_sep(out: &mut String) {
-    if !out.is_empty() && out.chars().next_back().unwrap_or(' ') != ' ' {
-        out.push(' ');
-    }
-}
-
 /// Decode a character entity starting at `i` (i.e. bytes[i] == b'&').
 /// Returns (text, index after the semicolon).
 fn decode_entity(s: &str, i: usize) -> Option<(String, usize)> {
@@ -53,64 +46,112 @@ fn decode_entity(s: &str, i: usize) -> Option<(String, usize)> {
     Some((ch.to_string(), i + semi + 1))
 }
 
-/// Strip HTML tags (and the text of `<script>`/`<style>` elements), decode
-/// common entities, and collapse whitespace. Stops after producing
-/// `max_chars` characters of text.
+/// Elements whose whole content is invisible or not part of an article's
+/// lead: CSS/JS, tables (an infobox precedes the lead in MediaWiki output),
+/// figures (image captions) and reference markers.
+const INTRO_SKIP_TAGS: [&str; 5] = ["style", "script", "table", "figure", "sup"];
+
+/// The region of a MediaWiki page that holds the article. Scanning the whole
+/// HTML would pick up browser-chrome text (title bar, navigation menus), so
+/// cut the page at the content div (`id="mw-content-text"`) and its matching
+/// close when the page has one.
+fn article_body(html: &str) -> &str {
+    const MARKER: &str = "id=\"mw-content-text\"";
+    let Some(i) = html.find(MARKER) else { return html };
+    let after = &html[i + MARKER.len()..];
+    // Skip the rest of the content div's own open tag, then find its close
+    // by counting nested <div>/</div> tags.
+    let Some(gt) = after.find('>') else { return html };
+    let after = &after[gt + 1..];
+    let mut depth = 1usize; // inside the content div
+    let mut pos = 0usize;
+    while let Some(lt) = after[pos..].find('<') {
+        let rest = &after[pos + lt + 1..];
+        let (is_close, name) = match rest.strip_prefix('/') {
+            Some(r) => (true, r),
+            None => (false, rest),
+        };
+        let name = name
+            .find(|c: char| !c.is_ascii_alphanumeric())
+            .map_or(name, |e| &name[..e]);
+        if name.eq_ignore_ascii_case("div") {
+            if is_close {
+                depth -= 1;
+                if depth == 0 {
+                    return &after[..pos + lt];
+                }
+            } else {
+                depth += 1;
+            }
+        }
+        pos += lt + 1;
+    }
+    html
+}
+
+/// Strip HTML tags, decode common entities, and collapse whitespace into
+/// single spaces. Stops after producing `max_chars` characters of text;
+/// markup and whitespace never consume the budget.
 pub fn intro_from_html(html: &str, max_chars: usize) -> String {
+    let html = article_body(html);
     let bytes = html.as_bytes();
     let mut out = String::new();
+    // Whitespace or markup seen since the last emitted text: emits a single
+    // separating space when the next text arrives.
+    let mut sep = false;
     let mut i = 0usize;
-    while i < bytes.len() {
-        if out.chars().count() >= max_chars {
-            break;
-        }
+    while i < bytes.len() && out.chars().count() < max_chars {
         match bytes[i] {
             b'<' => {
-                let gt = match bytes[i..].iter().position(|&c| c == b'>') {
-                    Some(p) => i + p,
-                    None => {
-                        out.push('<');
-                        i += 1;
-                        continue;
-                    }
+                let Some(gt_rel) = bytes[i..].iter().position(|&c| c == b'>') else {
+                    break;
                 };
+                let gt = i + gt_rel;
                 let tag = &html[i + 1..gt];
                 let tag_name = tag
-                    .split(|c: char| c.is_whitespace())
+                    .split(|c: char| c.is_whitespace() || c == '/')
                     .next()
                     .unwrap_or("")
                     .to_ascii_lowercase();
-                if tag_name == "script" || tag_name == "style" {
-                    // Skip the whole element, including its text.
+                if INTRO_SKIP_TAGS.contains(&tag_name.as_str()) {
+                    // Skip the whole element, including its content.
                     let close = format!("</{tag_name}");
                     if let Some(cp) = find_ci(bytes, i + 1, close.as_bytes()) {
                         if let Some(g) = bytes[cp..].iter().position(|&c| c == b'>') {
                             i = cp + g + 1;
+                            sep = true;
                             continue;
                         }
                     }
                 }
-                push_sep(&mut out);
+                sep = true;
                 i = gt + 1;
             }
             b'&' => {
-                if let Some((text, next)) = decode_entity(html, i) {
-                    out.push_str(&text);
-                    i = next;
-                } else {
-                    out.push('&');
-                    i += 1;
+                let (text, next) = match decode_entity(html, i) {
+                    Some((text, next)) => (text, next),
+                    None => ("&".to_string(), i + 1),
+                };
+                if sep && !out.is_empty() {
+                    out.push(' ');
                 }
+                out.push_str(&text);
+                sep = false;
+                i = next;
             }
             c if c.is_ascii_whitespace() => {
-                push_sep(&mut out);
+                sep = true;
                 i += 1;
             }
             _ => {
+                if sep && !out.is_empty() {
+                    out.push(' ');
+                }
                 // `i` is always on a char boundary: we advance by
                 // len_utf8() or by single-byte ASCII steps.
                 let ch = html[i..].chars().next().unwrap();
                 out.push(ch);
+                sep = false;
                 i += ch.len_utf8();
             }
         }
@@ -322,6 +363,33 @@ mod tests {
     fn intro_respects_char_limit() {
         let intro = intro_from_html(WIKI, 10);
         assert!(intro.chars().count() <= 10, "{intro:?}");
+    }
+
+    #[test]
+    fn intro_budget_ignores_markup() {
+        // Markup between texts must not eat the character budget: even
+        // hundreds of tags cannot crowd later text out of the intro.
+        let page = format!("<p>x</p>{}<p>real text here</p>", "<span></span>".repeat(400));
+        let intro = intro_from_html(&page, 20);
+        assert_eq!(intro, "x real text here", "{intro:?}");
+    }
+
+    #[test]
+    fn intro_scopes_to_article_body_and_skips_infobox() {
+        let page = "<html><head><title>Chemistry - Wikipedia</title></head>\
+            <body><h1>Chemistry</h1>\
+            <div id=\"mw-content-text\"><div class=\"mw-parser-output\">\
+            <style>.hatnote{font-style:italic}</style>\
+            <table><tbody><tr><td>Standard atomic weight 1.008</td></tr></tbody></table>\
+            <figure>Aromatic hydrocarbon rings</figure>\
+            <p><b>Chemistry</b> is the study of &amp; matter.</p>\
+            </div></div><footer>Navigation menu</footer></body></html>";
+        let intro = intro_from_html(page, 100);
+        assert!(intro.starts_with("Chemistry is the study of & matter"), "{intro:?}");
+        assert!(!intro.contains("atomic weight"), "{intro:?}");
+        assert!(!intro.contains("hydrocarbon"), "{intro:?}");
+        assert!(!intro.contains("Navigation"), "{intro:?}");
+        assert!(!intro.contains("Wikipedia"), "{intro:?}");
     }
 
     #[test]
