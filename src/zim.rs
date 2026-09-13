@@ -361,13 +361,18 @@ impl Zim {
     /// old namespace scheme (stored url includes the namespace, e.g.
     /// "A/index.html") and the new one (>=6.1, stored url excludes it).
     pub fn resolve_path(&self, path: &str) -> io::Result<Option<u32>> {
-        let path = path.trim_matches('/');
+        // Trim user-supplied decoration: surrounding whitespace, a leading
+        // "./" (how in-page hrefs reference articles) and leading slashes.
+        // A trailing slash is NOT trimmed: "C/" is the (nonexistent) C
+        // namespace root, and silently trimming it would resolve to
+        // whatever article happens to be named "C".
+        let path = path.trim().trim_start_matches("./").trim_start_matches('/');
         if path.is_empty() {
             return Ok(None);
         }
         let mut candidates: Vec<(u8, String)> = Vec::new();
         if let Some((first, rest)) = path.split_once('/') {
-            if first.is_ascii() && first.len() == 1 {
+            if first.is_ascii() && first.len() == 1 && !rest.is_empty() {
                 let ns = first.as_bytes()[0];
                 candidates.push((ns, rest.to_string())); // new scheme
                 candidates.push((ns, path.to_string())); // old scheme
@@ -995,6 +1000,20 @@ pub(crate) mod testutil {
     fn get_article_not_found() {
         let (a, _f) = sample_archive();
         assert!(a.get_article("Nope").is_err());
+    }
+
+    #[test]
+    fn path_resolution_decorations() {
+        let (a, _f) = sample_archive();
+        // In-page href style with a leading "./" resolves.
+        assert!(a.get_article("./Apple").is_ok());
+        // A namespace-only path must not silently resolve to an article
+        // that happens to be named like the namespace.
+        assert!(a.get_article("C/").is_err());
+        // A trailing slash is a different (nonexistent) path, not the
+        // article without it.
+        assert!(a.get_article("Apple/").is_err());
+        assert!(a.get_article("C/Apple/").is_err());
     }
 
     #[test]
