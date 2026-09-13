@@ -121,7 +121,7 @@ pub struct ZimSearchParams {
 }
 
 /// One search result.
-#[derive(Serialize, JsonSchema)]
+#[derive(Serialize, JsonSchema, Debug)]
 pub struct SearchHit {
     /// ZIM file name, relative to the ZIM directory
     pub zim: String,
@@ -184,50 +184,77 @@ fn search_impl(library: &ZimLibrary, query: &str) -> Result<SearchResults, ToolE
         .parse_query(query)
         .map_err(|e| ToolError::InvalidArgument(format!("failed to parse query: {e}")))?;
 
-    // (weight, archive index, article path from the index's docdata)
-    let mut raw: Vec<(f64, usize, String)> = Vec::new();
-    let mut any_index = false;
-    for (i, arc) in library.archives.iter().enumerate() {
+    // Per-archive ranked hit lists: (weight, path, title from the index).
+    // libzim stores the article title in Xapian value slot 0.
+    let mut per_archive: Vec<(&Arc<Archive>, Vec<(f64, String, String)>)> = Vec::new();
+    for arc in &library.archives {
         let Some(db) = arc.xapian_db()? else {
             continue;
         };
-        any_index = true;
         let mut enquire = Enquire::new(&db)?;
         enquire.set_query(&xquery)?;
         enquire.set_sort_by_relevance();
         let mset = enquire.get_mset(0, SEARCH_LIMIT, 0)?;
+        let mut list = Vec::with_capacity(mset.size() as usize);
         for (j, m) in mset.iter().enumerate() {
             let mut doc = mset.document(j as u32)?;
             let path = doc.data_str()?;
             if path.is_empty() {
                 continue;
             }
-            raw.push((m.weight, i, path));
+            let title = String::from_utf8_lossy(&doc.value(0)?).into_owned();
+            list.push((m.weight, path, title));
         }
+        per_archive.push((arc, list));
     }
 
-    if !any_index {
+    if per_archive.is_empty() {
         return Err(ToolError::Internal(format!(
             "no ZIM files with a Xapian full-text index were found in {}",
             library.root.display()
         )));
     }
 
-    // Best matches across all archives.
-    raw.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
-    raw.truncate(SEARCH_LIMIT as usize);
+    // Xapian weights are computed from per-database statistics and are not
+    // comparable across archives, so merge the archives' ranked lists by
+    // rotation instead of by weight: every archive contributes its best
+    // match before any archive contributes its second best.
+    let mut merged: Vec<(&Arc<Archive>, String, String)> = Vec::new();
+    let mut rank = 0usize;
+    loop {
+        let mut picked = false;
+        for (arc, list) in &per_archive {
+            if let Some((_, path, title)) = list.get(rank) {
+                merged.push((arc, path.clone(), title.clone()));
+                picked = true;
+            }
+        }
+        if !picked {
+            break;
+        }
+        rank += 1;
+    }
 
-    let mut hits = Vec::with_capacity(raw.len());
-    for (_weight, i, path) in raw {
-        let arc = &library.archives[i];
-        let (title, intro) = match arc.article_preview(&path, INTRO_READ_BYTES) {
+    // The same article is often present in several archives (e.g. an HTML
+    // and a Markdown edition of the same ZIM): dedupe by normalized title
+    // so each article is reported once, from the archive ranked first.
+    let mut seen = std::collections::HashSet::new();
+    merged.retain(|(_, path, title)| {
+        let key = if title.is_empty() { path.as_str() } else { title.as_str() };
+        seen.insert(html::normalize(key))
+    });
+    merged.truncate(SEARCH_LIMIT as usize);
+
+    let mut hits = Vec::with_capacity(merged.len());
+    for (arc, path, _) in &merged {
+        let (title, intro) = match arc.article_preview(path, INTRO_READ_BYTES) {
             Ok(Some((title, bytes))) => {
                 let text = String::from_utf8_lossy(&bytes);
                 (title, html::intro_from_html(&text, INTRO_CHARS))
             }
             _ => (String::new(), String::new()),
         };
-        hits.push(SearchHit { zim: arc.name.clone(), path, title, intro });
+        hits.push(SearchHit { zim: arc.name.clone(), path: path.clone(), title, intro });
     }
     Ok(SearchResults { results: hits })
 }
@@ -257,24 +284,22 @@ mod tests {
         <p>Banana trees are actually tall herbaceous plants.</p>\
         </body></html>";
 
+    const CHERRY_HTML: &str = "<html><body><h1>Cherry</h1>\
+        <p>A cherry is the fruit of trees of the genus <i>Prunus</i>.</p>\
+        </body></html>";
+
     /// Build a single-file glass Xapian index, the way openZIM does: the
-    /// document data is the article's full path inside the archive.
-    fn make_index() -> Vec<u8> {
+    /// document data is the article's full path inside the archive, and the
+    /// terms are unprefixed Porter2 stems, exactly as libzim indexes with
+    /// STEM_ALL ("appl" is the stem of "apple", "comput" of "computing").
+    fn make_index(docs: &[(&str, &str)]) -> Vec<u8> {
         let dir = tempfile::tempdir().unwrap();
         let db_dir = dir.path().join("db");
         {
             let mut wdb = WritableDatabase::create(&db_dir).unwrap();
-            let docs = [
-                // Terms are unprefixed Porter2 stems, exactly as libzim
-                // indexes openZIM full-text indexes with STEM_ALL: "appl" is
-                // the stem of "apple", "comput" of "computing" - both exercise
-                // the query-side stemmer.
-                ("C/Apple", "appl histori 10 000 year domest wild kazakhstan comput devic nam".to_string()),
-                ("C/Banana", "banana tree tall herbaceou plant growth".to_string()),
-            ];
             for (path, terms) in docs {
                 let mut doc = Document::new().unwrap();
-                doc.set_data(path).unwrap();
+                doc.set_data(*path).unwrap();
                 for t in terms.split_whitespace() {
                     doc.add_term(t, 1).unwrap();
                 }
@@ -290,7 +315,10 @@ mod tests {
 
     fn test_server() -> (ZimMcpServer, tempfile::TempDir) {
         let dir = tempfile::tempdir().unwrap();
-        let index = make_index();
+        let index = make_index(&[
+            ("C/Apple", "appl histori 10 000 year domest wild kazakhstan comput devic nam"),
+            ("C/Banana", "banana tree tall herbaceou plant growth"),
+        ]);
         let content = [
             TestEntry { namespace: b'C', url: "Apple", title: "Apple", mime: 0, body: APPLE_HTML.as_bytes() },
             TestEntry { namespace: b'C', url: "Banana", title: "Banana", mime: 0, body: BANANA_HTML.as_bytes() },
@@ -352,6 +380,55 @@ mod tests {
             ZimSearchTool::invoke(&server, params),
             Err(ToolError::InvalidArgument(_))
         ));
+    }
+
+    #[test]
+    fn e2e_search_interleaves_archives_and_dedupes() {
+        let dir = tempfile::tempdir().unwrap();
+        // Two archives; both carry an "Apple" article (same article, as in an
+        // HTML and a Markdown edition of the same ZIM), plus one exclusive
+        // article each.
+        let index_a = make_index(&[
+            ("C/Apple", "appl histori 10 000 year domest wild kazakhstan comput devic nam"),
+            ("C/Banana", "banana tree tall herbaceou plant growth"),
+        ]);
+        let index_b = make_index(&[
+            ("C/Apple", "appl comput devic nam"),
+            ("C/Cherry", "cherri pie fruit tree"),
+        ]);
+        let content_a = [
+            TestEntry { namespace: b'C', url: "Apple", title: "Apple", mime: 0, body: APPLE_HTML.as_bytes() },
+            TestEntry { namespace: b'C', url: "Banana", title: "Banana", mime: 0, body: BANANA_HTML.as_bytes() },
+        ];
+        let content_b = [
+            TestEntry { namespace: b'C', url: "Apple", title: "Apple", mime: 0, body: APPLE_HTML.as_bytes() },
+            TestEntry { namespace: b'C', url: "Cherry", title: "Cherry", mime: 0, body: CHERRY_HTML.as_bytes() },
+        ];
+        std::fs::write(dir.path().join("a.zim"), build_archive(&["text/html"], &content_a, &[], 0, Some(&index_a))).unwrap();
+        std::fs::write(dir.path().join("b.zim"), build_archive(&["text/html"], &content_b, &[], 0, Some(&index_b))).unwrap();
+        let library = Arc::new(ZimLibrary::scan(dir.path()).unwrap());
+        assert_eq!(library.archives.len(), 2);
+        let server = ZimMcpServer::new(library);
+
+        // The article present in both archives is reported exactly once.
+        let params = serde_json::from_value::<ZimSearchParams>(
+            serde_json::json!({ "query": "apple" }),
+        )
+        .unwrap();
+        let hits = ZimSearchTool::invoke(&server, params).unwrap().results;
+        assert_eq!(hits.len(), 1, "{hits:?}");
+        assert_eq!(hits[0].zim, "a.zim");
+        assert_eq!(hits[0].path, "C/Apple");
+
+        // Distinct matches interleave: the best match of each archive first.
+        let params = serde_json::from_value::<ZimSearchParams>(
+            serde_json::json!({ "query": "banana cherry" }),
+        )
+        .unwrap();
+        let hits = ZimSearchTool::invoke(&server, params).unwrap().results;
+        assert_eq!(hits.len(), 2, "{hits:?}");
+        assert_eq!((hits[0].zim.as_str(), hits[0].path.as_str()), ("a.zim", "C/Banana"));
+        assert_eq!((hits[1].zim.as_str(), hits[1].path.as_str()), ("b.zim", "C/Cherry"));
     }
 
     #[test]

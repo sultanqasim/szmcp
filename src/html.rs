@@ -136,8 +136,9 @@ fn strip_tags(s: &str) -> String {
     out
 }
 
-/// Normalize a heading name for matching: trim, lowercase, collapse whitespace.
-fn normalize(s: &str) -> String {
+/// Normalize a heading name/title for matching: trim, lowercase, collapse
+/// whitespace.
+pub(crate) fn normalize(s: &str) -> String {
     s.split_whitespace().collect::<Vec<_>>().join(" ").to_lowercase()
 }
 
