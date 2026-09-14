@@ -15,7 +15,7 @@ use serde::{Deserialize, Serialize};
 use std::borrow::Cow;
 use std::sync::Arc;
 use thiserror::Error;
-use xapian2::{Enquire, Operator, QueryParser, StemStrategy};
+use xapian2::{Enquire, Operator, Query, QueryParser, Stem, StemStrategy};
 
 /// Number of results `zim_search` returns in total (across all archives).
 const SEARCH_LIMIT: u32 = 20;
@@ -25,6 +25,15 @@ const INTRO_CHARS: usize = 300;
 /// MediaWiki pages carry kilobytes of template CSS and infobox markup before
 /// the lead paragraph, so this needs generous headroom.
 const INTRO_READ_BYTES: u64 = 64 * 1024;
+
+/// Common English words dropped when collecting an all-terms query boost.
+/// They are stopped at index time (libzim's TermGenerator), so they are
+/// absent from the index terms and an AND over them would match nothing.
+const STOPWORDS: &[&str] = &[
+    "a", "an", "and", "are", "as", "at", "be", "but", "by", "for", "from", "has", "have", "in",
+    "is", "it", "its", "not", "of", "on", "or", "that", "the", "these", "this", "those", "to",
+    "was", "were", "which", "with",
+];
 
 #[derive(Error, Debug)]
 pub enum ToolError {
@@ -170,6 +179,29 @@ impl SyncTool<ZimMcpServer> for ZimSearchTool {
     }
 }
 
+/// The query's non-stopword terms, stemmed the way the ZIM full-text
+/// indexes were built (unprefixed Porter2 stems, lowercased): split on
+/// whitespace, keep alphanumeric characters only per word, lowercase, drop
+/// stopwords, stem, dedupe (preserving first-occurrence order).
+fn query_terms(query: &str, stem: &mut Stem) -> Vec<String> {
+    let mut terms: Vec<String> = Vec::new();
+    for word in query.split_whitespace() {
+        // Punctuation never appears in index terms either, so strip it.
+        let word: String = word.chars().filter(|c| c.is_alphanumeric()).collect();
+        let word = word.to_lowercase();
+        if word.is_empty() || STOPWORDS.contains(&word.as_str()) {
+            continue;
+        }
+        // The index has no spelling data, so an unknown word just stems to
+        // something that matches nothing; it cannot break anything here.
+        let stemmed = stem.apply(&word).unwrap_or(word);
+        if !terms.contains(&stemmed) {
+            terms.push(stemmed);
+        }
+    }
+    terms
+}
+
 fn search_impl(library: &ZimLibrary, query: &str) -> Result<SearchResults, ToolError> {
     if query.trim().is_empty() {
         return Err(ToolError::InvalidArgument("query must not be empty".into()));
@@ -186,6 +218,31 @@ fn search_impl(library: &ZimLibrary, query: &str) -> Result<SearchResults, ToolE
     let xquery = qp
         .parse_query(query)
         .map_err(|e| ToolError::InvalidArgument(format!("failed to parse query: {e}")))?;
+
+    // Multi-word queries: rank articles containing ALL the words above
+    // articles containing only some of them, by ORing the parsed query with
+    // an AND over the stemmed terms (the classic Xapian all-terms boost).
+    // BM25 sums contributions across OR branches, so an all-words article
+    // scores higher than one with a subset, while partial matches still
+    // appear. Positional operators cannot approximate exact matching here -
+    // the ZIM indexes carry no positional data, so OP_PHRASE/OP_NEAR match
+    // nothing - and the indexes have no spelling data, so a misspelled word
+    // simply matches nothing in the AND branch while the parsed OR branch
+    // still retrieves results for the good words.
+    let xquery = {
+        let mut stem = Stem::new("english")?;
+        let terms = query_terms(query, &mut stem);
+        if terms.len() >= 2 {
+            // Fold the AND left to right; Xapian flattens the tree itself.
+            let mut all_terms = Query::term(&terms[0])?;
+            for term in &terms[1..] {
+                all_terms = Query::combine(Operator::And, &all_terms, &Query::term(term)?)?;
+            }
+            Query::combine(Operator::Or, &all_terms, &xquery)?
+        } else {
+            xquery
+        }
+    };
 
     // Exact title/URL matches, found in the ZIM directory itself: redirects
     // are not in the full-text index, and a query that names an article
@@ -551,6 +608,61 @@ mod tests {
         assert_eq!(hits.len(), 2, "{hits:?}");
         assert_eq!(hits[0].path, "C/Atmosphere", "{hits:?}");
         assert_eq!(hits[1].path, "C/Nitrogen", "{hits:?}");
+    }
+
+    #[test]
+    fn e2e_search_multi_word_ranks_all_words_first() {
+        // BM25 alone ranks the "Cherry" document first: thirty repetitions
+        // of one term in a short document outweigh a document mentioning
+        // each term once. The all-terms AND branch must lift "Dessert
+        // Recipes" (the only document with BOTH terms) above it, while the
+        // partial match still appears. Two filler documents carry "pie" too,
+        // so this is a real re-ranking, not a tie.
+        let dir = tempfile::tempdir().unwrap();
+        let cherri_terms = "cherri ".repeat(30);
+        let dessert_terms = format!("cherri pie{}", " filler".repeat(8));
+        let index = make_index(&[
+            ("C/Cherry", &cherri_terms, "Cherry"),
+            ("C/Dessert_Recipes", &dessert_terms, "Dessert Recipes"),
+            ("C/Pie_1", "pie pie", "Pie 1"),
+            ("C/Pie_2", "pie pie", "Pie 2"),
+        ]);
+        let content = [
+            TestEntry { namespace: b'C', url: "Cherry", title: "Cherry", mime: 0, body: CHERRY_HTML.as_bytes() },
+            TestEntry { namespace: b'C', url: "Dessert_Recipes", title: "Dessert Recipes", mime: 0, body: CHERRY_HTML.as_bytes() },
+        ];
+        let bytes = build_archive(&["text/html"], &content, &[], 0, Some(&index));
+        std::fs::write(dir.path().join("test.zim"), &bytes).unwrap();
+        let library = Arc::new(ZimLibrary::scan(dir.path()).unwrap());
+        let server = ZimMcpServer::new(library);
+
+        let hits = search(&server, "cherry pie");
+        assert_eq!(hits[0].path, "C/Dessert_Recipes", "{hits:?}");
+        assert_eq!(hits[0].title, "Dessert Recipes");
+        // The partial match (only "cherry") is still reported, right behind.
+        assert_eq!(hits[1].path, "C/Cherry", "{hits:?}");
+    }
+
+    #[test]
+    fn e2e_search_stopword_only_query_returns_nothing() {
+        let (server, _keep) = test_server();
+
+        // A query made only of stopwords matches nothing (they are stopped
+        // at index time, so the terms are absent) and must not error.
+        let hits = search(&server, "the in of");
+        assert!(hits.is_empty(), "{hits:?}");
+    }
+
+    #[test]
+    fn e2e_search_nonsense_word_still_returns_results() {
+        let (server, _keep) = test_server();
+
+        // The indexes have no spelling data, so a nonsense word matches
+        // nothing: the all-terms AND branch is empty, but the parsed OR
+        // branch still retrieves the results for the real word.
+        let hits = search(&server, "apple zzzzqq");
+        assert!(!hits.is_empty(), "{hits:?}");
+        assert_eq!(hits[0].path, "C/Apple", "{hits:?}");
     }
 
     #[test]

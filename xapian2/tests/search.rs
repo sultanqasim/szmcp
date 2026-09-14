@@ -1,4 +1,4 @@
-use xapian2::{Database, DbFlags, Document, Enquire, Match, Operator, Query, QueryParser, WritableDatabase};
+use xapian2::{Database, DbFlags, Document, Enquire, Match, Operator, Query, QueryParser, Stem, WritableDatabase};
 
 fn temp_dir(name: &str) -> std::path::PathBuf {
     let dir = std::env::temp_dir().join(format!("xapian2-test-{}-{name}", std::process::id()));
@@ -127,6 +127,20 @@ fn search_roundtrip() {
     assert_eq!(mset.size(), 3);
 
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The standalone stemmer: stemming, the empty word, and errors.
+#[test]
+fn stem_words() {
+    let mut stem = Stem::new("english").unwrap();
+    // The stems the ZIM full-text indexes store (libzim, STEM_ALL); the
+    // QueryParser's STEM_ALL strategy produces the same terms.
+    assert_eq!(stem.apply("elephants").unwrap(), "eleph");
+    assert_eq!(stem.apply("dependent").unwrap(), "depend");
+    assert_eq!(stem.apply("miami").unwrap(), "miami");
+    assert_eq!(stem.apply("").unwrap(), "");
+    // An unknown language is an error, not a silent no-op.
+    assert!(Stem::new("notalanguage").is_err());
 }
 
 /// Single-file glass database embedded at an offset in a larger file -

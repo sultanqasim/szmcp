@@ -41,6 +41,15 @@ struct XDoc {
     std::string scratch;
 };
 
+// XStem wraps Xapian::Stem together with a scratch std::string so that the
+// stem of a word can be handed across the FFI boundary without a second
+// C++-side copy. The returned byte range is valid until the next call on
+// the same XStem, or until the handle is freed.
+struct XStem {
+    Xapian::Stem stem;
+    std::string scratch;
+};
+
 extern "C" {
 
 // ---- Errors -------------------------------------------------------------
@@ -210,6 +219,38 @@ const char *xapian2_doc_value(XDoc *d, uint32_t slot, uint32_t *out_len) {
 }
 
 void xapian2_doc_free(XDoc *d) { delete d; }
+
+// ---- Stem -------------------------------------------------------------------
+//
+// Standalone stemmer, e.g. to stem query words the same way libzim indexed
+// them (the ZIM full-text indexes store unprefixed Porter2 stems).
+
+XStem *xapian2_stem_new(const char *language) {
+    try {
+        return new XStem{Xapian::Stem(std::string_view(language), false), {}};
+    } catch (const Xapian::Error &e) {
+        g_error = describe(e);
+    } catch (const std::exception &e) {
+        g_error = e.what();
+    }
+    return nullptr;
+}
+
+// Stem `word` (operator() is const, but the result goes through the scratch
+// buffer, so the Rust side treats the call as exclusive access).
+const char *xapian2_stem_apply(XStem *s, const char *word, uint32_t len, uint32_t *out_len) {
+    try {
+        s->scratch = s->stem(std::string(word, len));
+        *out_len = static_cast<uint32_t>(s->scratch.size());
+        return s->scratch.data();
+    } catch (const Xapian::Error &e) {
+        g_error = describe(e);
+        *out_len = 0;
+    }
+    return nullptr;
+}
+
+void xapian2_stem_free(XStem *s) { delete s; }
 
 // ---- WritableDatabase (minimal; used for building/test databases) --------
 

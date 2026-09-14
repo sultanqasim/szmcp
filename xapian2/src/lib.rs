@@ -16,6 +16,8 @@
 //!   Note: in Xapian 2.x the default combining operator for `parse_query`
 //!   is **[`Operator::Or`]** (1.x used `And`); use
 //!   [`QueryParser::set_default_op`] to change it.
+//! - [`Stem`] to stem individual words with the same language an index was
+//!   built with (the ZIM full-text indexes store unprefixed stems).
 //! - [`Enquire`] / [`MSet`] with relevance sorting, random access to
 //!   matches (docid, weight, percent, rank) and per-match [`Document`]s.
 //!
@@ -97,6 +99,16 @@ mod ffi {
         pub fn xapian2_wdb_add_document(db: *mut c_void, d: *mut c_void) -> u32;
         pub fn xapian2_wdb_commit(db: *mut c_void) -> c_int;
         pub fn xapian2_wdb_free(db: *mut c_void);
+
+        // Stem
+        pub fn xapian2_stem_new(language: *const c_char) -> *mut c_void;
+        pub fn xapian2_stem_apply(
+            s: *mut c_void,
+            word: *const c_char,
+            len: u32,
+            out_len: *mut u32,
+        ) -> *const c_char;
+        pub fn xapian2_stem_free(s: *mut c_void);
 
         // QueryParser
         pub fn xapian2_qp_new() -> *mut c_void;
@@ -238,7 +250,7 @@ macro_rules! handle_debug {
     };
 }
 
-handle_debug!(Database, Document, WritableDatabase, Query, QueryParser, Enquire, MSet);
+handle_debug!(Database, Document, WritableDatabase, Query, QueryParser, Enquire, MSet, Stem);
 
 // ---------------------------------------------------------------------------
 // Flags / operators
@@ -572,6 +584,75 @@ impl Drop for Document {
 // SAFETY: a Document's C++ object is only mutated through `&mut self`
 // methods (scratch buffer); moving it between threads is safe.
 unsafe impl Send for Document {}
+
+// ---------------------------------------------------------------------------
+// Stem
+// ---------------------------------------------------------------------------
+
+/// A stemming algorithm ([`Xapian::Stem`]), e.g. `Stem::new("english")`.
+///
+/// Standalone stemmer, for stemming words the same way an index was built:
+/// the full-text indexes embedded in openZIM archives store unprefixed
+/// Porter2 stems (libzim indexes with `STEM_ALL`), so code that builds
+/// query terms by hand must stem with the index's language to match.
+///
+/// `Send` only: `apply` reuses a C++-side scratch buffer, so use one `Stem`
+/// from one thread at a time (mirrors [`Document`]).
+pub struct Stem {
+    ptr: NonNull<c_void>,
+}
+
+impl Stem {
+    /// Create a stemmer for `language` (e.g. `"english"`); `"none"` gives a
+    /// no-op stemmer. Fails with `InvalidArgumentError` for an unknown
+    /// language.
+    pub fn new(language: &str) -> Result<Self> {
+        let lang = cstr(language)?;
+        // SAFETY: `lang` is a valid NUL-terminated string for the call.
+        let ptr = unsafe { ffi::xapian2_stem_new(lang.as_ptr()) };
+        Error::from_ptr(ptr, "failed to create stemmer").map(|ptr| Self { ptr })
+    }
+
+    /// Stem `word` ("elephants" -> "eleph" with the English stemmer). An
+    /// empty word comes back unchanged, like Xapian itself.
+    pub fn apply(&mut self, word: &str) -> Result<String> {
+        let bytes = word.as_bytes();
+        let mut len = 0u32;
+        // SAFETY: `bytes` is a valid byte slice; the shim copies the word
+        // and writes `out_len` before returning.
+        let ptr = unsafe {
+            ffi::xapian2_stem_apply(
+                self.handle(),
+                bytes.as_ptr() as *const _,
+                bytes.len() as u32,
+                &mut len,
+            )
+        };
+        if ptr.is_null() {
+            return Err(Error::last_error("failed to stem word"));
+        }
+        // SAFETY: the shim guarantees `len` bytes at `ptr`, valid until the
+        // next call on this stemmer.
+        let stemmed =
+            unsafe { std::slice::from_raw_parts(ptr as *const u8, len as usize) }.to_vec();
+        String::from_utf8(stemmed).map_err(|e| Error::new(e.to_string()))
+    }
+
+    fn handle(&self) -> *mut c_void {
+        self.ptr.as_ptr()
+    }
+}
+
+impl Drop for Stem {
+    fn drop(&mut self) {
+        // SAFETY: the handle was allocated by the shim.
+        unsafe { ffi::xapian2_stem_free(self.ptr.as_ptr()) };
+    }
+}
+
+// SAFETY: a Stem's C++ object is only mutated through `&mut self` methods
+// (scratch buffer); moving it between threads is safe.
+unsafe impl Send for Stem {}
 
 // ---------------------------------------------------------------------------
 // WritableDatabase (minimal: build/test databases)
