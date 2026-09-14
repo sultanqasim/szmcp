@@ -16,19 +16,24 @@ use crate::html::{self, normalize, INTRO_SECTION};
 fn push_text(out: &mut String, text: &str, max_chars: usize) {
     // A space is due before the first character unless the intro is empty.
     let mut sep = !out.is_empty();
+    // The character count of `out`, tracked as we go: recounting per
+    // character would make long paragraphs quadratic.
+    let mut len = out.chars().count();
     for c in text.chars() {
         if c.is_whitespace() {
             sep = true;
             continue;
         }
         // Room for the pending separator space (if any) and the char itself.
-        if out.chars().count() + sep as usize >= max_chars {
+        if len + sep as usize >= max_chars {
             return;
         }
         if sep {
             out.push(' ');
+            len += 1;
         }
         out.push(c);
+        len += 1;
         sep = false;
     }
 }

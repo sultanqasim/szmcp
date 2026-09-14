@@ -197,7 +197,7 @@ impl SyncTool<ZimMcpServer> for ZimSearchTool {
 /// indexes were built (unprefixed Porter2 stems, lowercased): split on
 /// whitespace, keep alphanumeric characters only per word, lowercase, drop
 /// stopwords, stem, dedupe (preserving first-occurrence order).
-fn query_terms(query: &str, stem: &mut Stem) -> Vec<String> {
+fn query_terms(query: &str, stem: &mut Stemmer) -> Vec<String> {
     let mut terms: Vec<String> = Vec::new();
     for word in query.split_whitespace() {
         // Punctuation never appears in index terms either, so strip it.
@@ -208,12 +208,41 @@ fn query_terms(query: &str, stem: &mut Stem) -> Vec<String> {
         }
         // The index has no spelling data, so an unknown word just stems to
         // something that matches nothing; it cannot break anything here.
-        let stemmed = stem.apply(&word).unwrap_or(word);
+        let stemmed = stem.stem(&word).to_string();
         if !terms.contains(&stemmed) {
             terms.push(stemmed);
         }
     }
     terms
+}
+
+/// A stemmer that remembers the stem of every word it has seen. Natural
+/// text repeats its words heavily, and every uncached stem crosses the
+/// Xapian FFI; one instance serves a whole search (the query terms and all
+/// hits' paragraph matchers), so repeats dominate after the first hit.
+struct Stemmer {
+    stem: Stem,
+    cache: std::collections::HashMap<String, String>,
+}
+
+impl Stemmer {
+    fn new(language: &str) -> xapian2::Result<Self> {
+        Ok(Self {
+            stem: Stem::new(language)?,
+            cache: std::collections::HashMap::new(),
+        })
+    }
+
+    /// The word's stem, cased and stemmed the way `query_terms` and the ZIM
+    /// full-text indexes were built (lowercased Porter2 stems).
+    fn stem(&mut self, word: &str) -> &str {
+        if !self.cache.contains_key(word) {
+            let lowered = word.to_lowercase();
+            let stemmed = self.stem.apply(&lowered).unwrap_or(lowered);
+            self.cache.insert(word.to_string(), stemmed);
+        }
+        self.cache[word].as_str()
+    }
 }
 
 fn search_impl(library: &ZimLibrary, query: &str) -> Result<SearchResults, ToolError> {
@@ -245,8 +274,8 @@ fn search_impl(library: &ZimLibrary, query: &str) -> Result<SearchResults, ToolE
     // still retrieves results for the good words.
     // The query's terms drive two things: the all-terms boost below and the
     // paragraph matching when the hits are built - one stemmer serves both.
-    let mut stem = Stem::new("english")?;
-    let terms = query_terms(query, &mut stem);
+    let mut stemmer = Stemmer::new("english")?;
+    let terms = query_terms(query, &mut stemmer);
     let xquery = if terms.len() >= 2 {
         // Fold the AND left to right; Xapian flattens the tree itself.
         let mut all_terms = Query::term(&terms[0])?;
@@ -358,7 +387,7 @@ fn search_impl(library: &ZimLibrary, query: &str) -> Result<SearchResults, ToolE
         // Markdown editions carry plain Markdown, not HTML: pick the matching
         // splitter so the paragraphs and section names are free of markup.
         let is_markdown = mime.as_deref().is_some_and(|m| m.contains("markdown"));
-        let (text, sections) = hit_text(&article, &terms, *exact, &mut stem, is_markdown);
+        let (text, sections) = hit_text(&article, &terms, *exact, &mut stemmer, is_markdown);
         hits.push(SearchHit {
             zim: arc.name.clone(),
             path: path.clone(),
@@ -370,34 +399,26 @@ fn search_impl(library: &ZimLibrary, query: &str) -> Result<SearchResults, ToolE
     Ok(SearchResults { results: hits })
 }
 
-/// A word's stem, tokenized and cased the way `query_terms` and the ZIM
-/// full-text indexes were built.
-fn stem_word(word: &str, stem: &mut Stem) -> String {
-    stem.apply(word).unwrap_or_else(|_| word.to_string())
-}
-
 /// How many of `text`'s word occurrences are query terms - the paragraph's
 /// match count, stemmed the same way the index and the query are.
-fn para_matches(text: &str, terms: &[String], stem: &mut Stem) -> usize {
+fn para_matches(text: &str, terms: &[String], stem: &mut Stemmer) -> usize {
     text.split(|c: char| !c.is_alphanumeric())
-        .map(|w| w.to_lowercase())
-        .filter(|w| !w.is_empty() && !STOPWORDS.contains(&w.as_str()))
-        .filter(|w| terms.contains(&stem_word(w, stem)))
+        .filter(|w| !w.is_empty() && !STOPWORDS.iter().any(|s| s.eq_ignore_ascii_case(w)))
+        .filter(|w| terms.iter().any(|t| t == stem.stem(w)))
         .count()
 }
 
 /// Whether every query term occurs (stemmed) somewhere in `text`'s words.
-fn covers_all_terms(text: &str, terms: &[String], stem: &mut Stem) -> bool {
+fn covers_all_terms(text: &str, terms: &[String], stem: &mut Stemmer) -> bool {
     let mut covered = vec![false; terms.len()];
     let mut left = terms.len();
     for word in text.split(|c: char| !c.is_alphanumeric()) {
-        let word = word.to_lowercase();
-        if word.is_empty() || STOPWORDS.contains(&word.as_str()) {
+        if word.is_empty() || STOPWORDS.iter().any(|s| s.eq_ignore_ascii_case(word)) {
             continue;
         }
-        let stemmed = stem_word(&word, stem);
+        let stemmed = stem.stem(word);
         for (k, term) in terms.iter().enumerate() {
-            if !covered[k] && *term == stemmed {
+            if !covered[k] && term.as_str() == stemmed {
                 covered[k] = true;
                 left -= 1;
                 if left == 0 {
@@ -433,7 +454,7 @@ fn hit_text(
     article: &str,
     terms: &[String],
     exact: bool,
-    stem: &mut Stem,
+    stem: &mut Stemmer,
     is_markdown: bool,
 ) -> (String, Option<Vec<String>>) {
     let intro = if is_markdown {

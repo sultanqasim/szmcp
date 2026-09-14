@@ -5,14 +5,25 @@
 /// Case-insensitive byte substring search from index `from`. Returns `None`
 /// when `needle` cannot occur in `hay` (empty, or longer than `hay`).
 fn find_ci(hay: &[u8], from: usize, needle: &[u8]) -> Option<usize> {
-    if needle.is_empty() || needle.len() > hay.len() || from >= hay.len() {
+    if needle.is_empty() || needle.len() > hay.len() {
         return None;
     }
     let limit = hay.len() - needle.len();
-    for i in from..=limit {
+    let first = needle[0];
+    let mut i = from;
+    while i <= limit {
+        // A match starts with the needle's first byte: scan for that one
+        // byte per position instead of comparing the whole needle, which
+        // keeps the long close-tag scans (a heading's `</hN>` can lie tens
+        // of kilobytes away) cheap.
+        let Some(step) = hay[i..=limit].iter().position(|&c| c.eq_ignore_ascii_case(&first)) else {
+            return None;
+        };
+        i += step;
         if hay[i..i + needle.len()].eq_ignore_ascii_case(needle) {
             return Some(i);
         }
+        i += 1;
     }
     None
 }
@@ -366,13 +377,17 @@ fn paragraphs(html: &str, max_para_chars: usize) -> Vec<String> {
                 i += 1;
             }
             _ => {
-                // `i` is always on a char boundary: we advance by
-                // len_utf8() or by single-byte ASCII steps.
-                let ch = html[i..].chars().next().unwrap();
+                // A run of plain text: push it whole instead of char by
+                // char. The run ends at the next `<`, `&` or whitespace -
+                // all ASCII bytes, so the slice end is a char boundary.
+                let run = bytes[i..]
+                    .iter()
+                    .position(|&b| b == b'<' || b == b'&' || b.is_ascii_whitespace())
+                    .map_or(html.len(), |p| i + p);
                 if in_p {
-                    cur.push(ch);
+                    cur.push_str(&html[i..run]);
                 }
-                i += ch.len_utf8();
+                i = run;
             }
         }
     }
