@@ -19,12 +19,17 @@ use xapian2::{Enquire, Operator, Query, QueryParser, Stem, StemStrategy};
 
 /// Number of results `zim_search` returns in total (across all archives).
 const SEARCH_LIMIT: u32 = 20;
-/// Maximum characters of intro text reported per search hit.
+/// Maximum characters of the `text` reported per search hit.
 const INTRO_CHARS: usize = 300;
-/// How many raw bytes of an article are read to derive its intro. Modern
-/// MediaWiki pages carry kilobytes of template CSS and infobox markup before
-/// the lead paragraph, so this needs generous headroom.
-const INTRO_READ_BYTES: u64 = 64 * 1024;
+/// How many raw bytes of an article are read to locate the query's matches
+/// in it (region and paragraph level). Matching needs the whole article, not
+/// just the lead the old 64 KiB intro preview covered; for compressed
+/// clusters the whole cluster decompresses anyway.
+const HIT_READ_BYTES: u64 = 1024 * 1024;
+/// Cap on one paragraph's characters while scanning it for matches: long
+/// paragraphs keep matching far into their text. A paragraph chosen for
+/// reporting is truncated to `INTRO_CHARS` separately.
+const PARA_MATCH_CHARS: usize = 2000;
 
 /// Common English words dropped when collecting an all-terms query boost.
 /// They are stopped at index time (libzim's TermGenerator), so they are
@@ -141,8 +146,13 @@ pub struct SearchHit {
     pub path: String,
     /// Page/article title
     pub title: String,
-    /// Page/article intro
-    pub intro: String,
+    /// First paragraph of the article when the query matches the title or
+    /// the intro, otherwise the paragraph with the most query matches
+    pub text: String,
+    /// Names of the sections holding query matches; absent when the query
+    /// matches the title or the intro
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sections: Option<Vec<String>>,
 }
 
 /// The search result set (best matches first).
@@ -229,19 +239,19 @@ fn search_impl(library: &ZimLibrary, query: &str) -> Result<SearchResults, ToolE
     // nothing - and the indexes have no spelling data, so a misspelled word
     // simply matches nothing in the AND branch while the parsed OR branch
     // still retrieves results for the good words.
-    let xquery = {
-        let mut stem = Stem::new("english")?;
-        let terms = query_terms(query, &mut stem);
-        if terms.len() >= 2 {
-            // Fold the AND left to right; Xapian flattens the tree itself.
-            let mut all_terms = Query::term(&terms[0])?;
-            for term in &terms[1..] {
-                all_terms = Query::combine(Operator::And, &all_terms, &Query::term(term)?)?;
-            }
-            Query::combine(Operator::Or, &all_terms, &xquery)?
-        } else {
-            xquery
+    // The query's terms drive two things: the all-terms boost below and the
+    // paragraph matching when the hits are built - one stemmer serves both.
+    let mut stem = Stem::new("english")?;
+    let terms = query_terms(query, &mut stem);
+    let xquery = if terms.len() >= 2 {
+        // Fold the AND left to right; Xapian flattens the tree itself.
+        let mut all_terms = Query::term(&terms[0])?;
+        for term in &terms[1..] {
+            all_terms = Query::combine(Operator::And, &all_terms, &Query::term(term)?)?;
         }
+        Query::combine(Operator::Or, &all_terms, &xquery)?
+    } else {
+        xquery
     };
 
     // Exact title/URL matches, found in the ZIM directory itself: redirects
@@ -322,7 +332,7 @@ fn search_impl(library: &ZimLibrary, query: &str) -> Result<SearchResults, ToolE
 
     let mut hits = Vec::with_capacity(merged.len());
     for (arc, path, idx_title, exact) in &merged {
-        let (entry_title, mime, bytes) = match arc.article_preview(path, INTRO_READ_BYTES) {
+        let (entry_title, mime, bytes) = match arc.article_preview(path, HIT_READ_BYTES) {
             Ok(Some((entry_title, mime, bytes))) => (entry_title, mime, bytes),
             _ => (String::new(), None, Vec::new()),
         };
@@ -340,17 +350,123 @@ fn search_impl(library: &ZimLibrary, query: &str) -> Result<SearchResults, ToolE
         } else {
             path.clone()
         };
-        let text = String::from_utf8_lossy(&bytes);
+        let article = String::from_utf8_lossy(&bytes);
         // Markdown editions carry plain Markdown, not HTML: pick the matching
-        // extractor so the intro is clean text, free of markup.
-        let intro = if mime.as_deref().is_some_and(|m| m.contains("markdown")) {
-            markdown::intro_from_markdown(&text, INTRO_CHARS)
+        // splitter so the paragraphs and section names are free of markup.
+        let secs = if mime.as_deref().is_some_and(|m| m.contains("markdown")) {
+            markdown::sections(&article, PARA_MATCH_CHARS)
         } else {
-            html::intro_from_html(&text, INTRO_CHARS)
+            html::sections(&article, PARA_MATCH_CHARS)
         };
-        hits.push(SearchHit { zim: arc.name.clone(), path: path.clone(), title, intro });
+        let (text, sections) = hit_text(&secs, &terms, *exact, &mut stem);
+        hits.push(SearchHit {
+            zim: arc.name.clone(),
+            path: path.clone(),
+            title,
+            text,
+            sections,
+        });
     }
     Ok(SearchResults { results: hits })
+}
+
+/// A word's stem, tokenized and cased the way `query_terms` and the ZIM
+/// full-text indexes were built.
+fn stem_word(word: &str, stem: &mut Stem) -> String {
+    stem.apply(word).unwrap_or_else(|_| word.to_string())
+}
+
+/// How many of `text`'s word occurrences are query terms - the paragraph's
+/// match count, stemmed the same way the index and the query are.
+fn para_matches(text: &str, terms: &[String], stem: &mut Stem) -> usize {
+    text.split(|c: char| !c.is_alphanumeric())
+        .map(|w| w.to_lowercase())
+        .filter(|w| !w.is_empty() && !STOPWORDS.contains(&w.as_str()))
+        .filter(|w| terms.contains(&stem_word(w, stem)))
+        .count()
+}
+
+/// Whether every query term occurs (stemmed) somewhere in `paras`' words.
+fn covers_all_terms(paras: &[String], terms: &[String], stem: &mut Stem) -> bool {
+    let mut covered = vec![false; terms.len()];
+    let mut left = terms.len();
+    for para in paras {
+        for word in para.split(|c: char| !c.is_alphanumeric()) {
+            let word = word.to_lowercase();
+            if word.is_empty() || STOPWORDS.contains(&word.as_str()) {
+                continue;
+            }
+            let stemmed = stem_word(&word, stem);
+            for (k, term) in terms.iter().enumerate() {
+                if !covered[k] && *term == stemmed {
+                    covered[k] = true;
+                    left -= 1;
+                    if left == 0 {
+                        return true;
+                    }
+                }
+            }
+        }
+    }
+    left == 0
+}
+
+/// The `text`/`sections` pair of one search hit, from the article's
+/// `(region name, paragraphs)` list (`html`/`markdown::sections`, whose
+/// first entry is the intro region):
+///
+/// - a hit whose title matched exactly is a title match by definition: its
+///   text is the first intro paragraph, no sections;
+/// - otherwise, when every query term occurs in the intro region's
+///   paragraphs (an intro match), same: the lead already covers the query;
+/// - otherwise the sections with at least one query match are listed and
+///   the text is the best-matching paragraph (most matching word
+///   occurrences; ties keep the earliest), truncated to `INTRO_CHARS`;
+/// - when no section matches either (only the title in the index matched
+///   the query), the text falls back to the first intro paragraph. Regions
+///   without paragraphs degrade to empty text, never a panic.
+fn hit_text(
+    secs: &[(String, Vec<String>)],
+    terms: &[String],
+    exact: bool,
+    stem: &mut Stem,
+) -> (String, Option<Vec<String>>) {
+    let Some((_, intro)) = secs.first() else {
+        return (String::new(), None);
+    };
+    let first_para = || {
+        intro.first()
+            .map(|p| p.chars().take(INTRO_CHARS).collect())
+            .unwrap_or_default()
+    };
+    if exact || covers_all_terms(intro, terms, stem) {
+        return (first_para(), None);
+    }
+    let mut best_count = 0usize;
+    let mut best_para: Option<&String> = None;
+    let mut names: Vec<String> = Vec::new();
+    for (name, paras) in secs.iter().skip(1) {
+        let mut matched = false;
+        for para in paras {
+            let n = para_matches(para, terms, stem);
+            if n > 0 {
+                matched = true;
+                if n > best_count {
+                    // Ties keep the earlier paragraph: only a strictly
+                    // better count replaces the incumbent.
+                    best_count = n;
+                    best_para = Some(para);
+                }
+            }
+        }
+        if matched {
+            names.push(name.clone());
+        }
+    }
+    match best_para {
+        Some(p) => (p.chars().take(INTRO_CHARS).collect(), Some(names)),
+        None => (first_para(), None),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -462,7 +578,9 @@ mod tests {
         assert_eq!(first.zim, "test.zim");
         assert_eq!(first.path, "C/Apple");
         assert_eq!(first.title, "Apple");
-        assert!(first.intro.contains("apple is the fruit of"), "{:?}", first.intro);
+        // An exact title match reports the lead paragraph as its text.
+        assert_eq!(first.text, "An apple is the fruit of <rosaceae> trees.");
+        assert_eq!(first.sections, None);
 
         // Stemmed query ("computing" -> "comput").
         let params = serde_json::from_value::<ZimSearchParams>(
@@ -567,7 +685,10 @@ mod tests {
         assert_eq!(hits[0].path, "C/Nitrogen", "{hits:?}");
         assert_eq!(hits[0].title, "Nitrogen");
         assert_eq!(hits[0].zim, "test.zim");
-        assert!(hits[0].intro.contains("colorless"), "{:?}", hits[0].intro);
+        // An exact match is a title match: the lead paragraph, no sections.
+        assert_eq!(hits[0].text, "Nitrogen is a colorless, odorless gas.");
+        assert_eq!(hits[0].sections, None);
+        assert!(!serde_json::to_string(&hits[0]).unwrap().contains("sections"));
         // The BM25 runner-up is still reported, behind the exact match.
         assert_eq!(hits[1].path, "C/Atmosphere", "{hits:?}");
     }
@@ -583,8 +704,9 @@ mod tests {
         let hits = search(&server, "NACA");
         assert_eq!(hits[0].path, "C/NACA", "{hits:?}");
         assert_eq!(hits[0].title, "NACA");
-        // The intro is built from the redirect target's content.
-        assert!(hits[0].intro.contains("science of flight"), "{:?}", hits[0].intro);
+        // The text is built from the redirect target's content.
+        assert_eq!(hits[0].text, "Aeronautics is the science of flight.");
+        assert_eq!(hits[0].sections, None);
         // Fulltext hits follow in BM25 order.
         assert_eq!(hits[1].path, "C/Atmosphere", "{hits:?}");
         assert_eq!(hits[2].path, "C/Aeronautics", "{hits:?}");
@@ -608,6 +730,54 @@ mod tests {
         assert_eq!(hits.len(), 2, "{hits:?}");
         assert_eq!(hits[0].path, "C/Atmosphere", "{hits:?}");
         assert_eq!(hits[1].path, "C/Nitrogen", "{hits:?}");
+        // The Atmosphere lead covers the whole query ("The atmosphere is
+        // mostly nitrogen and oxygen."): an intro match. The Nitrogen lead
+        // only covers "nitrogen", its article has no sections, and the
+        // text falls back to the first intro paragraph.
+        assert_eq!(hits[0].sections, None, "{:?}", hits[0]);
+        assert_eq!(hits[0].text, "The atmosphere is mostly nitrogen and oxygen.");
+        assert_eq!(hits[1].sections, None, "{:?}", hits[1]);
+        assert_eq!(hits[1].text, "Nitrogen is a colorless, odorless gas.");
+    }
+
+    #[test]
+    fn e2e_search_intro_match_reports_lead_without_sections() {
+        // Both query terms occur in the lead paragraph ("An apple is the
+        // fruit of <rosaceae> trees."): an intro match on a full-text hit
+        // (nobody's title is "apple fruit"), so the text is the lead and
+        // the serialized JSON carries no "sections" field at all.
+        let (server, _keep) = test_server();
+        let hits = search(&server, "apple fruit");
+        assert_eq!(hits.len(), 1, "{hits:?}");
+        assert_eq!(hits[0].path, "C/Apple");
+        assert_eq!(hits[0].text, "An apple is the fruit of <rosaceae> trees.");
+        assert_eq!(hits[0].sections, None);
+        let json = serde_json::to_string(&hits[0]).unwrap();
+        assert!(!json.contains("sections"), "{json}");
+    }
+
+    #[test]
+    fn e2e_search_section_match_reports_sections_and_best_paragraph() {
+        // The query term appears only in a later section of the article
+        // ("Wild apples grew in Kazakhstan." under History): the intro
+        // cannot cover it, so the hit reports the matched sections and the
+        // best-matching paragraph, not the lead.
+        let (server, _keep) = test_server();
+        let hits = search(&server, "kazakhstan");
+        assert_eq!(hits.len(), 1, "{hits:?}");
+        let hit = &hits[0];
+        assert_eq!(hit.path, "C/Apple");
+        // The paragraph sits under History, whose range includes the nested
+        // Domestication heading: both sections report the match.
+        assert_eq!(
+            hit.sections,
+            Some(vec!["History".to_string(), "Domestication".to_string()]),
+            "{hit:?}"
+        );
+        assert_eq!(hit.text, "Wild apples grew in Kazakhstan.");
+        // The serialized JSON carries the section names.
+        let json = serde_json::to_string(hit).unwrap();
+        assert!(json.contains(r#""sections":["History","Domestication"]"#), "{json}");
     }
 
     #[test]
@@ -641,6 +811,10 @@ mod tests {
         assert_eq!(hits[0].title, "Dessert Recipes");
         // The partial match (only "cherry") is still reported, right behind.
         assert_eq!(hits[1].path, "C/Cherry", "{hits:?}");
+        // Neither hit's lead covers both terms and the fixture has no
+        // sections: the text falls back to the first intro paragraph.
+        assert_eq!(hits[0].sections, None);
+        assert!(hits[0].text.contains("cherry is the fruit"), "{:?}", hits[0].text);
     }
 
     #[test]
@@ -748,10 +922,10 @@ Ancient India smelted zinc early.
         assert!(library.archives[0].searchable());
         let server = ZimMcpServer::new(library);
 
-        // Search: the intro is plain text derived from the Markdown, free of
-        // markup, and starts with the lead paragraph - the leading `# Zinc`
-        // title line (a separate field of every hit) and the hatnote are
-        // dropped.
+        // Search: the text is plain text derived from the Markdown, free of
+        // markup, and is the lead paragraph - the leading `# Zinc` title
+        // line (a separate field of every hit) and the hatnote are dropped.
+        // An exact title match never carries sections.
         let params = serde_json::from_value::<ZimSearchParams>(
             serde_json::json!({ "query": "zinc" }),
         )
@@ -762,19 +936,20 @@ Ancient India smelted zinc early.
         assert_eq!(hits[0].path, "C/Zinc");
         assert!(
             hits[0]
-                .intro
+                .text
                 .starts_with("Zinc is a chemical element with the symbol Zn."),
             "{:?}",
-            hits[0].intro
+            hits[0].text
         );
         assert!(
-            !hits[0].intro.contains("disambiguation")
-                && !hits[0].intro.contains("**")
-                && !hits[0].intro.contains("[[")
-                && !hits[0].intro.contains('#'),
+            !hits[0].text.contains("disambiguation")
+                && !hits[0].text.contains("**")
+                && !hits[0].text.contains("[[")
+                && !hits[0].text.contains('#'),
             "{:?}",
-            hits[0].intro
+            hits[0].text
         );
+        assert_eq!(hits[0].sections, None);
 
         // Section extraction on the Markdown article: case-insensitive,
         // includes the subsection, reports the heading as written.

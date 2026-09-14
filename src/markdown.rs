@@ -125,6 +125,13 @@ fn is_hatnote(para: &str) -> bool {
 /// renders "For other uses..." notes) are dropped, so the intro starts with
 /// the actual lead text. Whitespace collapses to single spaces; markup and
 /// whitespace never consume the character budget.
+///
+/// Not used by the search hit path anymore (`sections` shapes its text and
+/// also reports where in the article the query matched), but kept beside it:
+/// unlike `sections` it walks the document once and stops as soon as the
+/// budget is full, and it emits mid-document heading text, so rebuilding it
+/// on `sections` would change its observable behavior.
+#[allow(dead_code)]
 pub fn intro_from_markdown(md: &str, max_chars: usize) -> String {
     let mut out = String::new();
     let mut in_fence = false;
@@ -228,6 +235,170 @@ pub fn intro_from_markdown(md: &str, max_chars: usize) -> String {
         push_text(&mut out, &text, max_chars);
     }
     out.trim().to_string()
+}
+
+/// Append one cleaned paragraph to the list, capped at `max_para_chars`
+/// characters (whitespace collapses the way [`push_text`] collapses it).
+fn push_paragraph(paras: &mut Vec<String>, text: &str, max_para_chars: usize) {
+    let mut out = String::new();
+    push_text(&mut out, text, max_para_chars);
+    if !out.is_empty() {
+        paras.push(out);
+    }
+}
+
+/// The cleaned paragraph texts of one Markdown region: each
+/// blank-line-separated block, cleaned the way `intro_from_markdown` cleans
+/// its text (wikilinks resolved, emphasis and inline-code markers stripped,
+/// hatnotes dropped, fenced blocks skipped, raw HTML blocks handed to
+/// `intro_from_html`), each capped at `max_para_chars`. Deeper headings
+/// inside the region (a `###` under a `##` section) are dropped like the
+/// HTML path drops heading text: they name subregions, and their content's
+/// paragraphs follow right after them.
+fn md_paragraphs(lines: &[&str], max_para_chars: usize) -> Vec<String> {
+    let mut paras: Vec<String> = Vec::new();
+    let mut in_fence = false;
+    let mut i = 0usize;
+    while i < lines.len() {
+        let t = lines[i].trim_start();
+        if is_fence(t) {
+            in_fence = !in_fence;
+            i += 1;
+            continue;
+        }
+        if in_fence || t.is_empty() || heading_level(t) > 0 {
+            i += 1;
+            continue;
+        }
+        if t.starts_with('|') {
+            // A pipe table: one paragraph of its cells' text; a dash-only
+            // separator row is pure markup. Wikilinks are resolved first -
+            // their `|` is a label separator, not a cell boundary.
+            let mut cells = String::new();
+            while i < lines.len() {
+                let n = lines[i].trim_start();
+                if !n.starts_with('|') {
+                    break;
+                }
+                i += 1;
+                let row = strip_inline(n).replace('|', " ");
+                let row = row.trim();
+                if !row.is_empty() && !row.chars().all(|c| matches!(c, '-' | ':' | ' ')) {
+                    if !cells.is_empty() {
+                        cells.push(' ');
+                    }
+                    cells.push_str(row);
+                }
+            }
+            push_paragraph(&mut paras, &cells, max_para_chars);
+            continue;
+        }
+        if t.starts_with('<') {
+            // Raw HTML block (a complex table, its styles): it runs to the
+            // next blank line, and the HTML helpers strip tags and drop
+            // table/style content.
+            let mut block = String::from(lines[i]);
+            i += 1;
+            while i < lines.len() && !lines[i].trim().is_empty() {
+                block.push('\n');
+                block.push_str(lines[i]);
+                i += 1;
+            }
+            let text = html::intro_from_html(&block, max_para_chars);
+            push_paragraph(&mut paras, &text, max_para_chars);
+            continue;
+        }
+        if list_marker_len(t).is_some() {
+            // A run of list items becomes one paragraph: the items of a
+            // "Key Facts" or "See also" list belong together. Dash-only
+            // item bodies carry no text.
+            let mut items = String::new();
+            while let Some(n) = lines.get(i).map(|l| l.trim_start()) {
+                let Some(m) = list_marker_len(n) else { break };
+                i += 1;
+                let body = &n[m..];
+                if !body.chars().all(|c| matches!(c, '-' | ':' | ' ')) {
+                    if !items.is_empty() {
+                        items.push(' ');
+                    }
+                    items.push_str(&strip_inline(body));
+                }
+            }
+            push_paragraph(&mut paras, &items, max_para_chars);
+            continue;
+        }
+        // A plain paragraph: gather its remaining lines so a hatnote (see
+        // `is_hatnote`) can be skipped whole. Any special line - heading,
+        // list, table, fence, HTML, a textless dash row - ends the
+        // paragraph and is handled on its own turn through the loop.
+        let mut para = String::from(t);
+        i += 1;
+        while i < lines.len() {
+            let n = lines[i].trim_start();
+            if n.is_empty()
+                || is_fence(n)
+                || heading_level(n) > 0
+                || n.starts_with('|')
+                || n.starts_with('<')
+                || list_marker_len(n).is_some()
+                || n.chars().all(|c| matches!(c, '-' | ':' | ' '))
+            {
+                break;
+            }
+            para.push('\n');
+            para.push_str(lines[i]);
+            i += 1;
+        }
+        if para.chars().all(|c| matches!(c, '-' | ':' | ' ')) {
+            continue; // a thematic break carries no text
+        }
+        if is_hatnote(&para) {
+            continue;
+        }
+        push_paragraph(&mut paras, &strip_inline(&para), max_para_chars);
+    }
+    paras
+}
+
+/// Split a Markdown article into its intro region and one region per
+/// heading, with the cleaned paragraph texts of each region (the shape
+/// [`html::sections`] mirrors for HTML). Returns `(name, paragraphs)` pairs:
+/// the first entry carries the intro region under the empty name, the later
+/// entries carry each heading's section under the heading text as written,
+/// spanning what [`section_content`] would return for it, so a nested
+/// `###`'s paragraphs belong to its own entry and to the enclosing `##`'s.
+/// The leading `# Title` heading is the article title - a separate field of
+/// every search hit - not a section: when the document opens with a
+/// heading, it is dropped (the positional rule `intro_from_markdown`
+/// applies to that line) and the intro region runs from after it.
+pub fn sections(md: &str, max_para_chars: usize) -> Vec<(String, Vec<String>)> {
+    let lines: Vec<&str> = md.lines().collect();
+    let headings = collect_headings(&lines);
+    let title = headings
+        .first()
+        .filter(|h| lines[..h.line].iter().all(|l| l.trim().is_empty()));
+    let (intro_start, first_section) = match title {
+        Some(t) => (t.line + 1, 1),
+        None => (0, 0),
+    };
+    let intro_end = headings
+        .get(first_section)
+        .map_or(lines.len(), |h| h.line);
+    let mut out = vec![(
+        String::new(),
+        md_paragraphs(&lines[intro_start..intro_end], max_para_chars),
+    )];
+    for (i, h) in headings.iter().enumerate().skip(first_section) {
+        let end = headings[i + 1..]
+            .iter()
+            .find(|n| n.level <= h.level)
+            .map_or(lines.len(), |n| n.line);
+        out.push((
+            h.name.clone(),
+            md_paragraphs(&lines[h.line + 1..end], max_para_chars),
+        ));
+    }
+    out
 }
 
 struct Heading {
@@ -524,5 +695,83 @@ That is all.
         // The fence (with its heading-looking line) stays in the section.
         assert!(real.contains("## Fake"), "{real:?}");
         assert!(real.contains("More."), "{real:?}");
+    }
+
+    /// Title, hatnote, lead paragraphs, a section with a nested heading, a
+    /// section with a table, a fence, a list and an HTML block - the block
+    /// kinds `md_paragraphs` has to tell apart.
+    const SECTIONS_MD: &str = "# Salt\n\n*This article is about the mineral. For the seasoning, see [[Pepper]].*\n\n**Salt** is a mineral composed of sodium chloride.\n\nIt is an ionic compound.\n\n## History\n\nSalt has been mined for millennia.\n\n### China\n\nChinese salt lakes fed ancient trade.\n\n## Uses\n\n| Use | Detail |\n| --- | --- |\n| seasoning | keeps food edible |\n\n```\nfenced code, not prose\n```\n\n- [[Preservation|preserving]] meat\n- tanning\n\n<p>plain &amp; <b>bold</b></p>\n\nFinal paragraph.\n";
+
+    #[test]
+    fn sections_split_intro_and_headings_with_clean_paragraphs() {
+        let secs = sections(SECTIONS_MD, 400);
+        // The intro region: the paragraphs after the leading `# Title` line
+        // (dropped - the title is a separate field of every hit), with the
+        // hatnote dropped, under the empty name.
+        assert_eq!(secs[0].0, "");
+        assert_eq!(
+            secs[0].1,
+            vec![
+                "Salt is a mineral composed of sodium chloride.".to_string(),
+                "It is an ionic compound.".to_string(),
+            ]
+        );
+        // One entry per heading (nested ones included), named as written.
+        assert_eq!(secs[1].0, "History");
+        assert_eq!(
+            secs[1].1,
+            vec![
+                "Salt has been mined for millennia.".to_string(),
+                "Chinese salt lakes fed ancient trade.".to_string(),
+            ]
+        );
+        assert_eq!(secs[2].0, "China");
+        assert_eq!(secs[2].1, vec!["Chinese salt lakes fed ancient trade."]);
+        assert_eq!(secs[3].0, "Uses");
+        assert_eq!(
+            secs[3].1,
+            vec![
+                // The table's cells run together into one paragraph.
+                "Use Detail seasoning keeps food edible".to_string(),
+                // The list items run together into one paragraph.
+                "preserving meat tanning".to_string(),
+                // The HTML block goes through the HTML helpers.
+                "plain & bold".to_string(),
+                "Final paragraph.".to_string(),
+            ]
+        );
+        assert_eq!(secs.len(), 4);
+        for (name, paras) in &secs {
+            // Hatnote, title line and fence content never become paragraphs.
+            assert!(!paras.iter().any(|p| p.contains("seasoning, see")), "{name}: {paras:?}");
+            assert!(!paras.iter().any(|p| p.contains("fenced code")), "{name}: {paras:?}");
+            assert!(!paras.iter().any(|p| p.contains('#')), "{name}: {paras:?}");
+            assert!(!paras.iter().any(|p| p.contains("**") || p.contains("[[")), "{name}: {paras:?}");
+        }
+    }
+
+    #[test]
+    fn sections_without_a_leading_title_heading() {
+        // A document that does not open with `# Title`: nothing is dropped,
+        // the plain lead is the intro region.
+        let md = "Plain lead text.\n\n## Section\n\nBody.\n";
+        let secs = sections(md, 100);
+        assert_eq!(secs[0].0, "");
+        assert_eq!(secs[0].1, vec!["Plain lead text."]);
+        assert_eq!(secs[1].0, "Section");
+        assert_eq!(secs[1].1, vec!["Body."]);
+
+        // No headings at all: a single intro entry.
+        assert_eq!(
+            sections("One.\n\nTwo.\n", 100),
+            vec![("".to_string(), vec!["One.".to_string(), "Two.".to_string()])]
+        );
+    }
+
+    #[test]
+    fn sections_cap_paragraph_characters() {
+        let secs = sections(SECTIONS_MD, 12);
+        assert_eq!(secs[0].1[0], "Salt is a mi");
+        assert!(secs.iter().all(|(_, paras)| paras.iter().all(|p| p.chars().count() <= 12)));
     }
 }

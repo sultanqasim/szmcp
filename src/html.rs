@@ -127,6 +127,41 @@ fn element_end(html: &str, open_i: usize, tag_name: &str) -> usize {
     html.len()
 }
 
+/// The tag starting at `<i>` (`html[i] == b'<'`): its name (as written),
+/// its attribute text (empty for close tags and comments), whether it is an
+/// open tag, and the index just past its `>`. `None` when the fragment ends
+/// inside the tag.
+fn tag_at(html: &str, i: usize) -> Option<(&str, &str, bool, usize)> {
+    let bytes = html.as_bytes();
+    let gt = i + bytes[i..].iter().position(|&c| c == b'>')?;
+    let tag = &html[i + 1..gt];
+    let name_end = tag
+        .find(|c: char| c.is_whitespace() || c == '/')
+        .unwrap_or(tag.len());
+    let (name, attrs) = tag.split_at(name_end);
+    let opens = name.as_bytes().first().is_some_and(|&c| c.is_ascii_alphabetic());
+    Some((name, attrs, opens, gt + 1))
+}
+
+/// The index just past the close tag matching the skipped open element at
+/// `open_i`. Tables nest (an infobox holds nested tables), so their close
+/// tag is matched by depth - ending the skip at an inner table's close
+/// would spill the rest of the infobox into the text. Other skipped
+/// elements never nest; their first close tag ends the skip (a script's
+/// text may itself contain "<script", so depth counting could overshoot
+/// there). An element never closed within the scanned text ends the skip
+/// at the end of it.
+fn skip_end(html: &str, open_i: usize, tag_name: &str) -> usize {
+    if tag_name.eq_ignore_ascii_case("table") {
+        element_end(html, open_i, tag_name)
+    } else {
+        let close = format!("</{tag_name}");
+        find_ci(html.as_bytes(), open_i + 1, close.as_bytes()).map_or(html.len(), |cp| {
+            html[cp..].find('>').map_or(html.len(), |g| cp + g + 1)
+        })
+    }
+}
+
 /// The region of a MediaWiki page that holds the article. Scanning the whole
 /// HTML would pick up browser-chrome text (title bar, navigation menus), so
 /// cut the page at the content div (`id="mw-content-text"`) and its matching
@@ -195,16 +230,9 @@ pub fn intro_from_html(html: &str, max_chars: usize) -> String {
     while i < bytes.len() && out.chars().count() < max_chars {
         match bytes[i] {
             b'<' => {
-                let Some(gt_rel) = bytes[i..].iter().position(|&c| c == b'>') else {
+                let Some((tag_name, attrs, opens, after)) = tag_at(html, i) else {
                     break;
                 };
-                let gt = i + gt_rel;
-                let tag = &html[i + 1..gt];
-                let tag_name = tag
-                    .split(|c: char| c.is_whitespace() || c == '/')
-                    .next()
-                    .unwrap_or("")
-                    .to_ascii_lowercase();
                 // Elements whose whole content stays out of the intro: the
                 // INTRO_SKIP_TAGS set plus hatnotes (`is_hatnote_attrs`).
                 // Only a real open tag qualifies: a close tag (`</div>`)
@@ -213,33 +241,16 @@ pub fn intro_from_html(html: &str, max_chars: usize) -> String {
                 // comment could quote `class="hatnote"` in its text). Jump
                 // to the element's close tag (hatnote divs hold no nested
                 // same-name element); failing that, drop just the open tag.
-                let opens = tag.as_bytes().first().is_some_and(|&c| c.is_ascii_alphabetic());
                 let skip = opens
-                    && (INTRO_SKIP_TAGS.contains(&tag_name.as_str())
-                        || is_hatnote_attrs(&tag[tag_name.len()..]));
+                    && (INTRO_SKIP_TAGS.iter().any(|t| tag_name.eq_ignore_ascii_case(t))
+                        || is_hatnote_attrs(attrs));
                 if skip {
-                    // Tables nest (an infobox holds nested tables), so their
-                    // close tag is matched by depth - ending the skip at an
-                    // inner table's close would spill the rest of the
-                    // infobox into the intro. Other skipped elements never
-                    // nest; their first close tag ends the skip (a script's
-                    // text may itself contain "<script", so depth counting
-                    // could overshoot there). An element never closed within
-                    // the scanned text ends the skip at the end of it.
-                    let end = if tag_name == "table" {
-                        element_end(html, i, &tag_name)
-                    } else {
-                        let close = format!("</{tag_name}");
-                        find_ci(bytes, i + 1, close.as_bytes()).map_or(html.len(), |cp| {
-                            bytes[cp..].iter().position(|&c| c == b'>').map_or(html.len(), |g| cp + g + 1)
-                        })
-                    };
-                    i = end;
+                    i = skip_end(html, i, tag_name);
                     sep = true;
                     continue;
                 }
                 sep = true;
-                i = gt + 1;
+                i = after;
             }
             b'&' => {
                 let (text, next) = match decode_entity(html, i) {
@@ -271,6 +282,122 @@ pub fn intro_from_html(html: &str, max_chars: usize) -> String {
         }
     }
     out.trim().to_string()
+}
+
+/// Tags that implicitly close an open `<p>`: browsers close a `<p>` before
+/// any block-level element. Well-formed wiki HTML closes it explicitly;
+/// this only guards the odd page that leaves it open.
+const P_CLOSERS: [&str; 14] = [
+    "div", "ul", "ol", "dl", "li", "table", "blockquote", "pre", "hr", "h2", "h3", "h4", "h5",
+    "h6",
+];
+
+/// Finish the paragraph under construction: collapse its whitespace, cap it
+/// at `max_para_chars` characters, and keep it when it holds any text.
+fn push_para(paras: &mut Vec<String>, cur: &mut String, max_para_chars: usize) {
+    let text: String = cur.split_whitespace().collect::<Vec<_>>().join(" ");
+    cur.clear();
+    if !text.is_empty() {
+        paras.push(text.chars().take(max_para_chars).collect());
+    }
+}
+
+/// The cleaned paragraph texts of an HTML region: the text of each `<p>`
+/// element, extracted with the same skip machinery as `intro_from_html`
+/// (skipped elements - style/script/table/figure/sup/title/h1 - and
+/// hatnotes yield nothing, so infobox or figure text never becomes a
+/// paragraph), tags stripped, entities decoded, whitespace collapsed, each
+/// paragraph capped at `max_para_chars`. Text outside `<p>` elements -
+/// heading text, list items, navigation blocks - is not prose and stays
+/// out.
+fn paragraphs(html: &str, max_para_chars: usize) -> Vec<String> {
+    let bytes = html.as_bytes();
+    let mut paras: Vec<String> = Vec::new();
+    // The `<p>` currently open and its text so far (uncollapsed).
+    let mut cur = String::new();
+    let mut in_p = false;
+    let mut i = 0usize;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'<' => {
+                let Some((tag_name, attrs, opens, after)) = tag_at(html, i) else {
+                    break;
+                };
+                let skip = opens
+                    && (INTRO_SKIP_TAGS.iter().any(|t| tag_name.eq_ignore_ascii_case(t))
+                        || is_hatnote_attrs(attrs));
+                if skip {
+                    i = skip_end(html, i, tag_name);
+                    continue;
+                }
+                if opens && tag_name.eq_ignore_ascii_case("p") {
+                    push_para(&mut paras, &mut cur, max_para_chars);
+                    in_p = true;
+                } else if !opens && tag_name.eq_ignore_ascii_case("p") {
+                    push_para(&mut paras, &mut cur, max_para_chars);
+                    in_p = false;
+                } else if opens && P_CLOSERS.iter().any(|t| tag_name.eq_ignore_ascii_case(t)) {
+                    push_para(&mut paras, &mut cur, max_para_chars);
+                    in_p = false;
+                }
+                i = after;
+            }
+            b'&' => {
+                let (text, next) = match decode_entity(html, i) {
+                    Some((text, next)) => (text, next),
+                    None => ("&".to_string(), i + 1),
+                };
+                if in_p {
+                    cur.push_str(&text);
+                }
+                i = next;
+            }
+            c if c.is_ascii_whitespace() => {
+                if in_p {
+                    cur.push(' ');
+                }
+                i += 1;
+            }
+            _ => {
+                // `i` is always on a char boundary: we advance by
+                // len_utf8() or by single-byte ASCII steps.
+                let ch = html[i..].chars().next().unwrap();
+                if in_p {
+                    cur.push(ch);
+                }
+                i += ch.len_utf8();
+            }
+        }
+    }
+    // A `<p>` left open (e.g. the scan was truncated inside it) still counts.
+    push_para(&mut paras, &mut cur, max_para_chars);
+    paras
+}
+
+/// Split an article into its intro region and one region per heading, with
+/// the cleaned paragraph texts of each region. Returns `(name, paragraphs)`
+/// pairs: the first entry carries the intro region (everything before the
+/// first heading) under the empty name, the later entries carry each
+/// heading's section under the heading text as written. A heading's section
+/// spans what [`section_content`] would return for it, so a nested
+/// `<h3>`'s paragraphs belong to its own entry and to the enclosing
+/// `<h2>`'s. `<h1>` carries the page title (see `INTRO_SKIP_TAGS`), not a
+/// section: it bounds no entry, and its element is skipped like in
+/// `intro_from_html`, so its text stays out of the intro paragraphs.
+pub fn sections(html: &str, max_para_chars: usize) -> Vec<(String, Vec<String>)> {
+    let body = article_body(html);
+    let headings = collect_headings(body);
+    let secs: Vec<&Heading> = headings.iter().filter(|h| h.level >= 2).collect();
+    let mut out = Vec::with_capacity(secs.len() + 1);
+    let intro_end = secs.first().map_or(body.len(), |h| h.start);
+    out.push((String::new(), paragraphs(&body[..intro_end], max_para_chars)));
+    for h in &secs {
+        out.push((
+            h.name.clone(),
+            paragraphs(&body[h.content_start..h.content_end], max_para_chars),
+        ));
+    }
+    out
 }
 
 /// Remove tags from a short string (used for heading text).
@@ -674,5 +801,70 @@ mod tests {
 
         assert!(section_content(WIKI, "Nope").is_none());
         assert!(section_content(WIKI, "").is_none());
+    }
+
+    #[test]
+    fn sections_split_intro_and_headings_with_clean_paragraphs() {
+        // Hatnote, an infobox table holding a nested table, a lead <p>, and
+        // two <h2> sections with paragraphs - plus an <h1> page title inside
+        // the body (older scrapers): the title, the hatnote and the infobox
+        // must yield no paragraphs anywhere.
+        let page = "<html><head><title>Salt - Wikipedia</title></head>\
+            <body><div id=\"mw-content-text\"><div class=\"mw-parser-output\">\
+            <h1 id=\"firstHeading\">Salt</h1>\
+            <div role=\"note\" class=\"hatnote\">This article is about the mineral. For the seasoning, see Pepper.</div>\
+            <table><tbody><tr><td><table><tbody><tr><td>inner</td></tr></tbody></table></td></tr>\
+            <tr><td>Halite crystals</td></tr></tbody></table>\
+            <p><b>Salt</b> is a mineral composed of sodium chloride.</p>\
+            <p>It tastes salty.</p>\
+            <div class=\"mw-heading mw-heading2\"><h2 id=\"History\">History</h2></div>\
+            <p>Salt has been mined for millennia.</p>\
+            <div class=\"mw-heading mw-heading3\"><h3>Trade</h3></div><p>Salt roads crossed continents.</p>\
+            <div class=\"mw-heading mw-heading2\"><h2 id=\"Uses\">Uses</h2></div>\
+            <style>.portalbox{padding:0}</style>\
+            <p>Salt seasons food and preserves it.</p>\
+            </div></div><footer>Navigation menu</footer></body></html>";
+
+        let secs = sections(page, 300);
+        // The intro region: the lead paragraphs only (title, hatnote and
+        // infobox skipped), under the empty name.
+        assert_eq!(secs[0].0, "");
+        assert_eq!(
+            secs[0].1,
+            vec![
+                "Salt is a mineral composed of sodium chloride.".to_string(),
+                "It tastes salty.".to_string(),
+            ]
+        );
+        // One entry per heading (nested ones included), named as written,
+        // each with its own paragraphs.
+        assert_eq!(secs[1].0, "History");
+        // A heading's section spans what `section_content` would return for
+        // it: the nested h3's paragraphs belong to it as well.
+        assert_eq!(
+            secs[1].1,
+            vec!["Salt has been mined for millennia.", "Salt roads crossed continents."]
+        );
+        assert_eq!(secs[2].0, "Trade");
+        assert_eq!(secs[2].1, vec!["Salt roads crossed continents."]);
+        assert_eq!(secs[3].0, "Uses");
+        assert_eq!(secs[3].1, vec!["Salt seasons food and preserves it."]);
+        assert_eq!(secs.len(), 4);
+        // Infobox, hatnote and title text never becomes a paragraph.
+        for (name, paras) in &secs {
+            assert!(!paras.iter().any(|p| p.contains("Halite")), "{name}: {paras:?}");
+            assert!(!paras.iter().any(|p| p.contains("seasoning, see")), "{name}: {paras:?}");
+            assert!(!paras.iter().any(|p| p.contains("Salt Salt")), "{name}: {paras:?}");
+            assert!(!paras.iter().any(|p| p.contains("Navigation")), "{name}: {paras:?}");
+        }
+
+        // No headings: a single intro entry.
+        let flat = "<p>Just a lead.</p><p>And more.</p>";
+        assert_eq!(sections(flat, 100), vec![("".to_string(), vec!["Just a lead.".to_string(), "And more.".to_string()])]);
+        // No <p> anywhere: empty regions (callers fall back gracefully).
+        assert_eq!(sections("<div>no paragraphs here</div>", 100), vec![("".to_string(), Vec::<String>::new())]);
+        // A paragraph is capped at `max_para_chars` characters.
+        let long = sections("<p>0123456789 0123456789 0123456789</p>", 12);
+        assert_eq!(long[0].1, vec!["0123456789 0"]);
     }
 }
