@@ -434,8 +434,21 @@ pub(crate) mod tests {
         ZimSearchParams, ZimSearchTool,
     };
     use crate::zim::testutil::{build_archive, TestEntry, TestRedirect};
-    use rmcp::handler::server::router::tool::SyncTool;
+    use rmcp::handler::server::router::tool::AsyncTool;
+    use std::future::Future;
     use xapian2::{Document, WritableDatabase};
+
+    /// Run an async tool invocation to completion on this thread: the tools
+    /// are async (each hops to a blocking thread), and these tests are sync
+    /// `#[test]`s, so each invocation gets its own tiny current-thread
+    /// runtime to await in.
+    fn block_on<F: Future>(future: F) -> F::Output {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(future)
+    }
 
     const APPLE_HTML: &str = "<html><head><title>Apple</title></head><body>\
         <h1>Apple</h1>\
@@ -507,7 +520,7 @@ Meltwater streams out of the ice.
             serde_json::json!({ "query": query }),
         )
         .unwrap();
-        ZimSearchTool::invoke(server, params).unwrap().results
+        block_on(ZimSearchTool::invoke(server, params)).unwrap().results
     }
 
     /// Build a single-file glass Xapian index, the way openZIM does: the
@@ -564,7 +577,7 @@ Meltwater streams out of the ice.
             serde_json::json!({ "query": "apple" }),
         )
         .unwrap();
-        let hits = ZimSearchTool::invoke(&server, params).unwrap().results;
+        let hits = block_on(ZimSearchTool::invoke(&server, params)).unwrap().results;
         assert!(!hits.is_empty(), "search must return hits");
         let first = &hits[0];
         assert_eq!(first.zim, "test.zim");
@@ -579,7 +592,7 @@ Meltwater streams out of the ice.
             serde_json::json!({ "query": "computing" }),
         )
         .unwrap();
-        let hits = ZimSearchTool::invoke(&server, params).unwrap().results;
+        let hits = block_on(ZimSearchTool::invoke(&server, params)).unwrap().results;
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].path, "C/Apple");
 
@@ -588,7 +601,7 @@ Meltwater streams out of the ice.
             serde_json::json!({ "query": "zzzzz" }),
         )
         .unwrap();
-        let hits = ZimSearchTool::invoke(&server, params).unwrap().results;
+        let hits = block_on(ZimSearchTool::invoke(&server, params)).unwrap().results;
         assert!(hits.is_empty());
 
         // OR semantics: two terms from different articles.
@@ -596,7 +609,7 @@ Meltwater streams out of the ice.
             serde_json::json!({ "query": "banana apple" }),
         )
         .unwrap();
-        let hits = ZimSearchTool::invoke(&server, params).unwrap().results;
+        let hits = block_on(ZimSearchTool::invoke(&server, params)).unwrap().results;
         assert_eq!(hits.len(), 2);
     }
 
@@ -605,7 +618,7 @@ Meltwater streams out of the ice.
         let (server, _keep) = test_server();
         let params = ZimSearchParams { query: "   ".into() };
         assert!(matches!(
-            ZimSearchTool::invoke(&server, params),
+            block_on(ZimSearchTool::invoke(&server, params)),
             Err(ToolError::InvalidArgument(_))
         ));
     }
@@ -1024,7 +1037,7 @@ Meltwater streams out of the ice.
             serde_json::json!({ "query": "apple" }),
         )
         .unwrap();
-        let hits = ZimSearchTool::invoke(&server, params).unwrap().results;
+        let hits = block_on(ZimSearchTool::invoke(&server, params)).unwrap().results;
         assert_eq!(hits.len(), 1, "{hits:?}");
         assert_eq!(hits[0].zim, "a.zim");
         assert_eq!(hits[0].path, "C/Apple");
@@ -1034,7 +1047,7 @@ Meltwater streams out of the ice.
             serde_json::json!({ "query": "banana cherry" }),
         )
         .unwrap();
-        let hits = ZimSearchTool::invoke(&server, params).unwrap().results;
+        let hits = block_on(ZimSearchTool::invoke(&server, params)).unwrap().results;
         assert_eq!(hits.len(), 2, "{hits:?}");
         assert_eq!((hits[0].zim.as_str(), hits[0].path.as_str()), ("a.zim", "C/Banana"));
         assert_eq!((hits[1].zim.as_str(), hits[1].path.as_str()), ("b.zim", "C/Cherry"));
@@ -1072,7 +1085,7 @@ Meltwater streams out of the ice.
             serde_json::json!({ "zim": "one.zim", "path": "C/Salt" }),
         )
         .unwrap();
-        let result = ZimGetTool::invoke(&server, params).unwrap();
+        let result = block_on(ZimGetTool::invoke(&server, params)).unwrap();
         assert_eq!(result.title, "Salt");
         assert!(result.content.contains("sodium chloride"));
     }
@@ -1119,7 +1132,7 @@ Ancient India smelted zinc early.
             serde_json::json!({ "query": "zinc" }),
         )
         .unwrap();
-        let hits = ZimSearchTool::invoke(&server, params).unwrap().results;
+        let hits = block_on(ZimSearchTool::invoke(&server, params)).unwrap().results;
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].zim, "md.zim");
         assert_eq!(hits[0].path, "C/Zinc");
@@ -1147,7 +1160,7 @@ Ancient India smelted zinc early.
             serde_json::json!({ "query": "smelting" }),
         )
         .unwrap();
-        let hits = ZimSearchTool::invoke(&server, params).unwrap().results;
+        let hits = block_on(ZimSearchTool::invoke(&server, params)).unwrap().results;
         assert_eq!(hits.len(), 1);
         assert_eq!(
             hits[0].sections,
@@ -1161,7 +1174,7 @@ Ancient India smelted zinc early.
             serde_json::json!({ "zim": "md.zim", "path": "Zinc", "section": "history" }),
         )
         .unwrap();
-        let result = ZimGetSectionTool::invoke(&server, params).unwrap();
+        let result = block_on(ZimGetSectionTool::invoke(&server, params)).unwrap();
         assert_eq!(result.section, "History");
         assert!(result.content.contains("ancient times"), "{:?}", result.content);
         assert!(result.content.contains("Ancient India smelted zinc early"));
@@ -1173,7 +1186,7 @@ Ancient India smelted zinc early.
             serde_json::json!({ "zim": "md.zim", "path": "Zinc", "section": "_intro" }),
         )
         .unwrap();
-        let result = ZimGetSectionTool::invoke(&server, params).unwrap();
+        let result = block_on(ZimGetSectionTool::invoke(&server, params)).unwrap();
         assert_eq!(result.section, "_intro");
         assert!(
             result.content.contains("For other uses, see [[Zinc (disambiguation)]]."),
@@ -1190,7 +1203,7 @@ Ancient India smelted zinc early.
         )
         .unwrap();
         assert!(matches!(
-            ZimGetSectionTool::invoke(&server, params),
+            block_on(ZimGetSectionTool::invoke(&server, params)),
             Err(ToolError::SectionNotFound(_))
         ));
     }

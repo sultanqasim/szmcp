@@ -1,13 +1,19 @@
 //! MCP server definition: server struct, tool registration, and the three
 //! ZIM tools (`zim_search`, `zim_get`, `zim_get_section`) - thin wrappers
 //! over the pipelines in `search` and `get`.
+//!
+//! The tools are async: each one moves its arguments onto a blocking thread
+//! (`tokio::task::spawn_blocking`) and awaits the result. The pipelines do
+//! hundreds of milliseconds of synchronous work per call; running them
+//! inline on async workers (as rmcp does for sync tools) would pin one
+//! runtime worker per in-flight call.
 
 use crate::get::{get_article, get_section};
 pub use crate::get::{ZimGetResult, ZimGetSectionResult};
 use crate::search::search;
 pub use crate::search::SearchResults;
 use crate::zim::ZimLibrary;
-use rmcp::handler::server::router::tool::{SyncTool, ToolBase, ToolRouter};
+use rmcp::handler::server::router::tool::{AsyncTool, ToolBase, ToolRouter};
 use rmcp::handler::server::router::Router;
 use rmcp::handler::server::ServerHandler;
 use rmcp::model::{Implementation, ServerInfo};
@@ -60,9 +66,9 @@ impl ZimMcpServer {
 
     pub fn router(self) -> Router<ZimMcpServer> {
         let tool_router = ToolRouter::new()
-            .with_sync_tool::<ZimSearchTool>()
-            .with_sync_tool::<ZimGetTool>()
-            .with_sync_tool::<ZimGetSectionTool>();
+            .with_async_tool::<ZimSearchTool>()
+            .with_async_tool::<ZimGetTool>()
+            .with_async_tool::<ZimGetSectionTool>();
 
         let mut router = Router::new(self);
         router.tool_router = tool_router;
@@ -110,9 +116,12 @@ impl ToolBase for ZimSearchTool {
     }
 }
 
-impl SyncTool<ZimMcpServer> for ZimSearchTool {
-    fn invoke(server: &ZimMcpServer, params: Self::Parameter) -> Result<Self::Output, Self::Error> {
-        search(&server.library, &params.query)
+impl AsyncTool<ZimMcpServer> for ZimSearchTool {
+    async fn invoke(server: &ZimMcpServer, params: Self::Parameter) -> Result<Self::Output, Self::Error> {
+        let library = server.library.clone();
+        tokio::task::spawn_blocking(move || search(&library, &params.query))
+            .await
+            .map_err(|e| ToolError::Internal(format!("zim_search task failed: {e}")))?
     }
 }
 
@@ -149,9 +158,12 @@ impl ToolBase for ZimGetTool {
     }
 }
 
-impl SyncTool<ZimMcpServer> for ZimGetTool {
-    fn invoke(server: &ZimMcpServer, params: Self::Parameter) -> Result<Self::Output, Self::Error> {
-        get_article(&server.library, &params.zim, &params.path)
+impl AsyncTool<ZimMcpServer> for ZimGetTool {
+    async fn invoke(server: &ZimMcpServer, params: Self::Parameter) -> Result<Self::Output, Self::Error> {
+        let library = server.library.clone();
+        tokio::task::spawn_blocking(move || get_article(&library, &params.zim, &params.path))
+            .await
+            .map_err(|e| ToolError::Internal(format!("zim_get task failed: {e}")))?
     }
 }
 
@@ -191,8 +203,13 @@ impl ToolBase for ZimGetSectionTool {
     }
 }
 
-impl SyncTool<ZimMcpServer> for ZimGetSectionTool {
-    fn invoke(server: &ZimMcpServer, params: Self::Parameter) -> Result<Self::Output, Self::Error> {
-        get_section(&server.library, &params.zim, &params.path, &params.section)
+impl AsyncTool<ZimMcpServer> for ZimGetSectionTool {
+    async fn invoke(server: &ZimMcpServer, params: Self::Parameter) -> Result<Self::Output, Self::Error> {
+        let library = server.library.clone();
+        tokio::task::spawn_blocking(move || {
+            get_section(&library, &params.zim, &params.path, &params.section)
+        })
+        .await
+        .map_err(|e| ToolError::Internal(format!("zim_get_section task failed: {e}")))?
     }
 }

@@ -6,16 +6,14 @@ mod tools;
 mod zim;
 
 use clap::{Parser, Subcommand};
-use rmcp::handler::server::router::tool::SyncTool;
+use get::{get_article, get_section};
 use rmcp::transport::streamable_http_server::{
     session::local::LocalSessionManager, StreamableHttpServerConfig, StreamableHttpService,
 };
+use search::search;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use tools::{
-    ZimGetParams, ZimGetSectionParams, ZimGetSectionTool, ZimGetTool, ZimMcpServer, ZimSearchParams,
-    ZimSearchTool,
-};
+use tools::ZimMcpServer;
 
 #[derive(Parser)]
 #[command(name = "szmcp")]
@@ -87,38 +85,31 @@ fn open_library(zim_path: &Path) -> Result<Arc<zim::ZimLibrary>, String> {
     library.map(Arc::new)
 }
 
-/// Run one of the MCP tools against a freshly opened library and print its
-/// response to stdout - the same JSON the MCP tool returns, without the MCP
-/// wrapper. Nothing else may reach stdout.
-fn run_tool<T: SyncTool<ZimMcpServer>>(
-    library: Arc<zim::ZimLibrary>,
-    params: T::Parameter,
-) -> Result<(), String>
-where
-    T::Error: std::fmt::Display,
-{
-    match T::invoke(&ZimMcpServer::new(library), params) {
-        Ok(out) => {
-            println!("{}", serde_json::to_string_pretty(&out).map_err(|e| e.to_string())?);
-            Ok(())
-        }
-        Err(e) => Err(e.to_string()),
-    }
+/// Print one tool response to stdout as pretty JSON - the same JSON the MCP
+/// tool returns, without the MCP wrapper. Nothing else may reach stdout.
+fn print_result<T: serde::Serialize>(result: &T) -> Result<(), String> {
+    println!("{}", serde_json::to_string_pretty(result).map_err(|e| e.to_string())?);
+    Ok(())
 }
 
 async fn run(command: Command) -> Result<(), String> {
     match command {
         Command::Serve { zim_path, bind, port } => serve(&zim_path, bind, port).await,
         Command::Search { zim_path, query } => {
-            run_tool::<ZimSearchTool>(open_library(&zim_path)?, ZimSearchParams { query })
+            let library = open_library(&zim_path)?;
+            let results = search(&library, &query).map_err(|e| e.to_string())?;
+            print_result(&results)
         }
         Command::Get { zim_path, zim, path } => {
-            run_tool::<ZimGetTool>(open_library(&zim_path)?, ZimGetParams { zim, path })
+            let library = open_library(&zim_path)?;
+            let result = get_article(&library, &zim, &path).map_err(|e| e.to_string())?;
+            print_result(&result)
         }
-        Command::GetSection { zim_path, zim, path, section } => run_tool::<ZimGetSectionTool>(
-            open_library(&zim_path)?,
-            ZimGetSectionParams { zim, path, section },
-        ),
+        Command::GetSection { zim_path, zim, path, section } => {
+            let library = open_library(&zim_path)?;
+            let result = get_section(&library, &zim, &path, &section).map_err(|e| e.to_string())?;
+            print_result(&result)
+        }
     }
 }
 

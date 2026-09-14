@@ -156,7 +156,20 @@ mod tests {
         ZimGetParams, ZimGetSectionParams, ZimGetSectionTool, ZimGetTool, ZimMcpServer,
     };
     use crate::zim::testutil::{build_archive, TestEntry};
-    use rmcp::handler::server::router::tool::SyncTool;
+    use rmcp::handler::server::router::tool::AsyncTool;
+    use std::future::Future;
+
+    /// Run an async tool invocation to completion on this thread: the tools
+    /// are async (each hops to a blocking thread), and these tests are sync
+    /// `#[test]`s, so each invocation gets its own tiny current-thread
+    /// runtime to await in.
+    fn block_on<F: Future>(future: F) -> F::Output {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(future)
+    }
 
     #[test]
     fn e2e_get() {
@@ -166,7 +179,7 @@ mod tests {
             serde_json::json!({ "zim": "test.zim", "path": "C/Apple" }),
         )
         .unwrap();
-        let result = ZimGetTool::invoke(&server, params).unwrap();
+        let result = block_on(ZimGetTool::invoke(&server, params)).unwrap();
         assert_eq!(result.title, "Apple");
         assert_eq!(result.path, "C/Apple");
         assert_eq!(result.mime_type.as_deref(), Some("text/html"));
@@ -178,7 +191,7 @@ mod tests {
             serde_json::json!({ "zim": "test.zim", "path": "Banana" }),
         )
         .unwrap();
-        let result = ZimGetTool::invoke(&server, params).unwrap();
+        let result = block_on(ZimGetTool::invoke(&server, params)).unwrap();
         assert!(result.content.contains("herbaceous plants"));
 
         // Unknown article / unknown archive.
@@ -186,12 +199,12 @@ mod tests {
             serde_json::json!({ "zim": "test.zim", "path": "Nope" }),
         )
         .unwrap();
-        assert!(matches!(ZimGetTool::invoke(&server, params), Err(ToolError::NotFound(_))));
+        assert!(matches!(block_on(ZimGetTool::invoke(&server, params)), Err(ToolError::NotFound(_))));
         let params = serde_json::from_value::<ZimGetParams>(
             serde_json::json!({ "zim": "other.zim", "path": "Apple" }),
         )
         .unwrap();
-        assert!(matches!(ZimGetTool::invoke(&server, params), Err(ToolError::NotFound(_))));
+        assert!(matches!(block_on(ZimGetTool::invoke(&server, params)), Err(ToolError::NotFound(_))));
     }
 
     #[test]
@@ -204,7 +217,7 @@ mod tests {
         )
         .unwrap();
         assert!(matches!(
-            ZimGetTool::invoke(&server, params),
+            block_on(ZimGetTool::invoke(&server, params)),
             Err(ToolError::InvalidArgument(_))
         ));
 
@@ -221,7 +234,7 @@ mod tests {
         )
         .unwrap();
         assert!(matches!(
-            ZimGetTool::invoke(&server, params),
+            block_on(ZimGetTool::invoke(&server, params)),
             Err(ToolError::InvalidArgument(msg)) if msg.contains("too large")
         ));
     }
@@ -234,7 +247,7 @@ mod tests {
             serde_json::json!({ "zim": "test.zim", "path": "Apple", "section": "History" }),
         )
         .unwrap();
-        let result = ZimGetSectionTool::invoke(&server, params).unwrap();
+        let result = block_on(ZimGetSectionTool::invoke(&server, params)).unwrap();
         assert_eq!(result.title, "Apple");
         assert_eq!(result.section, "History");
         assert!(result.content.contains("10,000 years"), "{:?}", result.content);
@@ -247,7 +260,7 @@ mod tests {
             serde_json::json!({ "zim": "test.zim", "path": "Banana", "section": "growth" }),
         )
         .unwrap();
-        let result = ZimGetSectionTool::invoke(&server, params).unwrap();
+        let result = block_on(ZimGetSectionTool::invoke(&server, params)).unwrap();
         assert_eq!(result.section, "Growth");
         assert!(result.content.contains("herbaceous plants"));
 
@@ -257,7 +270,7 @@ mod tests {
             serde_json::json!({ "zim": "test.zim", "path": "Apple", "section": "_intro" }),
         )
         .unwrap();
-        let result = ZimGetSectionTool::invoke(&server, params).unwrap();
+        let result = block_on(ZimGetSectionTool::invoke(&server, params)).unwrap();
         assert_eq!(result.section, "_intro");
         assert!(
             result.content.contains("An <b>apple</b> is the fruit of"),
@@ -272,7 +285,7 @@ mod tests {
         )
         .unwrap();
         assert!(matches!(
-            ZimGetSectionTool::invoke(&server, params),
+            block_on(ZimGetSectionTool::invoke(&server, params)),
             Err(ToolError::SectionNotFound(_))
         ));
     }
