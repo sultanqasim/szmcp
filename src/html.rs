@@ -2,9 +2,10 @@
 //! heading-based section extraction. Not a full HTML parser; it is a byte
 //! scanner good enough for the well-formed pages ZIMs (mostly Wikipedia) hold.
 
-/// Case-insensitive byte substring search from index `from`.
+/// Case-insensitive byte substring search from index `from`. Returns `None`
+/// when `needle` cannot occur in `hay` (empty, or longer than `hay`).
 fn find_ci(hay: &[u8], from: usize, needle: &[u8]) -> Option<usize> {
-    if needle.is_empty() || from >= hay.len() {
+    if needle.is_empty() || needle.len() > hay.len() || from >= hay.len() {
         return None;
     }
     let limit = hay.len() - needle.len();
@@ -768,6 +769,20 @@ mod tests {
             intro_from_html(page, 100),
             "The hatnote template renders notes. More."
         );
+    }
+
+    #[test]
+    fn attribute_shorter_than_probed_name_is_not_found() {
+        // A `<br />` open tag splits into name "br" and attribute text " /":
+        // probing `class` (5 bytes) in that 2-byte haystack underflowed
+        // `hay.len() - needle.len()` in find_ci, and the sliced comparison
+        // panicked - aborting every search on scraped (non-wikipedia) ZIMs,
+        // where `<br />` is ubiquitous. An attribute shorter than the probed
+        // name is simply not present.
+        assert_eq!(attr_value(" /", "class"), None);
+        assert_eq!(attr_value(" /", "role"), None);
+        assert!(!is_hatnote_attrs(" /"));
+        assert_eq!(intro_from_html("<p>a<br />b</p>", 10), "a b");
     }
 
     #[test]
