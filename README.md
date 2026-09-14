@@ -1,9 +1,10 @@
 # szmcp — Sultan's ZIM MCP
 
-An [MCP](https://modelcontextprotocol.io) server that serves content from
-[Kiwix ZIM files](https://www.kiwix.org/). It exposes the ZIM articles in a
-directory through three tools over the streamable HTTP transport, with CORS
-headers so it can be used from browsers.
+An [MCP](https://modelcontextprotocol.io) server and CLI that serve content
+from [Kiwix ZIM files](https://www.kiwix.org/). The ZIM articles in a
+directory are exposed through three tools, either as an MCP server over the
+streamable HTTP transport (with CORS headers so it can be used from
+browsers) or as one-shot CLI subcommands.
 
 ## Tools
 
@@ -45,16 +46,23 @@ cargo build --release
 
 ## Run
 
+Every mode takes the folder containing the ZIM files as its first argument
+(scanned recursively; chunked archives `*.zimaa…` are supported).
+
 ```
-./target/release/szmcp /path/to/zim-folder [--bind 127.0.0.1] [-p 3001]
+szmcp serve /path/to/zim-folder [--bind 127.0.0.1] [-p 3001]
+szmcp search /path/to/zim-folder "query"
+szmcp get /path/to/zim-folder file.zim C/SomeArticle
+szmcp get_section /path/to/zim-folder file.zim C/SomeArticle "History"
 ```
 
-- Positional argument: a folder containing ZIM files (scanned recursively;
-  chunked archives `*.zimaa…` are supported).
-- `--bind`: bind address (default `127.0.0.1`).
-- `-p`/`--port`: port (default `3001`).
-
-The MCP endpoint is served at the root path (`http://127.0.0.1:3001`).
+- `serve` runs the MCP server. The endpoint is served at the root path
+  (`http://127.0.0.1:3001`); `--bind` sets the bind address (default
+  `127.0.0.1`), `-p`/`--port` the port (default `3001`).
+- `search`, `get` and `get_section` run the matching tool once and print its
+  response JSON to stdout — the same JSON the MCP tool returns, without the
+  MCP wrapper. The ZIM file name is relative to the ZIM directory, as given
+  in search results. Errors go to stderr and exit non-zero.
 
 ## Notes
 
