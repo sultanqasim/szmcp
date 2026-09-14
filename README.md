@@ -12,7 +12,7 @@ browsers) or as one-shot CLI subcommands.
   rank articles containing all the words higher, but partial matches are
   still returned; an article whose title or redirect exactly matches the
   query comes first. Each result has the ZIM file name (relative to the ZIM
-  directory), the article path, the title, and `text` — the article's first
+  directory), the article path, the title, and `preview` — the article's first
   paragraph when the query matches the title or that paragraph, otherwise
   the paragraph with the most query matches together with `sections` (the
   matching regions' names, the intro listed as `_intro`). `sections` is
