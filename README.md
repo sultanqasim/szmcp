@@ -14,9 +14,10 @@ browsers) or as one-shot CLI subcommands.
   query comes first. Each result has the ZIM file name (relative to the ZIM
   directory), the article path, the title, and `preview` — the article's first
   paragraph when the query matches the title or that paragraph, otherwise
-  the paragraph with the most query matches together with `sections` (the
-  matching regions' names, the intro listed as `_intro`). `sections` is
-  omitted when the query matches the title or the first intro paragraph.
+  the sentence with the most query matches (followed by the rest of its
+  paragraph) together with `sections` (the matching regions' names, the
+  intro listed as `_intro`). `sections` is omitted when the query matches
+  the title or the first intro paragraph.
   Use `zim` + `path` with `zim_get`/`zim_get_section`.
 - **`zim_get`** — get the full content of an article/page/object. Arguments:
   the ZIM file name and the article path. Returns the title, final path (after

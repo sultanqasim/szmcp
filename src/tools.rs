@@ -147,8 +147,9 @@ pub struct SearchHit {
     /// Page/article title
     pub title: String,
     /// Preview of the article: the first paragraph when the query matches
-    /// the title or that paragraph, otherwise the paragraph with the most
-    /// query matches
+    /// the title or that paragraph, otherwise the sentence with the most
+    /// query matches, followed by its paragraph's next sentences up to the
+    /// length cap
     pub preview: String,
     /// Names of the regions holding query matches - the intro listed as
     /// `_intro` first when it matched, then the sections in document order;
@@ -179,7 +180,7 @@ impl ToolBase for ZimSearchTool {
             "Search all articles in all ZIM files. Results are ranked best first (an exact \
              title match always comes first); each result has the ZIM file name, the article \
              path, the page title, and preview - the article's first paragraph when the query \
-             matches the title or that paragraph, otherwise the paragraph that best matches \
+             matches the title or that paragraph, otherwise the sentence that best matches \
              the query together with \"sections\", the matching regions' names (the intro \
              listed as \"_intro\"). Use the returned zim and path with the zim_get and \
              zim_get_section tools."
@@ -431,6 +432,28 @@ fn covers_all_terms(text: &str, terms: &[String], stem: &mut Stemmer) -> bool {
     left == 0
 }
 
+/// Split a paragraph into sentences: a sentence ends after `.`, `!`, or `?`
+/// followed by whitespace or the paragraph's end; a paragraph without any
+/// terminator is a single sentence. (Abbreviations like "U.S." over-split,
+/// which is acceptable for a preview.)
+fn sentences(paragraph: &str) -> Vec<&str> {
+    let mut out = Vec::new();
+    let mut start = 0;
+    for (i, c) in paragraph.char_indices() {
+        if matches!(c, '.' | '!' | '?') {
+            let after = i + c.len_utf8();
+            if after == paragraph.len() || paragraph[after..].starts_with(char::is_whitespace) {
+                out.push(paragraph[start..after].trim());
+                start = after;
+            }
+        }
+    }
+    if start < paragraph.len() {
+        out.push(paragraph[start..].trim());
+    }
+    out.into_iter().filter(|s| !s.is_empty()).collect()
+}
+
 /// The `preview`/`sections` pair of one search hit, from the article's raw
 /// text (`is_markdown` picks the Markdown or the HTML splitter):
 ///
@@ -441,10 +464,12 @@ fn covers_all_terms(text: &str, terms: &[String], stem: &mut Stemmer) -> bool {
 /// - otherwise every region is scanned - the intro first (under its
 ///   `_intro` name, `html::INTRO_SECTION`), then the body sections in
 ///   document order. The regions holding at least one query match are
-///   reported as `sections`, and the preview is the best-matching paragraph
+///   reported as `sections`, and the preview is the best-matching sentence
 ///   (most matching word occurrences across all regions; ties keep the
-///   earliest, so an intro paragraph beats a body paragraph), truncated
-///   to `INTRO_CHARS`;
+///   earliest, so an intro sentence beats a body one), followed by its
+///   paragraph's next sentences while the length stays under `INTRO_CHARS`
+///   and truncated to `INTRO_CHARS` - the matched sentence sits at the
+///   front, so the truncation cannot hide the words that matched;
 /// - when no region matches either (only the title in the index matched
 ///   the query), the preview falls back to the first intro paragraph. Regions
 ///   without paragraphs degrade to an empty preview, never a panic.
@@ -476,20 +501,26 @@ fn hit_preview(
     } else {
         html::sections(article, PARA_MATCH_CHARS)
     };
+    // Paragraphs are scored whole only for the `sections` reporting; the
+    // preview picks the best-matching SENTENCE, so that a match in the
+    // middle of a long paragraph is still visible in the preview.
     let mut best_count = 0usize;
-    let mut best_para: Option<&String> = None;
+    // The best-matching sentence, as (its paragraph, its index within it).
+    let mut best_sent: Option<(&String, usize)> = None;
     let mut names: Vec<String> = Vec::new();
     for (name, paras) in &secs {
         let mut matched = false;
         for para in paras {
-            let n = para_matches(para, terms, stem);
-            if n > 0 {
+            if para_matches(para, terms, stem) > 0 {
                 matched = true;
-                if n > best_count {
-                    // Ties keep the earlier paragraph: only a strictly
-                    // better count replaces the incumbent.
-                    best_count = n;
-                    best_para = Some(para);
+                for (i, s) in sentences(para).into_iter().enumerate() {
+                    let n = para_matches(s, terms, stem);
+                    if n > best_count {
+                        // Ties keep the earlier sentence: only a strictly
+                        // better count replaces the incumbent.
+                        best_count = n;
+                        best_sent = Some((para, i));
+                    }
                 }
             }
         }
@@ -497,8 +528,21 @@ fn hit_preview(
             names.push(name.clone());
         }
     }
-    match best_para {
-        Some(p) => (p.chars().take(INTRO_CHARS).collect(), Some(names)),
+    match best_sent {
+        Some((para, first)) => {
+            let sent = sentences(para);
+            let mut preview = String::new();
+            for s in &sent[first..] {
+                if preview.chars().count() >= INTRO_CHARS {
+                    break;
+                }
+                if !preview.is_empty() {
+                    preview.push(' ');
+                }
+                preview.push_str(s);
+            }
+            (preview.chars().take(INTRO_CHARS).collect(), Some(names))
+        }
         None => (lead(), None),
     }
 }
@@ -555,6 +599,28 @@ mod tests {
         <h2>Uses</h2>\
         <p>People season their food with it.</p>\
         </body></html>";
+
+    /// Articles whose best-matching paragraph holds several sentences, with
+    /// the query matching a mid-paragraph sentence: the preview must START
+    /// with that sentence, which the old paragraph preview did not (the
+    /// matched words sat mid-paragraph). The Volcano lead does not cover
+    /// its query, so the lead fallback does not fire.
+    const VOLCANO_HTML: &str = "<html><body><h1>Volcano</h1>\
+        <p>Volcanoes are openings in the crust.</p>\
+        <p>Molten rock rises from chambers below. Eruptions reshape the \
+        land. Ash clouds can ground aircraft. Farmers fear the fallout.</p>\
+        </body></html>";
+
+    const GLACIER_MD: &str = "\
+# Glacier
+
+A glacier is a body of dense ice.
+
+## Movement
+
+Glaciers move under their own weight. The flow is slower than a river. \
+Meltwater streams out of the ice.
+";
 
     fn search(server: &ZimMcpServer, query: &str) -> Vec<SearchHit> {
         let params = serde_json::from_value::<ZimSearchParams>(
@@ -886,6 +952,58 @@ mod tests {
             "{hit:?}"
         );
         assert_eq!(hit.preview, "Salt beds form when seas evaporate.");
+    }
+
+    #[test]
+    fn e2e_search_preview_starts_with_best_sentence() {
+        // The best-matching paragraph holds several sentences and the query
+        // matches a mid-paragraph one: the preview starts with that sentence
+        // (a 300-character preview of the whole paragraph would cut the
+        // matched words off), continued with the paragraph's remaining
+        // sentences. Covered for an HTML article (match in the intro's
+        // second paragraph) and a Markdown one (match in a body section).
+        let dir = tempfile::tempdir().unwrap();
+        let index = make_index(&[
+            ("C/Volcano", "volcano crust molten rock erupt reshape land ash cloud aircraft farmer", "Volcano"),
+            ("C/Glacier", "glacier ice movement weight flow river meltwater stream", "Glacier"),
+        ]);
+        let content = [
+            TestEntry { namespace: b'C', url: "Volcano", title: "Volcano", mime: 0, body: VOLCANO_HTML.as_bytes() },
+            TestEntry { namespace: b'C', url: "Glacier", title: "Glacier", mime: 1, body: GLACIER_MD.as_bytes() },
+        ];
+        let bytes = build_archive(&["text/html", "text/markdown"], &content, &[], 0, Some(&index));
+        std::fs::write(dir.path().join("test.zim"), &bytes).unwrap();
+        let library = Arc::new(ZimLibrary::scan(dir.path()).unwrap());
+        assert!(library.archives[0].searchable());
+        let server = ZimMcpServer::new(library);
+
+        let hits = search(&server, "aircraft");
+        assert_eq!(hits.len(), 1, "{hits:?}");
+        assert_eq!(hits[0].path, "C/Volcano");
+        assert_eq!(hits[0].sections, Some(vec!["_intro".to_string()]));
+        assert!(
+            hits[0].preview.starts_with("Ash clouds can ground aircraft."),
+            "{:?}",
+            hits[0].preview
+        );
+        assert_eq!(
+            hits[0].preview,
+            "Ash clouds can ground aircraft. Farmers fear the fallout."
+        );
+
+        let hits = search(&server, "river");
+        assert_eq!(hits.len(), 1, "{hits:?}");
+        assert_eq!(hits[0].path, "C/Glacier");
+        assert_eq!(hits[0].sections, Some(vec!["Movement".to_string()]));
+        assert!(
+            hits[0].preview.starts_with("The flow is slower than a river."),
+            "{:?}",
+            hits[0].preview
+        );
+        assert_eq!(
+            hits[0].preview,
+            "The flow is slower than a river. Meltwater streams out of the ice."
+        );
     }
 
     #[test]
