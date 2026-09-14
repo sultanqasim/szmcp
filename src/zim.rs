@@ -212,6 +212,66 @@ fn u64le(b: &[u8]) -> u64 {
     u64::from_le_bytes(b.try_into().unwrap())
 }
 
+/// Read a blob-table entry (`sz` = 4 or 8 bytes wide) at byte offset `off`.
+fn table_int(d: &[u8], off: usize, sz: usize) -> u64 {
+    if sz == 8 {
+        u64le(&d[off..off + 8])
+    } else {
+        u32le(&d[off..off + 4]) as u64
+    }
+}
+
+/// Incremental decoder for a compressed cluster body: decompressed bytes are
+/// only produced as `decode_to` asks for them, so reading a blob prefix never
+/// decodes the rest of the cluster.
+struct ClusterDecoder<'a> {
+    stream: Box<dyn io::Read + 'a>,
+    buf: Vec<u8>,
+}
+
+impl<'a> ClusterDecoder<'a> {
+    fn new(compression: u8, body: &'a [u8]) -> io::Result<ClusterDecoder<'a>> {
+        let stream: Box<dyn io::Read + 'a> = match compression {
+            5 => Box::new(zstd::stream::read::Decoder::with_buffer(body)?),
+            // liblzma's auto decoder transparently handles the LZMA
+            // streams ZIM clusters store.
+            4 => Box::new(xz2::read::XzDecoder::new(body)),
+            other => {
+                return Err(io::Error::new(
+                    ErrorKind::InvalidData,
+                    format!("unknown cluster compression {other}"),
+                ))
+            }
+        };
+        Ok(ClusterDecoder { stream, buf: Vec::new() })
+    }
+
+    /// Decode until at least `len` bytes are buffered. A stream that ends
+    /// early (or fails) is a malformed cluster.
+    fn decode_to(&mut self, len: u64) -> io::Result<&[u8]> {
+        while self.buf.len() < len as usize {
+            let filled = self.buf.len();
+            // Grow in bounded steps so a bogus length runs into the stream's
+            // end (an error) before its bytes are ever buffered.
+            self.buf.resize((filled + 1024 * 1024).min(len as usize), 0);
+            match self.stream.read(&mut self.buf[filled..]) {
+                Ok(0) => {
+                    return Err(io::Error::new(ErrorKind::InvalidData, "malformed decompressed cluster"));
+                }
+                Ok(n) => self.buf.truncate(filled + n),
+                Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+                Err(e) => {
+                    return Err(io::Error::new(
+                        ErrorKind::InvalidData,
+                        format!("cluster decompression failed: {e}"),
+                    ));
+                }
+            }
+        }
+        Ok(&self.buf[..len as usize])
+    }
+}
+
 /// Read a NUL-terminated string at `off`; returns (string, offset-after-NUL).
 fn cstr(b: &[u8], off: usize) -> io::Result<(&str, usize)> {
     let nul = b[off..]
@@ -455,8 +515,9 @@ impl Zim {
         self.read_blob_prefix(cluster, blob, u64::MAX)
     }
 
-    /// Read at most `max` bytes of a blob (no decompression cost beyond what
-    /// the cluster format requires).
+    /// Read at most `max` bytes of a blob. Compressed clusters are decoded
+    /// incrementally: only the bytes leading up to the wanted prefix are ever
+    /// decompressed, not the whole cluster.
     pub fn read_blob_prefix(&self, cluster: u32, blob: u32, max: u64) -> io::Result<Vec<u8>> {
         let loc = self.locate_blob(cluster, blob)?;
         if let Some(voff) = loc.file_offset {
@@ -465,60 +526,29 @@ impl Zim {
         }
         let (start, end) = self.cluster_range(cluster)?;
         let body = self.store.read(start + 1, end - start - 1)?;
-        let decompressed = match loc.compression {
-            5 => zstd::decode_all(body.as_ref()).map_err(|e| {
-                io::Error::new(ErrorKind::InvalidData, format!("zstd decompression failed: {e}"))
-            })?,
-            4 => {
-                // liblzma's auto decoder transparently handles the raw LZMA2
-                // streams ZIM clusters store.
-                let mut decoder =
-                    xz2::stream::Stream::new_auto_decoder(0, 0).map_err(|e| {
-                        io::Error::new(ErrorKind::InvalidData, format!("lzma decoder init failed: {e:?}"))
-                    })?;
-                let mut out = Vec::new();
-                let status = decoder
-                    .process_vec(body.as_ref(), &mut out, xz2::stream::Action::Finish)
-                    .map_err(|e| {
-                        io::Error::new(ErrorKind::InvalidData, format!("lzma decompression failed: {e:?}"))
-                    })?;
-                if !matches!(status, xz2::stream::Status::StreamEnd) {
-                    return Err(io::Error::new(ErrorKind::InvalidData, "lzma stream did not end cleanly"));
-                }
-                out
-            }
-            other => {
-                return Err(io::Error::new(ErrorKind::InvalidData, format!("unknown cluster compression {other}")));
-            }
-        };
         let info = self.store.read(start, 1)?[0];
-        let sz = if (info & 0x10) != 0 { 8 } else { 4 };
-        let dec_u64 = |d: &[u8], i: u64| -> io::Result<u64> {
-            if sz == 8 {
-                Ok(u64le(&d[i as usize..i as usize + 8]))
-            } else {
-                Ok(u32le(&d[i as usize..i as usize + 4]) as u64)
-            }
-        };
-        if (decompressed.len() as u64) < 2 * sz {
-            return Err(io::Error::new(ErrorKind::InvalidData, "malformed decompressed cluster"));
-        }
-        let tbl_size = dec_u64(&decompressed, 0)?;
-        if tbl_size < sz || tbl_size % sz != 0 || (tbl_size as usize) > decompressed.len() {
+        let sz = if (info & 0x10) != 0 { 8 } else { 4 }; // 64-bit blob offsets
+        let mut dec = ClusterDecoder::new(loc.compression, body.as_ref())?;
+        // The decompressed data starts with the blob-offset table, whose
+        // first entry gives the table's own byte size; blob data follows.
+        let tbl_size = table_int(dec.decode_to(sz as u64)?, 0, sz);
+        if tbl_size < sz as u64 || tbl_size % sz as u64 != 0 {
             return Err(io::Error::new(ErrorKind::InvalidData, "malformed cluster blob table"));
         }
-        let n = tbl_size / sz; // offsets including the end sentinel
+        let n = tbl_size / sz as u64; // offsets including the end sentinel
         let bi = blob as u64;
         if bi + 1 >= n {
             return Err(io::Error::new(ErrorKind::InvalidData, "blob index out of bounds"));
         }
-        let s = dec_u64(&decompressed, bi * sz)?;
-        let e = dec_u64(&decompressed, (bi + 1) * sz)?;
-        if s > e || (e as usize) > decompressed.len() {
+        let tbl = dec.decode_to(tbl_size)?;
+        let s = table_int(tbl, bi as usize * sz, sz);
+        let e = table_int(tbl, (bi as usize + 1) * sz, sz);
+        if s > e {
             return Err(io::Error::new(ErrorKind::InvalidData, "malformed cluster blob table"));
         }
-        let take = (e - s).min(max) as usize;
-        Ok(decompressed[s as usize..s as usize + take].to_vec())
+        let take = (e - s).min(max);
+        let data = dec.decode_to(s + take)?;
+        Ok(data[s as usize..(s + take) as usize].to_vec())
     }
 
     /// Open the archive's full-text Xapian index, preferring the zero-copy
@@ -832,6 +862,54 @@ pub(crate) mod testutil {
         c
     }
 
+    /// Build a minimal archive whose only cluster stores `blobs` under
+    /// `compression` (4 = lzma, 5 = zstd), for compressed-read tests.
+    fn build_cluster_archive(compression: u8, blobs: &[&[u8]]) -> Vec<u8> {
+        // Cluster body: blob-offset table (32-bit offsets; the first entry's
+        // value is the table's own byte size) + blob data.
+        let mut data = Vec::new();
+        let mut off = (blobs.len() + 1) as u32 * 4;
+        for b in blobs {
+            data.extend_from_slice(&off.to_le_bytes());
+            off += b.len() as u32;
+        }
+        data.extend_from_slice(&off.to_le_bytes()); // end sentinel
+        for b in blobs {
+            data.extend_from_slice(b);
+        }
+        let mut cluster = vec![compression]; // info byte
+        match compression {
+            4 => {
+                std::io::Read::read_to_end(
+                    &mut xz2::read::XzEncoder::new(data.as_slice(), 6),
+                    &mut cluster,
+                )
+                .unwrap();
+            }
+            5 => cluster.extend_from_slice(&zstd::encode_all(data.as_slice(), 0).unwrap()),
+            _ => cluster.extend_from_slice(&data),
+        }
+        // Header for one cluster and no directory entries; `read_blob_prefix`
+        // only needs the cluster pointer list.
+        let ptr_pos = 81u64; // header (80) + empty mime list
+        let cluster_pos = ptr_pos + 8;
+        let mut out = vec![0u8; 80];
+        out[0..4].copy_from_slice(&ZIM_MAGIC.to_le_bytes());
+        out[4..6].copy_from_slice(&6u16.to_le_bytes()); // major
+        out[6..8].copy_from_slice(&1u16.to_le_bytes()); // minor
+        out[28..32].copy_from_slice(&1u32.to_le_bytes()); // cluster count
+        out[32..40].copy_from_slice(&ptr_pos.to_le_bytes()); // url ptr (empty)
+        out[40..48].copy_from_slice(&ptr_pos.to_le_bytes()); // title ptr (empty)
+        out[48..56].copy_from_slice(&ptr_pos.to_le_bytes()); // cluster ptr
+        out[56..64].copy_from_slice(&80u64.to_le_bytes()); // mime list
+        out[72..80].copy_from_slice(&(cluster_pos + cluster.len() as u64).to_le_bytes());
+        out.push(0); // empty mime list
+        out.extend_from_slice(&cluster_pos.to_le_bytes());
+        out.extend_from_slice(&cluster);
+        out.extend_from_slice(&[0u8; 16]);
+        out
+    }
+
     /// Assemble a complete in-memory ZIM. `index`, when given, is stored as
     /// an uncompressed `X/fulltext/xapian` content entry (a single-blob
     /// cluster), like a real archive's embedded Xapian full-text index.
@@ -1091,6 +1169,32 @@ pub(crate) mod testutil {
         assert_eq!(title, "Apple");
         assert_eq!(mime.as_deref(), Some("text/html"));
         assert_eq!(bytes.len(), 64);
+    }
+
+    #[test]
+    fn compressed_cluster_blob_prefix_reads() {
+        let blobs: &[&[u8]] = &[
+            b"alpha-first-blob",
+            b"middle blob payload, long enough to make offsets interesting",
+            b"zeta-last-blob",
+        ];
+        for compression in [4u8, 5] {
+            let (z, _f) = open_bytes(&build_cluster_archive(compression, blobs));
+            let (len1, len2) = (blobs[1].len() as u64, blobs[2].len() as u64);
+            // max < len: truncated prefix of the first blob.
+            assert_eq!(z.read_blob_prefix(0, 0, 5).unwrap(), b"alpha");
+            // max = len, max > len, and a middle blob.
+            assert_eq!(z.read_blob_prefix(0, 1, len1).unwrap(), blobs[1]);
+            assert_eq!(z.read_blob_prefix(0, 2, len2 + 10).unwrap(), blobs[2]);
+            assert_eq!(z.read_blob_prefix(0, 1, 7).unwrap(), b"middle ");
+            // Unbounded reads return the whole blob.
+            assert_eq!(z.read_blob(0, 0).unwrap(), blobs[0]);
+            // A blob index past the table is rejected.
+            assert_eq!(
+                z.read_blob_prefix(0, 3, 4).unwrap_err().to_string(),
+                "blob index out of bounds"
+            );
+        }
     }
 
     #[test]
