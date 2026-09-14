@@ -51,6 +51,46 @@ fn decode_entity(s: &str, i: usize) -> Option<(String, usize)> {
 /// figures (image captions) and reference markers.
 const INTRO_SKIP_TAGS: [&str; 5] = ["style", "script", "table", "figure", "sup"];
 
+/// The value of attribute `name` in an open tag's attribute text (the part
+/// of the tag left over after the tag name), or `None`. Names match
+/// case-insensitively but must start a fresh attribute (preceded by
+/// whitespace or the `/` separator), so `data-class` does not read as
+/// `class`; values may be double- or single-quoted or bare.
+fn attr_value<'a>(attrs: &'a str, name: &str) -> Option<&'a str> {
+    let bytes = attrs.as_bytes();
+    let mut from = 0usize;
+    while let Some(p) = find_ci(bytes, from, name.as_bytes()) {
+        from = p + 1;
+        if p > 0 && !bytes[p - 1].is_ascii_whitespace() && bytes[p - 1] != b'/' {
+            continue; // mid-word: a longer name (`data-class`)
+        }
+        // Followed by `=`, then the value: quoted (`".."`, `'..'`) or bare.
+        let Some(rest) = attrs[p + name.len()..].trim_start().strip_prefix('=') else {
+            continue; // no `=` here: not this attribute (or a value's text)
+        };
+        let rest = rest.trim_start();
+        return Some(match rest.as_bytes().first() {
+            Some(b'"') | Some(b'\'') => {
+                let q = rest.as_bytes()[0] as char;
+                rest[1..].split(q).next().unwrap_or("")
+            }
+            _ => rest.split_ascii_whitespace().next().unwrap_or(""),
+        });
+    }
+    None
+}
+
+/// Whether an open tag's attributes mark a MediaWiki hatnote. `{{about}}`,
+/// `{{other uses}}` and `{{main}}` render as elements like
+/// `<div role="note" class="hatnote navigation-not-searchable">`: the class
+/// list contains the token `hatnote` (order, extra classes and quote style
+/// vary) or the role is `note`.
+fn is_hatnote_attrs(attrs: &str) -> bool {
+    attr_value(attrs, "class").is_some_and(|v| {
+        v.split_ascii_whitespace().any(|t| t.eq_ignore_ascii_case("hatnote"))
+    }) || attr_value(attrs, "role").is_some_and(|v| v.trim().eq_ignore_ascii_case("note"))
+}
+
 /// The region of a MediaWiki page that holds the article. Scanning the whole
 /// HTML would pick up browser-chrome text (title bar, navigation menus), so
 /// cut the page at the content div (`id="mw-content-text"`) and its matching
@@ -91,7 +131,10 @@ fn article_body(html: &str) -> &str {
 
 /// Strip HTML tags, decode common entities, and collapse whitespace into
 /// single spaces. Stops after producing `max_chars` characters of text;
-/// markup and whitespace never consume the budget.
+/// markup and whitespace never consume the budget. MediaWiki hatnotes
+/// (`{{about}}` and friends, marked by `is_hatnote_attrs`) are skipped
+/// whole, so intros start with the article lead - as the Markdown path
+/// already does.
 pub fn intro_from_html(html: &str, max_chars: usize) -> String {
     let html = article_body(html);
     let bytes = html.as_bytes();
@@ -113,8 +156,19 @@ pub fn intro_from_html(html: &str, max_chars: usize) -> String {
                     .next()
                     .unwrap_or("")
                     .to_ascii_lowercase();
-                if INTRO_SKIP_TAGS.contains(&tag_name.as_str()) {
-                    // Skip the whole element, including its content.
+                // Elements whose whole content stays out of the intro: the
+                // INTRO_SKIP_TAGS set plus hatnotes (`is_hatnote_attrs`).
+                // Only a real open tag qualifies: a close tag (`</div>`)
+                // splits into an empty tag name and a comment (`<!-- .. -->`)
+                // starts with `!`, and neither must read as a hatnote (a
+                // comment could quote `class="hatnote"` in its text). Jump
+                // to the element's close tag (hatnote divs hold no nested
+                // same-name element); failing that, drop just the open tag.
+                let opens = tag.as_bytes().first().is_some_and(|&c| c.is_ascii_alphabetic());
+                let skip = opens
+                    && (INTRO_SKIP_TAGS.contains(&tag_name.as_str())
+                        || is_hatnote_attrs(&tag[tag_name.len()..]));
+                if skip {
                     let close = format!("</{tag_name}");
                     if let Some(cp) = find_ci(bytes, i + 1, close.as_bytes()) {
                         if let Some(g) = bytes[cp..].iter().position(|&c| c == b'>') {
@@ -342,6 +396,7 @@ mod tests {
 
     const WIKI: &str = "<html><head><title>Apple</title><style>p{}</style></head>\
         <body><script>var x=1;</script><h1>Apple</h1>\
+        <div role=\"note\" class=\"hatnote\">This article is about the fruit. For other uses, see <a href=\"Apple_(disambiguation)\" title=\"Apple (disambiguation)\">Apple (disambiguation)</a>.</div>\
         <p>An <b>apple</b> is the fruit of &lt;rosaceae&gt; trees.</p>\
         <div class=\"mw-heading mw-heading2\"><h2 id=\"History\">History</h2></div>\
         <p>Apples have been grown for 10,000 years.</p>\
@@ -357,6 +412,9 @@ mod tests {
         assert!(intro.contains("apple is the fruit of <rosaceae> trees"), "{intro:?}");
         assert!(!intro.contains("var x"), "{intro:?}");
         assert!(!intro.contains("p{}"), "{intro:?}");
+        // The hatnote before the lead (note text and its inner link) is
+        // skipped; the intro starts with the article text.
+        assert!(!intro.contains("disambiguation"), "{intro:?}");
     }
 
     #[test]
@@ -390,6 +448,68 @@ mod tests {
         assert!(!intro.contains("hydrocarbon"), "{intro:?}");
         assert!(!intro.contains("Navigation"), "{intro:?}");
         assert!(!intro.contains("Wikipedia"), "{intro:?}");
+    }
+
+    #[test]
+    fn intro_skips_hatnotes() {
+        // Vector 2022 pages open the article body with hatnote divs
+        // ({{about}} and friends) before the lead paragraph: the note, its
+        // inner link and the deduplicated-style <link> MediaWiki puts next
+        // to it must not reach the intro.
+        let page = "<html><head><title>Solid oxygen - Wikipedia</title></head><body><div id=\"mw-content-text\"><div class=\"mw-parser-output\"><div role=\"note\" class=\"hatnote navigation-not-searchable\">This article is about the solid phase of elemental oxygen. For other uses, see <a href=\"Oxygen\" title=\"Oxygen\">Oxygen</a>.</div><link rel=\"mw-deduplicated-inline-style\" href=\"mw-data:TemplateStyles:r128\"/><p><b>Solid oxygen</b> forms below 54.36 K at normal pressure.</p></div></div><footer>Navigation menu</footer></body></html>";
+        let intro = intro_from_html(page, 200);
+        assert_eq!(intro, "Solid oxygen forms below 54.36 K at normal pressure.");
+    }
+
+    #[test]
+    fn hatnote_detection_by_class_token_or_role() {
+        // `hatnote` anywhere in the class list, in any order, quote style
+        // and case, on any element; or a bare role="note". Each element is
+        // skipped whole, down to its close tag.
+        let hatnotes = [
+            "<div class=\"hatnote navigation-not-searchable\">For other uses, see X.</div>",
+            "<div class='navigation-not-searchable hatnote'>For other uses, see X.</div>",
+            "<div class=hatnote>For other uses, see X.</div>",
+            "<span CLASS=\"navigation-not-searchable hatnote\">For other uses, see X.</span>",
+            "<P class=\"Hatnote\">For other uses, see X.</P>",
+            "<div role=\"note\" class=\"navigation-not-searchable\">Main article: X.</div>",
+            "<div role=note>Not to be confused with X.</div>",
+        ];
+        for el in hatnotes {
+            let page = format!(
+                "<div id=\"mw-content-text\">{el}<p>Lead text here.</p></div>"
+            );
+            let intro = intro_from_html(&page, 100);
+            assert_eq!(intro, "Lead text here.", "{el}");
+        }
+    }
+
+    #[test]
+    fn intro_keeps_non_hatnotes() {
+        // `navigation-not-searchable` alone is not a hatnote; neither are
+        // other roles, lookalike attributes (`data-class`, `data-role`) or
+        // "hatnote" inside another attribute's value. They stay in the intro.
+        let keepers = [
+            "<div class=\"navigation-not-searchable\">For other uses, see X.</div>",
+            "<div role=\"presentation\" class=\"navbox\">For other uses, see X.</div>",
+            "<div data-class=\"hatnote\">For other uses, see X.</div>",
+            "<div data-role=\"note\">For other uses, see X.</div>",
+            "<div title=\"hatnote\">For other uses, see X.</div>",
+        ];
+        for el in keepers {
+            let page = format!(
+                "<div id=\"mw-content-text\">{el}<p>Lead text here.</p></div>"
+            );
+            let intro = intro_from_html(&page, 100);
+            assert_eq!(intro, "For other uses, see X. Lead text here.", "{el}");
+        }
+        // The word "hatnote" in plain text changes nothing, and close tags
+        // (`</div>`) are never mistaken for hatnote open tags.
+        let page = "<div id=\"mw-content-text\"><p>The hatnote template renders notes.</p><p>More.</p></div>";
+        assert_eq!(
+            intro_from_html(page, 100),
+            "The hatnote template renders notes. More."
+        );
     }
 
     #[test]
