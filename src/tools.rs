@@ -527,16 +527,19 @@ Ancient India smelted zinc early.
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].zim, "md.zim");
         assert_eq!(hits[0].path, "C/Zinc");
+        // The intro starts with the lead text; the hatnote is dropped.
         assert!(
-            hits[0].intro.starts_with(
-                "Zinc This article is about the element. For other uses, see Zinc (disambiguation). \
-                 Zinc is a chemical element with the symbol Zn."
-            ),
+            hits[0]
+                .intro
+                .starts_with("Zinc Zinc is a chemical element with the symbol Zn."),
             "{:?}",
             hits[0].intro
         );
         assert!(
-            !hits[0].intro.contains("**") && !hits[0].intro.contains("[[") && !hits[0].intro.contains('#'),
+            !hits[0].intro.contains("disambiguation")
+                && !hits[0].intro.contains("**")
+                && !hits[0].intro.contains("[[")
+                && !hits[0].intro.contains('#'),
             "{:?}",
             hits[0].intro
         );

@@ -95,14 +95,31 @@ fn list_marker_len(t: &str) -> Option<usize> {
     (digits > 0 && t[digits..].starts_with(". ")).then_some(digits + 2)
 }
 
+/// Whether a paragraph is a hatnote, as wikizim_parser emits them: text
+/// entirely wrapped in single asterisks (`*For other uses, see [[X]].*`),
+/// possibly wrapped over several lines. Bold (`**x**`) does not match: the
+/// character after the first `*` is another `*`.
+fn is_hatnote(para: &str) -> bool {
+    let t = para.trim();
+    t.len() > 2
+        && t.starts_with('*')
+        && t.ends_with('*')
+        && !t[1..].starts_with('*')
+        && !t[1..].starts_with(' ')
+        && !t[1..t.len() - 1].contains('*')
+}
+
 /// Plain-text preview of the start of a Markdown article: the title text,
 /// then the paragraphs that follow, until `max_chars` characters of text
 /// have been produced. Headings lose their `#` markers, emphasis and
 /// inline-code markers are stripped, wikilinks become their text, list
 /// bullets and pipe-table cell separators vanish, fenced code blocks are
 /// skipped entirely, and raw HTML lines are handed to `intro_from_html`
-/// for tag stripping. Whitespace collapses to single spaces; markup and
-/// whitespace never consume the character budget.
+/// for tag stripping. Hatnote paragraphs (standalone paragraphs wrapped in
+/// single asterisks, how wikizim_parser renders "For other uses..." notes)
+/// are dropped, so the intro starts with the actual lead text. Whitespace
+/// collapses to single spaces; markup and whitespace never consume the
+/// character budget.
 pub fn intro_from_markdown(md: &str, max_chars: usize) -> String {
     let mut out = String::new();
     let mut in_fence = false;
@@ -157,16 +174,45 @@ pub fn intro_from_markdown(md: &str, max_chars: usize) -> String {
             }
             continue;
         }
-        // List items: drop the bullet marker, keep the text. A line made
-        // only of dashes/colons (a thematic break) carries no text either.
-        let body = match list_marker_len(t) {
-            Some(n) => &t[n..],
-            None => t,
-        };
-        if body.chars().all(|c| matches!(c, '-' | ':' | ' ')) {
+        // List items: drop the bullet marker, keep the text. A body made
+        // only of dashes/colons carries no text.
+        if let Some(n) = list_marker_len(t) {
+            let body = &t[n..];
+            if !body.chars().all(|c| matches!(c, '-' | ':' | ' ')) {
+                let text = strip_inline(body);
+                push_text(&mut out, &text, max_chars);
+            }
             continue;
         }
-        let text = strip_inline(body);
+        // A plain paragraph: gather its remaining lines so a hatnote (see
+        // `is_hatnote`) can be skipped whole. Any special line - heading,
+        // list, table, fence, HTML, a textless dash row - ends the
+        // paragraph and is handled on its own turn through the loop.
+        let mut para = String::from(t);
+        while let Some(next) = lines.peek() {
+            let n = next.trim_start();
+            if n.is_empty()
+                || is_fence(n)
+                || heading_level(n) > 0
+                || n.starts_with('|')
+                || n.starts_with('<')
+                || list_marker_len(n).is_some()
+                || n.chars().all(|c| matches!(c, '-' | ':' | ' '))
+            {
+                break;
+            }
+            para.push('\n');
+            para.push_str(next);
+            lines.next();
+        }
+        // A line made only of dashes/colons (a thematic break) carries no text.
+        if para.chars().all(|c| matches!(c, '-' | ':' | ' ')) {
+            continue;
+        }
+        if is_hatnote(&para) {
+            continue;
+        }
+        let text = strip_inline(&para);
         push_text(&mut out, &text, max_chars);
     }
     out.trim().to_string()
@@ -298,22 +344,36 @@ That is all.
     #[test]
     fn intro_strips_markup_and_resolves_wikilinks() {
         let intro = intro_from_markdown(CHEMISTRY, 400);
-        // Title, then the hatnote, then the lead - as plain text.
+        // Title text, then the lead: the hatnote paragraph is dropped, so
+        // the intro starts with the actual article text.
         assert!(
             intro.starts_with(
-                "Chemistry For other uses, see Chemistry (disambiguation). \
-                 \"Chemical science\" redirects here."
+                "Chemistry Chemistry is the scientific study of the matter and its properties"
             ),
             "{intro:?}"
         );
-        assert!(
-            intro.contains("is the scientific study of the matter and its properties"),
-            "{intro:?}"
-        );
+        assert!(!intro.contains("For other uses"), "{intro:?}");
         // No markdown markup survives into the intro.
         assert!(!intro.contains("**") && !intro.contains("[["), "{intro:?}");
         assert!(!intro.contains('#'), "{intro:?}");
         assert!(!intro.contains('*'), "{intro:?}");
+    }
+
+    #[test]
+    fn intro_skips_hatnotes() {
+        // Hatnotes are standalone paragraphs wrapped in single asterisks,
+        // possibly wrapped over several lines. Bold paragraphs do not match.
+        let md = "# X\n\n*For the village, see [[X (village)]].*\n\n\
+                  *A second hatnote\nwrapped over two lines.*\n\n\
+                  **X** is a thing of great importance.\n";
+        let intro = intro_from_markdown(md, 200);
+        assert_eq!(intro, "X X is a thing of great importance.");
+
+        // Hatnotes further in (before a section) are dropped as well.
+        let md = "# Y\n\n**Y** leads here.\n\n## Section\n\n\
+                  *Main article: [[Something else]]*\n\nSection text follows.\n";
+        let intro = intro_from_markdown(md, 200);
+        assert_eq!(intro, "Y Y leads here. Section Section text follows.");
     }
 
     #[test]
