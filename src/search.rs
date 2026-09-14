@@ -191,54 +191,95 @@ pub fn search(library: &ZimLibrary, query: &str) -> Result<SearchResults, ToolEr
     // concurrent searches never share a handle (Xapian does not support
     // concurrent calls on one database object).
     //
-    // The title-index band runs one query = OR of the stemmed query terms
-    // against the title index (documents ARE titles: the same unprefixed
-    // stems as the full-text index, so the same `terms` match directly). An
-    // article whose title contains ALL the query words outranks one whose
-    // title has a subset (BM25 sums OR-branch contributions), and the band
-    // ranks those articles ahead of every full-text match - a title that
-    // says the whole query is far stronger evidence than body words. The
-    // band is skipped for archives without a title index and queries with
-    // no usable terms.
+    // The title-index band queries the archive's title index (`X/title/xapian`;
+    // documents ARE titles: the same unprefixed stems as the full-text index,
+    // so the same `terms` match directly) in two sub-bands: for multi-word
+    // queries an AND over ALL the stemmed terms first (titles containing
+    // every query word), then the OR of the terms (partial title matches).
+    // Under the OR ranking alone, a title matching one ultra-common query
+    // word can outrank titles containing every word - the AND sub-band
+    // fixes the ordering inside the band. The band ranks its hits ahead of
+    // every full-text match - a title that says the whole query is far
+    // stronger evidence than body words - and is skipped for archives
+    // without a title index and queries with no usable terms.
     let mut title_lists: Vec<(&Arc<Archive>, Vec<(String, String)>)> = Vec::new();
     // Full-text band: (weight, path, title from the index).
     let mut per_archive: Vec<(&Arc<Archive>, Vec<(f64, String, String)>)> = Vec::new();
     for arc in &library.archives {
+        // Paths already reported as exact title/URL matches for THIS archive:
+        // the title band must not report them again (the skip below).
+        let exact_paths: std::collections::HashSet<&str> = merged
+            .iter()
+            .filter(|(a, ..)| Arc::ptr_eq(a, arc))
+            .map(|(_, path, ..)| path.as_str())
+            .collect();
         let Some((title_list, list)) = arc.with_xapian(|h| -> Result<_, ToolError> {
             let mut title_list = Vec::new();
             if !terms.is_empty() {
                 if let Some(title_db) = &h.title {
-                    let mut tquery = Query::term(&terms[0])?;
-                    for term in &terms[1..] {
-                        tquery = Query::combine(Operator::Or, &tquery, &Query::term(term)?)?;
+                    // Sub-band queries, in band order: the AND over ALL the
+                    // stemmed terms (multi-word queries only - with one term
+                    // AND and OR are the same query), then the OR of the
+                    // terms. Every AND hit reappears in the OR's results (a
+                    // title with all the words also matches any subset of
+                    // them), so the OR pass skips the docids the AND pass
+                    // already reported.
+                    let mut and_query: Option<Query> = None;
+                    if terms.len() >= 2 {
+                        let mut all_terms = Query::term(&terms[0])?;
+                        for term in &terms[1..] {
+                            all_terms = Query::combine(Operator::And, &all_terms, &Query::term(term)?)?;
+                        }
+                        and_query = Some(all_terms);
                     }
+                    let mut or_query = Query::term(&terms[0])?;
+                    for term in &terms[1..] {
+                        or_query = Query::combine(Operator::Or, &or_query, &Query::term(term)?)?;
+                    }
+                    let mut taken: std::collections::HashSet<u32> = std::collections::HashSet::new();
                     let mut enquire = Enquire::new(title_db)?;
-                    enquire.set_query(&tquery)?;
                     enquire.set_sort_by_relevance();
-                    let mset = enquire.get_mset(0, SEARCH_LIMIT, 0)?;
-                    for j in 0..mset.size() {
-                        let mut doc = mset.document(j)?;
-                        // The title-index document's data is the article
-                        // path and its value slot 0 the title (same shape
-                        // as the full-text index, one shared docid space).
-                        // Should a producer leave either empty, the
-                        // full-text document of the same docid fills it in.
-                        let mut path = doc.data_str()?;
-                        let mut title = String::from_utf8_lossy(&doc.value(0)?).into_owned();
-                        if path.is_empty() || title.is_empty() {
-                            if let Ok(mut ftdoc) = h.fulltext.get_document(mset.docid(j)) {
-                                if path.is_empty() {
-                                    path = ftdoc.data_str()?;
-                                }
-                                if title.is_empty() {
-                                    title = String::from_utf8_lossy(&ftdoc.value(0)?).into_owned();
+                    for tquery in [and_query, Some(or_query)].into_iter().flatten() {
+                        enquire.set_query(&tquery)?;
+                        let mset = enquire.get_mset(0, SEARCH_LIMIT, 0)?;
+                        for j in 0..mset.size() {
+                            // One band slot per title-index document.
+                            if !taken.insert(mset.docid(j)) {
+                                continue;
+                            }
+                            let mut doc = mset.document(j)?;
+                            // The title-index document's data is the article
+                            // path and its value slot 0 the title (same shape
+                            // as the full-text index, one shared docid space).
+                            // Should a producer leave either empty, the
+                            // full-text document of the same docid fills it in.
+                            let mut path = doc.data_str()?;
+                            let mut title = String::from_utf8_lossy(&doc.value(0)?).into_owned();
+                            if path.is_empty() || title.is_empty() {
+                                if let Ok(mut ftdoc) = h.fulltext.get_document(mset.docid(j)) {
+                                    if path.is_empty() {
+                                        path = ftdoc.data_str()?;
+                                    }
+                                    if title.is_empty() {
+                                        title =
+                                            String::from_utf8_lossy(&ftdoc.value(0)?).into_owned();
+                                    }
                                 }
                             }
+                            if path.is_empty() {
+                                continue;
+                            }
+                            // An article already reported as an exact
+                            // title/URL match keeps that first-band slot:
+                            // its exact-match title (the query itself when
+                            // the directory entry title is empty) need not
+                            // equal the index title, which the final
+                            // normalized-title dedupe cannot see through.
+                            if exact_paths.contains(path.as_str()) {
+                                continue;
+                            }
+                            title_list.push((path, title));
                         }
-                        if path.is_empty() {
-                            continue;
-                        }
-                        title_list.push((path, title));
                     }
                 }
             }
@@ -859,6 +900,82 @@ Meltwater streams out of the ice.
         // time) - no hits, no error.
         let hits = search(&server, "the of");
         assert!(hits.is_empty(), "{hits:?}");
+    }
+
+    /// An archive whose title band's OR query alone ranks a PARTIAL title
+    /// match above the all-words title match: the short "Quebec, Quebec"
+    /// title repeats its query word, while the word it is missing - "city" -
+    /// is ultra-common (seven of the eight titles contain it), so its BM25
+    /// contribution collapses. OR-only weights measured on exactly this
+    /// document set: "Quebec, Quebec" 1.298 vs "Quebec City" 1.081.
+    fn title_and_test_server() -> (ZimMcpServer, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        let titles = make_index(&[
+            ("C/Quebec,_Quebec", "quebec quebec", "Quebec, Quebec"),
+            ("C/Quebec_City", "quebec citi", "Quebec City"),
+            ("C/New_York_City", "new york citi", "New York City"),
+            ("C/Kansas_City", "kansas citi", "Kansas City"),
+            ("C/Mexico_City", "mexico citi", "Mexico City"),
+            ("C/Atlantic_City", "atlantic citi", "Atlantic City"),
+            ("C/Jersey_City", "jersey citi", "Jersey City"),
+            ("C/Salt_Lake_City", "salt lake citi", "Salt Lake City"),
+        ]);
+        let index = make_index(&[
+            ("C/Quebec,_Quebec", "quebec quebec appear twice own titl", "Quebec, Quebec"),
+            ("C/Quebec_City", "quebec citi capit provinc", "Quebec City"),
+            ("C/New_York_City", "new york citi largest unit state", "New York City"),
+            ("C/Kansas_City", "kansas citi", "Kansas City"),
+            ("C/Mexico_City", "mexico citi", "Mexico City"),
+            ("C/Atlantic_City", "atlantic citi", "Atlantic City"),
+            ("C/Jersey_City", "jersey citi", "Jersey City"),
+            ("C/Salt_Lake_City", "salt lake citi", "Salt Lake City"),
+        ]);
+        let content = [
+            // Empty directory-entry titles, as in modern openZIM archives:
+            // the titles live in the indexes (value slot 0) only.
+            TestEntry { namespace: b'C', url: "Quebec,_Quebec", title: "", mime: 0, body: b"<html><body><h1>Quebec, Quebec</h1><p>Quebec, Quebec appears twice in its own title.</p></body></html>" },
+            TestEntry { namespace: b'C', url: "Quebec_City", title: "", mime: 0, body: b"<html><body><h1>Quebec City</h1><p>Quebec City is the capital of the province.</p></body></html>" },
+            TestEntry { namespace: b'C', url: "New_York_City", title: "", mime: 0, body: b"<html><body><h1>New York City</h1><p>New York City is the largest in the United States.</p></body></html>" },
+            TestEntry { namespace: b'C', url: "Kansas_City", title: "", mime: 0, body: b"<html><body><h1>Kansas City</h1><p>Kansas City straddles two states.</p></body></html>" },
+            TestEntry { namespace: b'C', url: "Mexico_City", title: "", mime: 0, body: b"<html><body><h1>Mexico City</h1><p>Mexico City is the capital of Mexico.</p></body></html>" },
+            TestEntry { namespace: b'C', url: "Atlantic_City", title: "", mime: 0, body: b"<html><body><h1>Atlantic City</h1><p>Atlantic City is a resort town.</p></body></html>" },
+            TestEntry { namespace: b'C', url: "Jersey_City", title: "", mime: 0, body: b"<html><body><h1>Jersey City</h1><p>Jersey City sits opposite Manhattan.</p></body></html>" },
+            TestEntry { namespace: b'C', url: "Salt_Lake_City", title: "", mime: 0, body: b"<html><body><h1>Salt Lake City</h1><p>Salt Lake City hosts a famous temple.</p></body></html>" },
+        ];
+        let bytes = build_archive_indexes(&["text/html"], &content, &[], 0, Some(&index), Some(&titles));
+        std::fs::write(dir.path().join("test.zim"), &bytes).unwrap();
+        let library = Arc::new(ZimLibrary::scan(dir.path()).unwrap());
+        assert!(library.archives[0].searchable());
+        (ZimMcpServer::new(library), dir)
+    }
+
+    #[test]
+    fn e2e_search_title_band_ranks_all_words_titles_first() {
+        let (server, _keep) = title_and_test_server();
+
+        // Under OR-only BM25 the partial title match outranks the all-words
+        // title match (weights in the builder comment). Within the band, the
+        // AND sub-band must put the title containing BOTH query words - the
+        // AND query's only hit - ahead of it. ("quebec cities" is
+        // deliberately nobody's URL, so the hits really come from the band.)
+        let hits = search(&server, "quebec cities");
+        assert_eq!(hits.len(), 8, "{hits:?}");
+        assert_eq!(hits[0].path, "C/Quebec_City", "{hits:?}");
+        assert_eq!(hits[0].title, "Quebec City");
+        assert_eq!(hits[1].path, "C/Quebec,_Quebec", "{hits:?}");
+        assert_eq!(hits[1].title, "Quebec, Quebec");
+        // Title-band hits are title matches: the lead as the preview, no
+        // sections - for the all-words hit and the partial one alike.
+        assert_eq!(hits[0].preview, "Quebec City is the capital of the province.");
+        assert_eq!(hits[0].sections, None);
+        assert_eq!(hits[1].sections, None);
+
+        // A single-term query runs the one OR query only - the unchanged
+        // BM25 order (the short title repeating the term first).
+        let hits = search(&server, "quebec");
+        assert_eq!(hits.len(), 2, "{hits:?}");
+        assert_eq!(hits[0].path, "C/Quebec,_Quebec", "{hits:?}");
+        assert_eq!(hits[1].path, "C/Quebec_City", "{hits:?}");
     }
 
     /// An archive where BM25 alone ranks the wrong article first: the
