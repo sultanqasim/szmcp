@@ -91,6 +91,37 @@ fn is_hatnote_attrs(attrs: &str) -> bool {
     }) || attr_value(attrs, "role").is_some_and(|v| v.trim().eq_ignore_ascii_case("note"))
 }
 
+/// The index just past the close tag matching the open `<tag_name ...>` at
+/// `open_i`, counting nested same-name elements. Returns the end of the
+/// input when the element is never closed (e.g. a prefix truncated inside
+/// the element): everything after it is then the element's content.
+fn element_end(html: &str, open_i: usize, tag_name: &str) -> usize {
+    let bytes = html.as_bytes();
+    let mut depth = 1usize;
+    let mut j = open_i + 1;
+    while let Some(rel) = bytes[j..].iter().position(|&c| c == b'<') {
+        let lt = j + rel;
+        let rest = &html[lt + 1..];
+        let (is_close, name) = match rest.strip_prefix('/') {
+            Some(r) => (true, r),
+            None => (false, rest),
+        };
+        let name_end = name.find(|c: char| !c.is_ascii_alphanumeric()).unwrap_or(name.len());
+        if name_end == tag_name.len() && name[..name_end].eq_ignore_ascii_case(tag_name) {
+            if is_close {
+                depth -= 1;
+                if depth == 0 {
+                    return html[lt..].find('>').map_or(html.len(), |g| lt + g + 1);
+                }
+            } else {
+                depth += 1;
+            }
+        }
+        j = lt + 1;
+    }
+    html.len()
+}
+
 /// The region of a MediaWiki page that holds the article. Scanning the whole
 /// HTML would pick up browser-chrome text (title bar, navigation menus), so
 /// cut the page at the content div (`id="mw-content-text"`) and its matching
@@ -169,14 +200,25 @@ pub fn intro_from_html(html: &str, max_chars: usize) -> String {
                     && (INTRO_SKIP_TAGS.contains(&tag_name.as_str())
                         || is_hatnote_attrs(&tag[tag_name.len()..]));
                 if skip {
-                    let close = format!("</{tag_name}");
-                    if let Some(cp) = find_ci(bytes, i + 1, close.as_bytes()) {
-                        if let Some(g) = bytes[cp..].iter().position(|&c| c == b'>') {
-                            i = cp + g + 1;
-                            sep = true;
-                            continue;
-                        }
-                    }
+                    // Tables nest (an infobox holds nested tables), so their
+                    // close tag is matched by depth - ending the skip at an
+                    // inner table's close would spill the rest of the
+                    // infobox into the intro. Other skipped elements never
+                    // nest; their first close tag ends the skip (a script's
+                    // text may itself contain "<script", so depth counting
+                    // could overshoot there). An element never closed within
+                    // the scanned text ends the skip at the end of it.
+                    let end = if tag_name == "table" {
+                        element_end(html, i, &tag_name)
+                    } else {
+                        let close = format!("</{tag_name}");
+                        find_ci(bytes, i + 1, close.as_bytes()).map_or(html.len(), |cp| {
+                            bytes[cp..].iter().position(|&c| c == b'>').map_or(html.len(), |g| cp + g + 1)
+                        })
+                    };
+                    i = end;
+                    sep = true;
+                    continue;
                 }
                 sep = true;
                 i = gt + 1;
@@ -459,6 +501,24 @@ mod tests {
         let page = "<html><head><title>Solid oxygen - Wikipedia</title></head><body><div id=\"mw-content-text\"><div class=\"mw-parser-output\"><div role=\"note\" class=\"hatnote navigation-not-searchable\">This article is about the solid phase of elemental oxygen. For other uses, see <a href=\"Oxygen\" title=\"Oxygen\">Oxygen</a>.</div><link rel=\"mw-deduplicated-inline-style\" href=\"mw-data:TemplateStyles:r128\"/><p><b>Solid oxygen</b> forms below 54.36 K at normal pressure.</p></div></div><footer>Navigation menu</footer></body></html>";
         let intro = intro_from_html(page, 200);
         assert_eq!(intro, "Solid oxygen forms below 54.36 K at normal pressure.");
+    }
+
+    #[test]
+    fn intro_skips_nested_infobox_tables() {
+        // An infobox <table> holding a nested <table>: the skip must not end
+        // at the inner table's close, or the rest of the infobox leaks into
+        // the intro.
+        let page = "<div id=\"mw-content-text\"><div class=\"mw-parser-output\">\
+            <table><tbody><tr><td><table><tbody><tr><td>inner</td></tr></tbody></table></td></tr>\
+            <tr><td>Written in Objective-C</td></tr></tbody></table>\
+            <p><b>Apple Books</b> is an e-book reader.</p></div></div>";
+        let intro = intro_from_html(page, 100);
+        assert_eq!(intro, "Apple Books is an e-book reader.");
+
+        // A scan truncated inside the table skips to the end of the input:
+        // everything after is the table's content.
+        let page = "<div id=\"mw-content-text\"><table><tr><td>infobox";
+        assert_eq!(intro_from_html(page, 100), "");
     }
 
     #[test]
