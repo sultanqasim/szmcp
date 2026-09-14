@@ -174,14 +174,12 @@ impl ToolBase for ZimSearchTool {
     }
     fn description() -> Option<Cow<'static, str>> {
         Some(
-            "Full-text search across all ZIM files. Multi-word queries rank articles \
-             containing all the words higher, but partial matches are still returned (one \
-             bad or missing word is tolerated). An article whose title or redirect exactly \
-             matches the query comes first. Each result has zim, path, title, and text - \
-             the article's first paragraph when the query matches the title or the intro, \
-             otherwise the paragraph with the most query matches together with \
-             \"sections\" (the section names containing the matches). Use zim + path with \
-             the zim_get and zim_get_section tools."
+            "Search all articles in all ZIM files. Results are ranked best first (an exact \
+             title match always comes first); each result has the ZIM file name, the article \
+             path, the page title, and text - the article's first paragraph, or the \
+             paragraph that best matches the query together with \"sections\" (the section \
+             names it was found in). Use the returned zim and path with the zim_get and \
+             zim_get_section tools."
                 .into(),
         )
     }
