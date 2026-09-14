@@ -755,7 +755,8 @@ impl Archive {
     }
 }
 
-/// A set of ZIM archives loaded from a directory.
+/// A set of ZIM archives: everything under a directory (`scan`), or a
+/// single file (`single`).
 pub struct ZimLibrary {
     pub root: PathBuf,
     pub archives: Vec<Arc<Archive>>,
@@ -786,6 +787,23 @@ impl ZimLibrary {
             ));
         }
         Ok(ZimLibrary { root: root.to_path_buf(), archives })
+    }
+
+    /// Open the single ZIM archive at `file` (`*.zim`, or the first
+    /// `*.zimaa` chunk of a chunked archive) as a one-archive library. Errors
+    /// are fatal (unlike `scan`, no skip-and-continue). The archive keeps its
+    /// file name and `root` is its parent directory, so search results and
+    /// the `zim` argument of zim_get/zim_get_section behave exactly as in a
+    /// scanned directory.
+    pub fn single(file: &Path) -> io::Result<ZimLibrary> {
+        let name = file.file_name().and_then(zim_archive_name).ok_or_else(|| {
+            io::Error::new(ErrorKind::InvalidInput, format!("not a ZIM file: {}", file.display()))
+        })?;
+        // "x.zimaa" normalizes to "x.zim", whose (nonexistent) path makes
+        // Store::open pick up the chunked form x.zimaa, x.zimab, ...
+        let zim = Zim::open(file.with_file_name(&name))?;
+        let root = file.parent().unwrap_or(Path::new(".")).to_path_buf();
+        Ok(ZimLibrary { root, archives: vec![Arc::new(Archive::new(name, zim))] })
     }
 }
 
@@ -1213,5 +1231,52 @@ pub(crate) mod testutil {
         let art = a.get_article("index.html").unwrap();
         assert_eq!(art.bytes, b"<p>hello old world</p>");
         assert_eq!(art.full_path, "A/index.html");
+    }
+
+    #[test]
+    fn single_file_library() {
+        let dir = tempfile::tempdir().unwrap();
+        let content = [TestEntry {
+            namespace: b'C',
+            url: "Apple",
+            title: "Apple",
+            mime: 0,
+            body: b"<html><body><h1>Apple</h1><p>An apple a day keeps the doctor away.</p></body></html>",
+        }];
+        let bytes = build_archive(&["text/html"], &content, &[], 0, None);
+        let file = dir.path().join("sample.zim");
+        std::fs::write(&file, &bytes).unwrap();
+        let lib = ZimLibrary::single(&file).unwrap();
+        assert_eq!(lib.archives.len(), 1);
+        assert_eq!(lib.archives[0].name, "sample.zim");
+        assert_eq!(lib.root, dir.path());
+        let art = lib.archives[0].get_article("C/Apple").unwrap();
+        assert_eq!(art.title, "Apple");
+    }
+
+    #[test]
+    fn single_file_accepts_chunked_first_chunk() {
+        let dir = tempfile::tempdir().unwrap();
+        let content = [TestEntry {
+            namespace: b'C',
+            url: "Apple",
+            title: "Apple",
+            mime: 0,
+            body: b"<html><body><p>An apple a day.</p></body></html>",
+        }];
+        let bytes = build_archive(&["text/html"], &content, &[], 0, None);
+        let file = dir.path().join("chunk.zimaa");
+        std::fs::write(&file, &bytes).unwrap();
+        let lib = ZimLibrary::single(&file).unwrap();
+        // The chunk argument is normalized to the archive's `*.zim` name.
+        assert_eq!(lib.archives[0].name, "chunk.zim");
+    }
+
+    #[test]
+    fn single_file_rejects_non_zim() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("notes.txt");
+        std::fs::write(&file, b"definitely not a ZIM archive").unwrap();
+        assert!(ZimLibrary::single(&file).is_err());
     }
 }

@@ -49,12 +49,14 @@ cargo build --release
 
 ## Run
 
-Every mode takes the folder containing the ZIM files as its first argument
-(scanned recursively; chunked archives `*.zimaa…` are supported).
+Every mode takes either a single ZIM file or a folder containing ZIM files as
+its first argument (folders are scanned recursively; chunked archives
+`*.zimaa…` are supported).
 
 ```
 szmcp serve /path/to/zim-folder [--bind 127.0.0.1] [-p 3001]
 szmcp search /path/to/zim-folder "query"
+szmcp search /path/to/one-file.zim "query"
 szmcp get /path/to/zim-folder file.zim C/SomeArticle
 szmcp get_section /path/to/zim-folder file.zim C/SomeArticle "History"
 ```

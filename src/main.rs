@@ -28,8 +28,8 @@ struct Cli {
 enum Command {
     /// Serve the ZIM tools over the MCP streamable HTTP transport
     Serve {
-        /// Path to a folder containing ZIM files
-        zim_dir: PathBuf,
+        /// Path to a ZIM file or a folder containing ZIM files
+        zim_path: PathBuf,
 
         /// Bind address to listen on (default: 127.0.0.1)
         #[arg(long, default_value_t = String::from("127.0.0.1"))]
@@ -39,17 +39,17 @@ enum Command {
         #[arg(long, short, default_value_t = 3001)]
         port: u16,
     },
-    /// Search all articles of all ZIM files in a folder
+    /// Search all articles of the ZIM files
     Search {
-        /// Path to a folder containing ZIM files
-        zim_dir: PathBuf,
+        /// Path to a ZIM file or a folder containing ZIM files
+        zim_path: PathBuf,
         /// The search string to look for
         query: String,
     },
     /// Get the full content of an article from a ZIM file
     Get {
-        /// Path to a folder containing ZIM files
-        zim_dir: PathBuf,
+        /// Path to a ZIM file or a folder containing ZIM files
+        zim_path: PathBuf,
         /// ZIM file name, relative to the ZIM directory (as given in search results)
         zim: String,
         /// Path of the article inside the ZIM file
@@ -57,8 +57,8 @@ enum Command {
     },
     /// Get one section of an article from a ZIM file, by its heading text
     GetSection {
-        /// Path to a folder containing ZIM files
-        zim_dir: PathBuf,
+        /// Path to a ZIM file or a folder containing ZIM files
+        zim_path: PathBuf,
         /// ZIM file name, relative to the ZIM directory (as given in search results)
         zim: String,
         /// Path of the article inside the ZIM file
@@ -68,13 +68,21 @@ enum Command {
     },
 }
 
-/// Scan a folder of ZIM files, the way every subcommand starts.
-fn open_library(zim_dir: &Path) -> Result<Arc<zim::ZimLibrary>, String> {
-    let dir = std::fs::canonicalize(zim_dir)
-        .map_err(|e| format!("Invalid ZIM directory {}: {e}", zim_dir.display()))?;
-    zim::ZimLibrary::scan(&dir)
-        .map(Arc::new)
-        .map_err(|e| format!("Failed to scan ZIM directory {}: {e}", zim_dir.display()))
+/// Open the ZIM library the way every subcommand starts: `zim_path` is either
+/// a ZIM file itself or a folder whose ZIM files (recursed) are all loaded.
+fn open_library(zim_path: &Path) -> Result<Arc<zim::ZimLibrary>, String> {
+    let path = std::fs::canonicalize(zim_path)
+        .map_err(|e| format!("Invalid ZIM path {}: {e}", zim_path.display()))?;
+    let library = if path.is_dir() {
+        zim::ZimLibrary::scan(&path)
+            .map_err(|e| format!("Failed to scan ZIM directory {}: {e}", zim_path.display()))
+    } else if path.is_file() {
+        zim::ZimLibrary::single(&path)
+            .map_err(|e| format!("Failed to open ZIM file {}: {e}", zim_path.display()))
+    } else {
+        Err(format!("{}: not a directory or ZIM file", path.display()))
+    };
+    library.map(Arc::new)
 }
 
 /// Run one of the MCP tools against a freshly opened library and print its
@@ -98,15 +106,15 @@ where
 
 async fn run(command: Command) -> Result<(), String> {
     match command {
-        Command::Serve { zim_dir, bind, port } => serve(&zim_dir, bind, port).await,
-        Command::Search { zim_dir, query } => {
-            run_tool::<ZimSearchTool>(open_library(&zim_dir)?, ZimSearchParams { query })
+        Command::Serve { zim_path, bind, port } => serve(&zim_path, bind, port).await,
+        Command::Search { zim_path, query } => {
+            run_tool::<ZimSearchTool>(open_library(&zim_path)?, ZimSearchParams { query })
         }
-        Command::Get { zim_dir, zim, path } => {
-            run_tool::<ZimGetTool>(open_library(&zim_dir)?, ZimGetParams { zim, path })
+        Command::Get { zim_path, zim, path } => {
+            run_tool::<ZimGetTool>(open_library(&zim_path)?, ZimGetParams { zim, path })
         }
-        Command::GetSection { zim_dir, zim, path, section } => run_tool::<ZimGetSectionTool>(
-            open_library(&zim_dir)?,
+        Command::GetSection { zim_path, zim, path, section } => run_tool::<ZimGetSectionTool>(
+            open_library(&zim_path)?,
             ZimGetSectionParams { zim, path, section },
         ),
     }
@@ -128,8 +136,8 @@ async fn main() -> std::process::ExitCode {
 }
 
 /// Run the MCP server (streamable HTTP transport, endpoint at the root path).
-async fn serve(zim_dir: &Path, bind: String, port: u16) -> Result<(), String> {
-    let library = open_library(zim_dir)?;
+async fn serve(zim_path: &Path, bind: String, port: u16) -> Result<(), String> {
+    let library = open_library(zim_path)?;
 
     let addr = format!("{bind}:{port}");
 
@@ -177,7 +185,7 @@ async fn serve(zim_dir: &Path, bind: String, port: u16) -> Result<(), String> {
         .layer(cors_layer);
 
     eprintln!("szmcp - Sultan's ZIM MCP");
-    eprintln!("ZIM directory: {}", zim_dir.display());
+    eprintln!("ZIM path: {}", zim_path.display());
     for a in &library.archives {
         eprintln!(
             "  loaded: {} (entries: {}, searchable: {})",

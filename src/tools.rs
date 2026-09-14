@@ -1115,6 +1115,43 @@ Meltwater streams out of the ice.
         assert_eq!((hits[1].zim.as_str(), hits[1].path.as_str()), ("b.zim", "C/Cherry"));
     }
 
+    #[test]
+    fn e2e_search_and_get_single_file_library() {
+        // A library opened from one ZIM file (no folder scan) behaves like a
+        // scanned folder: the archive is addressed by its file name.
+        let dir = tempfile::tempdir().unwrap();
+        let index = make_index(&[(
+            "C/Salt",
+            "salt miner primari sodium chlorid himalaya deposit rock",
+            "Salt",
+        )]);
+        let content = [TestEntry {
+            namespace: b'C',
+            url: "Salt",
+            title: "Salt",
+            mime: 0,
+            body: SALT_HTML.as_bytes(),
+        }];
+        let file = dir.path().join("one.zim");
+        std::fs::write(&file, build_archive(&["text/html"], &content, &[], 0, Some(&index))).unwrap();
+        let library = Arc::new(ZimLibrary::single(&file).unwrap());
+        assert_eq!(library.archives.len(), 1);
+        let server = ZimMcpServer::new(library);
+
+        let hits = search(&server, "salt");
+        assert_eq!(hits.len(), 1, "{hits:?}");
+        assert_eq!(hits[0].zim, "one.zim");
+        assert_eq!(hits[0].path, "C/Salt");
+
+        let params = serde_json::from_value::<ZimGetParams>(
+            serde_json::json!({ "zim": "one.zim", "path": "C/Salt" }),
+        )
+        .unwrap();
+        let result = ZimGetTool::invoke(&server, params).unwrap();
+        assert_eq!(result.title, "Salt");
+        assert!(result.content.contains("sodium chloride"));
+    }
+
     /// An article in the shape wikizim_parser emits (`text/markdown`).
     const ZINC_MD: &str = "\
 # Zinc
