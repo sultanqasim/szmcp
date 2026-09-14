@@ -5,7 +5,7 @@
 //! `[[Target|label]]` wikilinks, lists, pipe tables, fenced code blocks and
 //! the occasional raw HTML block (complex tables).
 
-use crate::html::{self, normalize};
+use crate::html::{self, normalize, INTRO_SECTION};
 
 /// Append plain text to the intro under construction: a single space
 /// separates it from any text already emitted (a skipped line - blank line,
@@ -235,31 +235,23 @@ fn md_paragraphs(lines: &[&str], max_para_chars: usize) -> Vec<String> {
 /// Split a Markdown article into its intro region and one region per
 /// heading, with the cleaned paragraph texts of each region (the shape
 /// [`html::sections`] mirrors for HTML). Returns `(name, paragraphs)` pairs:
-/// the first entry carries the intro region under the empty name, the later
-/// entries carry each heading's section under the heading text as written,
-/// spanning what [`section_content`] would return for it, so a nested
-/// `###`'s paragraphs belong to its own entry and to the enclosing `##`'s.
-/// The leading `# Title` heading is the article title - a separate field of
-/// every search hit - not a section: when the document opens with a
-/// heading, it is dropped (the positional rule documented on [`sections`]
-/// applies to that line) and the intro region runs from after it.
+/// the first entry carries the intro region under the `INTRO_SECTION`
+/// name, the later entries carry each heading's section under the heading
+/// text as written, spanning what [`section_content`] would return for it,
+/// so a nested `###`'s paragraphs belong to its own entry and to the
+/// enclosing `##`'s. The leading `# Title` heading is the article title - a
+/// separate field of every search hit - not a section: when the document
+/// opens with a heading, it is dropped (the positional rule of
+/// `title_split` applies to that line) and the intro region runs from
+/// after it.
 pub fn sections(md: &str, max_para_chars: usize) -> Vec<(String, Vec<String>)> {
     let lines: Vec<&str> = md.lines().collect();
     let headings = collect_headings(&lines);
-    let title = headings
-        .first()
-        .filter(|h| lines[..h.line].iter().all(|l| l.trim().is_empty()));
-    let (intro_start, first_section) = match title {
-        Some(t) => (t.line + 1, 1),
-        None => (0, 0),
-    };
+    let (intro_start, first_section) = title_split(&lines, &headings);
     let intro_end = headings
         .get(first_section)
         .map_or(lines.len(), |h| h.line);
-    let mut out = vec![(
-        String::new(),
-        md_paragraphs(&lines[intro_start..intro_end], max_para_chars),
-    )];
+    let mut out = vec![(INTRO_SECTION.to_string(), md_paragraphs(&lines[intro_start..intro_end], max_para_chars))];
     for (i, h) in headings.iter().enumerate().skip(first_section) {
         let end = headings[i + 1..]
             .iter()
@@ -271,6 +263,35 @@ pub fn sections(md: &str, max_para_chars: usize) -> Vec<(String, Vec<String>)> {
         ));
     }
     out
+}
+
+/// The intro region's paragraphs: the paragraphs [`sections`] reports for
+/// its `INTRO_SECTION` entry, computed without extracting any body
+/// section's paragraphs (a search hit's lead fast path needs only these).
+pub fn intro_paragraphs(md: &str, max_para_chars: usize) -> Vec<String> {
+    let lines: Vec<&str> = md.lines().collect();
+    let headings = collect_headings(&lines);
+    let (intro_start, first_section) = title_split(&lines, &headings);
+    let intro_end = headings
+        .get(first_section)
+        .map_or(lines.len(), |h| h.line);
+    md_paragraphs(&lines[intro_start..intro_end], max_para_chars)
+}
+
+/// Where the intro region starts and where the section entries begin: the
+/// leading `# Title` heading is the article title - a separate field of
+/// every search hit - not a section, so when the document opens with a
+/// heading (however deep) it is dropped and the intro runs from after it.
+/// Both [`sections`] and [`intro_paragraphs`] split on this rule, so the
+/// two always agree on what the intro holds.
+fn title_split(lines: &[&str], headings: &[Heading]) -> (usize, usize) {
+    let title = headings
+        .first()
+        .filter(|h| lines[..h.line].iter().all(|l| l.trim().is_empty()));
+    match title {
+        Some(t) => (t.line + 1, 1),
+        None => (0, 0),
+    }
 }
 
 struct Heading {
@@ -467,8 +488,8 @@ That is all.
         let secs = sections(SECTIONS_MD, 400);
         // The intro region: the paragraphs after the leading `# Title` line
         // (dropped - the title is a separate field of every hit), with the
-        // hatnote dropped, under the empty name.
-        assert_eq!(secs[0].0, "");
+        // hatnote dropped, under the reserved intro name.
+        assert_eq!(secs[0].0, "_intro");
         assert_eq!(
             secs[0].1,
             vec![
@@ -531,7 +552,7 @@ That is all.
         // the plain lead is the intro region.
         let md = "Plain lead text.\n\n## Section\n\nBody.\n";
         let secs = sections(md, 100);
-        assert_eq!(secs[0].0, "");
+        assert_eq!(secs[0].0, "_intro");
         assert_eq!(secs[0].1, vec!["Plain lead text."]);
         assert_eq!(secs[1].0, "Section");
         assert_eq!(secs[1].1, vec!["Body."]);
@@ -539,7 +560,22 @@ That is all.
         // No headings at all: a single intro entry.
         assert_eq!(
             sections("One.\n\nTwo.\n", 100),
-            vec![("".to_string(), vec!["One.".to_string(), "Two.".to_string()])]
+            vec![("_intro".to_string(), vec!["One.".to_string(), "Two.".to_string()])]
+        );
+    }
+
+    #[test]
+    fn intro_paragraphs_are_the_intro_regions_paragraphs() {
+        // `intro_paragraphs` extracts exactly the paragraphs `sections`
+        // reports for the intro region, and nothing from the body sections.
+        let secs = sections(SECTIONS_MD, 400);
+        assert_eq!(intro_paragraphs(SECTIONS_MD, 400), secs[0].1);
+        assert_eq!(
+            intro_paragraphs(SECTIONS_MD, 400),
+            vec![
+                "Salt is a mineral composed of sodium chloride.".to_string(),
+                "It is an ionic compound.".to_string(),
+            ]
         );
     }
 

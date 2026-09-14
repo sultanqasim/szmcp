@@ -147,10 +147,11 @@ pub struct SearchHit {
     /// Page/article title
     pub title: String,
     /// First paragraph of the article when the query matches the title or
-    /// the intro, otherwise the paragraph with the most query matches
+    /// that paragraph, otherwise the paragraph with the most query matches
     pub text: String,
-    /// Names of the sections holding query matches; absent when the query
-    /// matches the title or the intro
+    /// Names of the regions holding query matches - the intro listed as
+    /// `_intro` first when it matched, then the sections in document order;
+    /// absent when the query matches the title or the first intro paragraph
     #[serde(skip_serializing_if = "Option::is_none")]
     pub sections: Option<Vec<String>>,
 }
@@ -176,9 +177,10 @@ impl ToolBase for ZimSearchTool {
         Some(
             "Search all articles in all ZIM files. Results are ranked best first (an exact \
              title match always comes first); each result has the ZIM file name, the article \
-             path, the page title, and text - the article's first paragraph, or the \
-             paragraph that best matches the query together with \"sections\" (the section \
-             names it was found in). Use the returned zim and path with the zim_get and \
+             path, the page title, and text - the article's first paragraph when the query \
+             matches the title or that paragraph, otherwise the paragraph that best matches \
+             the query together with \"sections\", the matching regions' names (the intro \
+             listed as \"_intro\"). Use the returned zim and path with the zim_get and \
              zim_get_section tools."
                 .into(),
         )
@@ -355,12 +357,8 @@ fn search_impl(library: &ZimLibrary, query: &str) -> Result<SearchResults, ToolE
         let article = String::from_utf8_lossy(&bytes);
         // Markdown editions carry plain Markdown, not HTML: pick the matching
         // splitter so the paragraphs and section names are free of markup.
-        let secs = if mime.as_deref().is_some_and(|m| m.contains("markdown")) {
-            markdown::sections(&article, PARA_MATCH_CHARS)
-        } else {
-            html::sections(&article, PARA_MATCH_CHARS)
-        };
-        let (text, sections) = hit_text(&secs, &terms, *exact, &mut stem);
+        let is_markdown = mime.as_deref().is_some_and(|m| m.contains("markdown"));
+        let (text, sections) = hit_text(&article, &terms, *exact, &mut stem, is_markdown);
         hits.push(SearchHit {
             zim: arc.name.clone(),
             path: path.clone(),
@@ -388,24 +386,22 @@ fn para_matches(text: &str, terms: &[String], stem: &mut Stem) -> usize {
         .count()
 }
 
-/// Whether every query term occurs (stemmed) somewhere in `paras`' words.
-fn covers_all_terms(paras: &[String], terms: &[String], stem: &mut Stem) -> bool {
+/// Whether every query term occurs (stemmed) somewhere in `text`'s words.
+fn covers_all_terms(text: &str, terms: &[String], stem: &mut Stem) -> bool {
     let mut covered = vec![false; terms.len()];
     let mut left = terms.len();
-    for para in paras {
-        for word in para.split(|c: char| !c.is_alphanumeric()) {
-            let word = word.to_lowercase();
-            if word.is_empty() || STOPWORDS.contains(&word.as_str()) {
-                continue;
-            }
-            let stemmed = stem_word(&word, stem);
-            for (k, term) in terms.iter().enumerate() {
-                if !covered[k] && *term == stemmed {
-                    covered[k] = true;
-                    left -= 1;
-                    if left == 0 {
-                        return true;
-                    }
+    for word in text.split(|c: char| !c.is_alphanumeric()) {
+        let word = word.to_lowercase();
+        if word.is_empty() || STOPWORDS.contains(&word.as_str()) {
+            continue;
+        }
+        let stemmed = stem_word(&word, stem);
+        for (k, term) in terms.iter().enumerate() {
+            if !covered[k] && *term == stemmed {
+                covered[k] = true;
+                left -= 1;
+                if left == 0 {
+                    return true;
                 }
             }
         }
@@ -413,41 +409,55 @@ fn covers_all_terms(paras: &[String], terms: &[String], stem: &mut Stem) -> bool
     left == 0
 }
 
-/// The `text`/`sections` pair of one search hit, from the article's
-/// `(region name, paragraphs)` list (`html`/`markdown::sections`, whose
-/// first entry is the intro region):
+/// The `text`/`sections` pair of one search hit, from the article's raw
+/// text (`is_markdown` picks the Markdown or the HTML splitter):
 ///
 /// - a hit whose title matched exactly is a title match by definition: its
 ///   text is the first intro paragraph, no sections;
-/// - otherwise, when every query term occurs in the intro region's
-///   paragraphs (an intro match), same: the lead already covers the query;
-/// - otherwise the sections with at least one query match are listed and
-///   the text is the best-matching paragraph (most matching word
-///   occurrences; ties keep the earliest), truncated to `INTRO_CHARS`;
-/// - when no section matches either (only the title in the index matched
+/// - otherwise, when every query term occurs in the first intro paragraph,
+///   same: the lead already covers the query;
+/// - otherwise every region is scanned - the intro first (under its
+///   `_intro` name, `html::INTRO_SECTION`), then the body sections in
+///   document order. The regions holding at least one query match are
+///   reported as `sections`, and the text is the best-matching paragraph
+///   (most matching word occurrences across all regions; ties keep the
+///   earliest, so an intro paragraph beats a body paragraph), truncated
+///   to `INTRO_CHARS`;
+/// - when no region matches either (only the title in the index matched
 ///   the query), the text falls back to the first intro paragraph. Regions
 ///   without paragraphs degrade to empty text, never a panic.
+///
+/// The intro's paragraphs are extracted first and alone: the two title/lead
+/// cases above - the common ones - never need the full article split.
 fn hit_text(
-    secs: &[(String, Vec<String>)],
+    article: &str,
     terms: &[String],
     exact: bool,
     stem: &mut Stem,
+    is_markdown: bool,
 ) -> (String, Option<Vec<String>>) {
-    let Some((_, intro)) = secs.first() else {
-        return (String::new(), None);
+    let intro = if is_markdown {
+        markdown::intro_paragraphs(article, PARA_MATCH_CHARS)
+    } else {
+        html::intro_paragraphs(article, PARA_MATCH_CHARS)
     };
-    let first_para = || {
+    let lead = || {
         intro.first()
             .map(|p| p.chars().take(INTRO_CHARS).collect())
             .unwrap_or_default()
     };
-    if exact || covers_all_terms(intro, terms, stem) {
-        return (first_para(), None);
+    if exact || intro.first().is_some_and(|p| covers_all_terms(p, terms, stem)) {
+        return (lead(), None);
     }
+    let secs = if is_markdown {
+        markdown::sections(article, PARA_MATCH_CHARS)
+    } else {
+        html::sections(article, PARA_MATCH_CHARS)
+    };
     let mut best_count = 0usize;
     let mut best_para: Option<&String> = None;
     let mut names: Vec<String> = Vec::new();
-    for (name, paras) in secs.iter().skip(1) {
+    for (name, paras) in &secs {
         let mut matched = false;
         for para in paras {
             let n = para_matches(para, terms, stem);
@@ -467,7 +477,7 @@ fn hit_text(
     }
     match best_para {
         Some(p) => (p.chars().take(INTRO_CHARS).collect(), Some(names)),
-        None => (first_para(), None),
+        None => (lead(), None),
     }
 }
 
@@ -510,6 +520,18 @@ mod tests {
 
     const AERONAUTICS_HTML: &str = "<html><body><h1>Aeronautics</h1>\
         <p>Aeronautics is the science of flight.</p>\
+        </body></html>";
+
+    /// An article whose intro has two paragraphs: a query can match the
+    /// first paragraph (the lead fast path), a later one (the intro
+    /// reported as the region `_intro`), or the intro and a body section.
+    const SALT_HTML: &str = "<html><body><h1>Salt</h1>\
+        <p>Salt is a mineral composed primarily of sodium chloride.</p>\
+        <p>The Himalaya range holds vast deposits of rock salt.</p>\
+        <h2>Formation</h2>\
+        <p>Salt beds form when seas evaporate.</p>\
+        <h2>Uses</h2>\
+        <p>People season their food with it.</p>\
         </body></html>";
 
     fn search(server: &ZimMcpServer, query: &str) -> Vec<SearchHit> {
@@ -733,12 +755,13 @@ mod tests {
         assert_eq!(hits[0].path, "C/Atmosphere", "{hits:?}");
         assert_eq!(hits[1].path, "C/Nitrogen", "{hits:?}");
         // The Atmosphere lead covers the whole query ("The atmosphere is
-        // mostly nitrogen and oxygen."): an intro match. The Nitrogen lead
-        // only covers "nitrogen", its article has no sections, and the
-        // text falls back to the first intro paragraph.
+        // mostly nitrogen and oxygen.") in its first paragraph: an intro
+        // match, so no sections. The Nitrogen lead only covers "nitrogen"
+        // - a partial intro match is reported like any other, as the
+        // region _intro.
         assert_eq!(hits[0].sections, None, "{:?}", hits[0]);
         assert_eq!(hits[0].text, "The atmosphere is mostly nitrogen and oxygen.");
-        assert_eq!(hits[1].sections, None, "{:?}", hits[1]);
+        assert_eq!(hits[1].sections, Some(vec!["_intro".to_string()]), "{:?}", hits[1]);
         assert_eq!(hits[1].text, "Nitrogen is a colorless, odorless gas.");
     }
 
@@ -782,6 +805,67 @@ mod tests {
         assert!(json.contains(r#""sections":["History","Domestication"]"#), "{json}");
     }
 
+    /// An archive whose only article (`SALT_HTML`) has a two-paragraph
+    /// intro, for the intro-matching search semantics.
+    fn intro_test_server() -> (ZimMcpServer, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        // Index terms are the stems the query parser produces ("beds" ->
+        // "bed"), unprefixed, as libzim indexes with STEM_ALL.
+        let index = make_index(&[(
+            "C/Salt",
+            "salt mineral chlorid sodium himalaya deposit rock bed form sea season food",
+            "Salt",
+        )]);
+        let content = [TestEntry {
+            namespace: b'C',
+            url: "Salt",
+            title: "Salt",
+            mime: 0,
+            body: SALT_HTML.as_bytes(),
+        }];
+        let bytes = build_archive(&["text/html"], &content, &[], 0, Some(&index));
+        std::fs::write(dir.path().join("test.zim"), &bytes).unwrap();
+        let library = Arc::new(ZimLibrary::scan(dir.path()).unwrap());
+        assert!(library.archives[0].searchable());
+        (ZimMcpServer::new(library), dir)
+    }
+
+    #[test]
+    fn e2e_search_intro_match_beyond_first_paragraph_reports_intro_section() {
+        // "himalaya" matches only the intro's second paragraph: the text is
+        // that paragraph and the intro is reported as the matching region
+        // _intro - not the lead, and not without sections.
+        let (server, _keep) = intro_test_server();
+        let hits = search(&server, "himalaya");
+        assert_eq!(hits.len(), 1, "{hits:?}");
+        let hit = &hits[0];
+        assert_eq!(hit.path, "C/Salt");
+        assert_eq!(hit.sections, Some(vec!["_intro".to_string()]), "{hit:?}");
+        assert_eq!(hit.text, "The Himalaya range holds vast deposits of rock salt.");
+        let json = serde_json::to_string(hit).unwrap();
+        assert!(json.contains(r#""sections":["_intro"]"#), "{json}");
+    }
+
+    #[test]
+    fn e2e_search_intro_and_section_matches_report_both() {
+        // "salt beds" matches the intro's second paragraph ("salt") and the
+        // Formation section ("Salt beds ..."): both regions are reported,
+        // _intro first, and the text is the paragraph with the most
+        // query-term occurrences across all regions (Formation's, two
+        // against the intro paragraphs' one).
+        let (server, _keep) = intro_test_server();
+        let hits = search(&server, "salt beds");
+        assert_eq!(hits.len(), 1, "{hits:?}");
+        let hit = &hits[0];
+        assert_eq!(hit.path, "C/Salt");
+        assert_eq!(
+            hit.sections,
+            Some(vec!["_intro".to_string(), "Formation".to_string()]),
+            "{hit:?}"
+        );
+        assert_eq!(hit.text, "Salt beds form when seas evaporate.");
+    }
+
     #[test]
     fn e2e_search_multi_word_ranks_all_words_first() {
         // BM25 alone ranks the "Cherry" document first: thirty repetitions
@@ -813,9 +897,10 @@ mod tests {
         assert_eq!(hits[0].title, "Dessert Recipes");
         // The partial match (only "cherry") is still reported, right behind.
         assert_eq!(hits[1].path, "C/Cherry", "{hits:?}");
-        // Neither hit's lead covers both terms and the fixture has no
-        // sections: the text falls back to the first intro paragraph.
-        assert_eq!(hits[0].sections, None);
+        // Neither hit's lead covers both terms, and "cherry" does match the
+        // intro: it is reported as the matching region _intro, and the text
+        // is the intro's matching paragraph.
+        assert_eq!(hits[0].sections, Some(vec!["_intro".to_string()]));
         assert!(hits[0].text.contains("cherry is the fruit"), "{:?}", hits[0].text);
     }
 
@@ -953,7 +1038,22 @@ Ancient India smelted zinc early.
         );
         assert_eq!(hits[0].sections, None);
 
-        // Section extraction on the Markdown article: case-insensitive,
+        // A query matching only a body section reports the matched
+        // sections, the nested one included, and the best-matching
+        // paragraph; the intro holds no match, so _intro is absent.
+        let params = serde_json::from_value::<ZimSearchParams>(
+            serde_json::json!({ "query": "smelting" }),
+        )
+        .unwrap();
+        let hits = ZimSearchTool::invoke(&server, params).unwrap().results;
+        assert_eq!(hits.len(), 1);
+        assert_eq!(
+            hits[0].sections,
+            Some(vec!["History".to_string(), "India".to_string()]),
+            "{:?}",
+            hits[0]
+        );
+        assert_eq!(hits[0].text, "Zinc smelting is documented in ancient times.");
         // includes the subsection, reports the heading as written.
         let params = serde_json::from_value::<ZimGetSectionParams>(
             serde_json::json!({ "zim": "md.zim", "path": "Zinc", "section": "history" }),

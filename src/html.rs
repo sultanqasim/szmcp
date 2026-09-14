@@ -285,6 +285,12 @@ pub fn intro_from_html(html: &str, max_chars: usize) -> String {
     out.trim().to_string()
 }
 
+/// The name the intro region carries everywhere it is reported: as the
+/// first entry of [`sections`] and in a search hit's `sections` list (the
+/// markdown splitter mirrors both). A leading underscore marks it as a
+/// reserved name, distinct from every heading text.
+pub(crate) const INTRO_SECTION: &str = "_intro";
+
 /// Tags that implicitly close an open `<p>`: browsers close a `<p>` before
 /// any block-level element. Well-formed wiki HTML closes it explicitly;
 /// this only guards the odd page that leaves it open.
@@ -378,9 +384,9 @@ fn paragraphs(html: &str, max_para_chars: usize) -> Vec<String> {
 /// Split an article into its intro region and one region per heading, with
 /// the cleaned paragraph texts of each region. Returns `(name, paragraphs)`
 /// pairs: the first entry carries the intro region (everything before the
-/// first heading) under the empty name, the later entries carry each
-/// heading's section under the heading text as written. A heading's section
-/// spans what [`section_content`] would return for it, so a nested
+/// first heading) under the [`INTRO_SECTION`] name, the later entries carry
+/// each heading's section under the heading text as written. A heading's
+/// section spans what [`section_content`] would return for it, so a nested
 /// `<h3>`'s paragraphs belong to its own entry and to the enclosing
 /// `<h2>`'s. `<h1>` carries the page title (see `INTRO_SKIP_TAGS`), not a
 /// section: it bounds no entry, and its element is skipped like in
@@ -388,17 +394,38 @@ fn paragraphs(html: &str, max_para_chars: usize) -> Vec<String> {
 pub fn sections(html: &str, max_para_chars: usize) -> Vec<(String, Vec<String>)> {
     let body = article_body(html);
     let headings = collect_headings(body);
-    let secs: Vec<&Heading> = headings.iter().filter(|h| h.level >= 2).collect();
-    let mut out = Vec::with_capacity(secs.len() + 1);
-    let intro_end = secs.first().map_or(body.len(), |h| h.start);
-    out.push((String::new(), paragraphs(&body[..intro_end], max_para_chars)));
-    for h in &secs {
+    let mut out = Vec::with_capacity(headings.len() + 1);
+    out.push((
+        INTRO_SECTION.to_string(),
+        paragraphs(&body[..intro_region_end(body, &headings)], max_para_chars),
+    ));
+    for h in headings.iter().filter(|h| h.level >= 2) {
         out.push((
             h.name.clone(),
             paragraphs(&body[h.content_start..h.content_end], max_para_chars),
         ));
     }
     out
+}
+
+/// The intro region's paragraphs: the paragraphs [`sections`] reports for
+/// its `INTRO_SECTION` entry, computed without extracting any body
+/// section's paragraphs (a search hit's lead fast path needs only these).
+pub fn intro_paragraphs(html: &str, max_para_chars: usize) -> Vec<String> {
+    let body = article_body(html);
+    let headings = collect_headings(body);
+    paragraphs(&body[..intro_region_end(body, &headings)], max_para_chars)
+}
+
+/// Where the intro region ends: at the first heading of level >= 2 (`<h1>`
+/// carries the page title, not a section), else at the end of the body.
+/// Both [`sections`] and [`intro_paragraphs`] bound their intro region with
+/// this, so the two always agree on what the intro holds.
+fn intro_region_end(body: &str, headings: &[Heading]) -> usize {
+    headings
+        .iter()
+        .find(|h| h.level >= 2)
+        .map_or(body.len(), |h| h.start)
 }
 
 /// Remove tags from a short string (used for heading text).
@@ -842,8 +869,8 @@ mod tests {
 
         let secs = sections(page, 300);
         // The intro region: the lead paragraphs only (title, hatnote and
-        // infobox skipped), under the empty name.
-        assert_eq!(secs[0].0, "");
+        // infobox skipped), under the reserved intro name.
+        assert_eq!(secs[0].0, "_intro");
         assert_eq!(
             secs[0].1,
             vec![
@@ -875,11 +902,28 @@ mod tests {
 
         // No headings: a single intro entry.
         let flat = "<p>Just a lead.</p><p>And more.</p>";
-        assert_eq!(sections(flat, 100), vec![("".to_string(), vec!["Just a lead.".to_string(), "And more.".to_string()])]);
+        assert_eq!(sections(flat, 100), vec![("_intro".to_string(), vec!["Just a lead.".to_string(), "And more.".to_string()])]);
         // No <p> anywhere: empty regions (callers fall back gracefully).
-        assert_eq!(sections("<div>no paragraphs here</div>", 100), vec![("".to_string(), Vec::<String>::new())]);
+        assert_eq!(sections("<div>no paragraphs here</div>", 100), vec![("_intro".to_string(), Vec::<String>::new())]);
         // A paragraph is capped at `max_para_chars` characters.
         let long = sections("<p>0123456789 0123456789 0123456789</p>", 12);
         assert_eq!(long[0].1, vec!["0123456789 0"]);
+    }
+
+    #[test]
+    fn intro_paragraphs_are_the_intro_regions_paragraphs() {
+        // `intro_paragraphs` extracts exactly the paragraphs `sections`
+        // reports for the intro region, and nothing from the body sections.
+        let secs = sections(WIKI, 300);
+        assert_eq!(intro_paragraphs(WIKI, 300), secs[0].1);
+        assert_eq!(
+            intro_paragraphs(WIKI, 300),
+            vec!["An apple is the fruit of <rosaceae> trees."]
+        );
+        // Without any heading the whole document is the intro region.
+        assert_eq!(
+            intro_paragraphs("<p>a</p><p>b</p>", 100),
+            vec!["a".to_string(), "b".to_string()]
+        );
     }
 }
