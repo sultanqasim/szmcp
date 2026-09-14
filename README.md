@@ -7,11 +7,15 @@ headers so it can be used from browsers.
 
 ## Tools
 
-- **`zim_search`** — full-text search through all articles in all ZIM files
-  (Xapian, over the uncompressed `X/fulltext/xapian` index embedded in each
-  archive). Returns a JSON array; each result has the ZIM file name (relative
-  to the ZIM directory), the article path inside the ZIM file, the page title,
-  and a short intro.
+- **`zim_search`** — full-text search across all ZIM files. Multi-word queries
+  rank articles containing all the words higher, but partial matches are
+  still returned; an article whose title or redirect exactly matches the
+  query comes first. Each result has the ZIM file name (relative to the ZIM
+  directory), the article path, the title, and `text` — the article's first
+  paragraph when the query matches the title or the intro, otherwise the
+  paragraph with the most query matches together with `sections` (the
+  section names containing the matches). Use `zim` + `path` with
+  `zim_get`/`zim_get_section`.
 - **`zim_get`** — get the full content of an article/page/object. Arguments:
   the ZIM file name and the article path. Returns the title, final path (after
   redirects), MIME type, and all of the content (UTF-8 text, or base64 for
@@ -24,9 +28,10 @@ headers so it can be used from browsers.
 
 Both classic HTML Wikipedia ZIMs and Markdown ZIMs (as produced by
 `wikizim_parser`, articles with MIME type `text/markdown`) are supported.
-Search intros and section extraction use an HTML or a Markdown parser
-depending on the article's MIME type, so Markdown articles yield clean plain
-text intros and Markdown section content; everything else behaves the same.
+Search text and section extraction use an HTML or a Markdown parser
+depending on the article's MIME type, so Markdown articles yield clean
+plain-text search text and Markdown section content; everything else
+behaves the same.
 
 ## Build
 
