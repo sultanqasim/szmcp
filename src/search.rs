@@ -143,8 +143,9 @@ pub fn search(library: &ZimLibrary, query: &str) -> Result<SearchResults, ToolEr
     // nothing - and the indexes have no spelling data, so a misspelled word
     // simply matches nothing in the AND branch while the parsed OR branch
     // still retrieves results for the good words.
-    // The query's terms drive two things: the all-terms boost below and the
-    // paragraph matching when the hits are built - one stemmer serves both.
+    // The query's terms drive three things: the all-terms boost below, the
+    // title-index band, and the paragraph matching when the hits are built
+    // - one stemmer serves all three.
     let mut stemmer = Stemmer::new("english")?;
     let terms = query_terms(query, &mut stemmer);
     let xquery = if terms.len() >= 2 {
@@ -158,29 +159,93 @@ pub fn search(library: &ZimLibrary, query: &str) -> Result<SearchResults, ToolEr
         xquery
     };
 
+    /// Which band produced a hit. Exact and title-index hits are title
+    /// matches: their preview is the lead paragraph and `sections` is
+    /// omitted.
+    #[derive(Clone, Copy, PartialEq)]
+    enum HitKind {
+        /// Exact title/URL probe hit (the ZIM directory itself).
+        ExactTitle,
+        /// Hit from the archive's title index (`X/title/xapian`).
+        TitleIndex,
+        /// Hit from the archive's full-text index.
+        Fulltext,
+    }
+
     // Exact title/URL matches, found in the ZIM directory itself: redirects
-    // are not in the full-text index, and a query that names an article
+    // are not in the search indexes, and a query that names an article
     // exactly must rank first no matter what BM25 produces. One probe per
     // archive; a failed probe simply contributes nothing. The title falls
     // back to the query (spaces restored) because modern openZIM archives
     // leave directory-entry titles empty.
-    let mut merged: Vec<(&Arc<Archive>, String, String, bool)> = Vec::new();
+    let mut merged: Vec<(&Arc<Archive>, String, String, HitKind)> = Vec::new();
     for arc in &library.archives {
         if let Some((path, title)) = arc.lookup_exact(query)? {
             let title = if title.is_empty() { query.replace('_', " ") } else { title };
-            merged.push((arc, path, title, true));
+            merged.push((arc, path, title, HitKind::ExactTitle));
         }
     }
 
-    // Per-archive ranked hit lists: (weight, path, title from the index).
-    // libzim stores the article title in Xapian value slot 0. Each archive's
-    // Xapian handle is checked out of that archive's pool for the duration
-    // of the search: concurrent searches never share a handle (Xapian does
-    // not support concurrent calls on one database object).
+    // Per-archive ranked hit lists. Each archive's Xapian handles are
+    // checked out of that archive's pool for the duration of the search:
+    // concurrent searches never share a handle (Xapian does not support
+    // concurrent calls on one database object).
+    //
+    // The title-index band runs one query = OR of the stemmed query terms
+    // against the title index (documents ARE titles: the same unprefixed
+    // stems as the full-text index, so the same `terms` match directly). An
+    // article whose title contains ALL the query words outranks one whose
+    // title has a subset (BM25 sums OR-branch contributions), and the band
+    // ranks those articles ahead of every full-text match - a title that
+    // says the whole query is far stronger evidence than body words. The
+    // band is skipped for archives without a title index and queries with
+    // no usable terms.
+    let mut title_lists: Vec<(&Arc<Archive>, Vec<(String, String)>)> = Vec::new();
+    // Full-text band: (weight, path, title from the index).
     let mut per_archive: Vec<(&Arc<Archive>, Vec<(f64, String, String)>)> = Vec::new();
     for arc in &library.archives {
-        let Some(list) = arc.with_xapian(|db| -> Result<_, ToolError> {
-            let mut enquire = Enquire::new(db)?;
+        let Some((title_list, list)) = arc.with_xapian(|h| -> Result<_, ToolError> {
+            let mut title_list = Vec::new();
+            if !terms.is_empty() {
+                if let Some(title_db) = &h.title {
+                    let mut tquery = Query::term(&terms[0])?;
+                    for term in &terms[1..] {
+                        tquery = Query::combine(Operator::Or, &tquery, &Query::term(term)?)?;
+                    }
+                    let mut enquire = Enquire::new(title_db)?;
+                    enquire.set_query(&tquery)?;
+                    enquire.set_sort_by_relevance();
+                    let mset = enquire.get_mset(0, SEARCH_LIMIT, 0)?;
+                    for j in 0..mset.size() {
+                        let mut doc = mset.document(j)?;
+                        // The title-index document's data is the article
+                        // path and its value slot 0 the title (same shape
+                        // as the full-text index, one shared docid space).
+                        // Should a producer leave either empty, the
+                        // full-text document of the same docid fills it in.
+                        let mut path = doc.data_str()?;
+                        let mut title = String::from_utf8_lossy(&doc.value(0)?).into_owned();
+                        if path.is_empty() || title.is_empty() {
+                            if let Ok(mut ftdoc) = h.fulltext.get_document(mset.docid(j)) {
+                                if path.is_empty() {
+                                    path = ftdoc.data_str()?;
+                                }
+                                if title.is_empty() {
+                                    title = String::from_utf8_lossy(&ftdoc.value(0)?).into_owned();
+                                }
+                            }
+                        }
+                        if path.is_empty() {
+                            continue;
+                        }
+                        title_list.push((path, title));
+                    }
+                }
+            }
+
+            // The full-text band, unchanged: the parsed query (with the
+            // all-terms boost folded in).
+            let mut enquire = Enquire::new(&h.fulltext)?;
             enquire.set_query(&xquery)?;
             enquire.set_sort_by_relevance();
             let mset = enquire.get_mset(0, SEARCH_LIMIT, 0)?;
@@ -194,11 +259,12 @@ pub fn search(library: &ZimLibrary, query: &str) -> Result<SearchResults, ToolEr
                 let title = String::from_utf8_lossy(&doc.value(0)?).into_owned();
                 list.push((m.weight, path, title));
             }
-            Ok(list)
+            Ok((title_list, list))
         })?
         else {
             continue;
         };
+        title_lists.push((arc, title_list));
         per_archive.push((arc, list));
     }
 
@@ -210,16 +276,31 @@ pub fn search(library: &ZimLibrary, query: &str) -> Result<SearchResults, ToolEr
     }
 
     // Xapian weights are computed from per-database statistics and are not
-    // comparable across archives, so merge the archives' ranked lists by
-    // rotation instead of by weight: every archive contributes its best
-    // match before any archive contributes its second best. Exact matches
-    // were already placed first in `merged`.
+    // comparable across archives, so each band merges its archives' ranked
+    // lists by rotation instead of by weight: every archive contributes its
+    // best match before any archive contributes its second best. The bands
+    // keep their order: exact title/URL probe hits (already in `merged`),
+    // then title-index matches, then full-text matches.
+    let mut rank = 0usize;
+    loop {
+        let mut picked = false;
+        for (arc, list) in &title_lists {
+            if let Some((path, title)) = list.get(rank) {
+                merged.push((arc, path.clone(), title.clone(), HitKind::TitleIndex));
+                picked = true;
+            }
+        }
+        if !picked {
+            break;
+        }
+        rank += 1;
+    }
     let mut rank = 0usize;
     loop {
         let mut picked = false;
         for (arc, list) in &per_archive {
             if let Some((_, path, title)) = list.get(rank) {
-                merged.push((arc, path.clone(), title.clone(), false));
+                merged.push((arc, path.clone(), title.clone(), HitKind::Fulltext));
                 picked = true;
             }
         }
@@ -230,9 +311,12 @@ pub fn search(library: &ZimLibrary, query: &str) -> Result<SearchResults, ToolEr
     }
 
     // The same article is often present in several archives (e.g. an HTML
-    // and a Markdown edition of the same ZIM): dedupe by normalized title
-    // so each article is reported once, from the archive ranked first.
-    // Exact matches come first, so duplicates of them drop out here.
+    // and a Markdown edition of the same ZIM), and one article can surface
+    // in several bands of the same archive (its title index document AND
+    // its full-text document both match): dedupe by normalized title so
+    // each article is reported once, from the band/archives ranked first.
+    // Exact matches come first, so duplicates of them drop out here, and a
+    // title-index hit shadows the same article's full-text hit.
     let mut seen = std::collections::HashSet::new();
     merged.retain(|(_, path, title, _)| {
         let key = if title.is_empty() { path.as_str() } else { title.as_str() };
@@ -241,7 +325,10 @@ pub fn search(library: &ZimLibrary, query: &str) -> Result<SearchResults, ToolEr
     merged.truncate(SEARCH_LIMIT as usize);
 
     let mut hits = Vec::with_capacity(merged.len());
-    for (arc, path, idx_title, exact) in &merged {
+    for (arc, path, idx_title, kind) in &merged {
+        // Exact and title-index hits are title matches: the lead is the
+        // right preview and there is nothing to point at section-wise.
+        let title_match = *kind != HitKind::Fulltext;
         let (entry_title, mime, bytes) = match arc.article_preview(path, HIT_READ_BYTES) {
             Ok(Some((entry_title, mime, bytes))) => (entry_title, mime, bytes),
             _ => (String::new(), None, Vec::new()),
@@ -251,7 +338,7 @@ pub fn search(library: &ZimLibrary, query: &str) -> Result<SearchResults, ToolEr
         // prefer the entry's own title; many openZIM archives leave the
         // directory-entry title empty and only carry the title in the
         // index (which we already read as `idx_title`).
-        let title = if *exact {
+        let title = if *kind == HitKind::ExactTitle {
             idx_title.clone()
         } else if !entry_title.is_empty() {
             entry_title
@@ -264,7 +351,7 @@ pub fn search(library: &ZimLibrary, query: &str) -> Result<SearchResults, ToolEr
         // Markdown editions carry plain Markdown, not HTML: pick the matching
         // splitter so the paragraphs and section names are free of markup.
         let is_markdown = mime.as_deref().is_some_and(|m| m.contains("markdown"));
-        let (preview, sections) = hit_preview(&article, &terms, *exact, &mut stemmer, is_markdown);
+        let (preview, sections) = hit_preview(&article, &terms, title_match, &mut stemmer, is_markdown);
         hits.push(SearchHit {
             zim: arc.name.clone(),
             path: path.clone(),
@@ -332,8 +419,9 @@ fn sentences(paragraph: &str) -> Vec<&str> {
 /// The `preview`/`sections` pair of one search hit, from the article's raw
 /// text (`is_markdown` picks the Markdown or the HTML splitter):
 ///
-/// - a hit whose title matched exactly is a title match by definition: its
-///   preview is the first intro paragraph, no sections;
+/// - a title match (`title_match`: the query named the article exactly, or
+///   the hit came from the title index) gets the first intro paragraph as
+///   its preview and no sections - the title already said everything;
 /// - otherwise, when every query term occurs in the first intro paragraph,
 ///   same: the lead already covers the query;
 /// - otherwise every region is scanned - the intro first (under its
@@ -354,7 +442,7 @@ fn sentences(paragraph: &str) -> Vec<&str> {
 fn hit_preview(
     article: &str,
     terms: &[String],
-    exact: bool,
+    title_match: bool,
     stem: &mut Stemmer,
     is_markdown: bool,
 ) -> (String, Option<Vec<String>>) {
@@ -368,7 +456,7 @@ fn hit_preview(
             .map(|p| p.chars().take(INTRO_CHARS).collect())
             .unwrap_or_default()
     };
-    if exact || intro.first().is_some_and(|p| covers_all_terms(p, terms, stem)) {
+    if title_match || intro.first().is_some_and(|p| covers_all_terms(p, terms, stem)) {
         return (lead(), None);
     }
     let secs = if is_markdown {
@@ -433,7 +521,7 @@ pub(crate) mod tests {
         ZimGetParams, ZimGetSectionParams, ZimGetSectionTool, ZimGetTool, ZimMcpServer,
         ZimSearchParams, ZimSearchTool,
     };
-    use crate::zim::testutil::{build_archive, TestEntry, TestRedirect};
+    use crate::zim::testutil::{build_archive, build_archive_indexes, TestEntry, TestRedirect};
     use rmcp::handler::server::router::tool::AsyncTool;
     use std::future::Future;
     use xapian2::{Document, WritableDatabase};
@@ -479,6 +567,22 @@ pub(crate) mod tests {
 
     const AERONAUTICS_HTML: &str = "<html><body><h1>Aeronautics</h1>\
         <p>Aeronautics is the science of flight.</p>\
+        </body></html>";
+
+    /// For the title-index tests: an article whose title contains all the
+    /// query's words ("Nitrogen Gas Effects" for "effects of nitrogen gas")
+    /// with the matching words also in its body (so its full-text document
+    /// matches too and the cross-band dedupe has something to do), and an
+    /// article that only matches the query in its body.
+    const NITROGEN_GAS_EFFECTS_HTML: &str = "<html><body><h1>Nitrogen Gas Effects</h1>\
+        <p>Nitrogen gas surrounds us all.</p>\
+        <h2>Everywhere</h2>\
+        <p>The effects of nitrogen gas are unavoidable.</p>\
+        </body></html>";
+
+    const WEATHER_HTML: &str = "<html><body><h1>Weather</h1>\
+        <p>Weather forecasts describe the effects of air pressure.</p>\
+        <p>Gas laws explain the atmosphere.</p>\
         </body></html>";
 
     /// An article whose intro has two paragraphs: a query can match the
@@ -692,6 +796,69 @@ Meltwater streams out of the ice.
         let hits = search(&server, "nitrogen gas");
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].title, "Nitrogen", "{hits:?}");
+    }
+
+    /// An archive with BOTH embedded indexes, the way libzim builds them:
+    /// the full-text index over article bodies plus a title index
+    /// (`X/title/xapian`) with one document per article whose terms are the
+    /// title's words and whose value slot 0 is the title (the document data
+    /// is the article path in both indexes).
+    fn title_index_test_server() -> (ZimMcpServer, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        let index = make_index(&[
+            ("C/Nitrogen_Gas_Effects", "nitrogen gas surround effect unavoid", "Nitrogen Gas Effects"),
+            ("C/Weather", "weather forecast describ effect air pressur gas law explan atmospher", "Weather"),
+        ]);
+        let titles = make_index(&[
+            ("C/Nitrogen_Gas_Effects", "nitrogen gas effect", "Nitrogen Gas Effects"),
+            ("C/Weather", "weather", "Weather"),
+        ]);
+        let content = [
+            // Empty directory-entry title, as in modern openZIM archives:
+            // the title lives in the indexes (value slot 0) only.
+            TestEntry { namespace: b'C', url: "Nitrogen_Gas_Effects", title: "", mime: 0, body: NITROGEN_GAS_EFFECTS_HTML.as_bytes() },
+            TestEntry { namespace: b'C', url: "Weather", title: "Weather", mime: 0, body: WEATHER_HTML.as_bytes() },
+        ];
+        let bytes = build_archive_indexes(&["text/html"], &content, &[], 0, Some(&index), Some(&titles));
+        std::fs::write(dir.path().join("test.zim"), &bytes).unwrap();
+        let library = Arc::new(ZimLibrary::scan(dir.path()).unwrap());
+        assert!(library.archives[0].searchable());
+        (ZimMcpServer::new(library), dir)
+    }
+
+    #[test]
+    fn e2e_search_title_index_ranks_title_matches_above_fulltext() {
+        let (server, _keep) = title_index_test_server();
+
+        // "effects of nitrogen gas" is nobody's title or URL (the article is
+        // "Nitrogen Gas Effects"), but the article's title contains every
+        // query word: its title-index document outranks the full-text-only
+        // matches (whose titles carry no query word), and the hit is styled
+        // as a title match.
+        let hits = search(&server, "effects of nitrogen gas");
+        assert_eq!(hits.len(), 2, "{hits:?}");
+        assert_eq!(hits[0].path, "C/Nitrogen_Gas_Effects", "{hits:?}");
+        assert_eq!(hits[0].title, "Nitrogen Gas Effects");
+        // Title-match semantics: the lead paragraph and no sections - NOT
+        // the Everywhere section (the "effects ..." paragraph with more
+        // query matches) the full-text band would have reported.
+        assert_eq!(hits[0].preview, "Nitrogen gas surrounds us all.");
+        assert_eq!(hits[0].sections, None);
+        let json = serde_json::to_string(&hits[0]).unwrap();
+        assert!(!json.contains("sections"), "{json}");
+        // The article also matched in the full-text band (its body carries
+        // the query words): reported exactly once, from the title band.
+        assert_eq!(hits.iter().filter(|h| h.path == "C/Nitrogen_Gas_Effects").count(), 1);
+        // The full-text-only match follows, with full-text hit semantics.
+        assert_eq!(hits[1].path, "C/Weather", "{hits:?}");
+        assert_eq!(hits[1].title, "Weather");
+        assert_eq!(hits[1].sections, Some(vec!["_intro".to_string()]));
+
+        // No usable terms: the title band is skipped by design and the
+        // full-text band matches nothing (stopwords are stopped at index
+        // time) - no hits, no error.
+        let hits = search(&server, "the of");
+        assert!(hits.is_empty(), "{hits:?}");
     }
 
     /// An archive where BM25 alone ranks the wrong article first: the

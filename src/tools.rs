@@ -104,8 +104,9 @@ impl ToolBase for ZimSearchTool {
     }
     fn description() -> Option<Cow<'static, str>> {
         Some(
-            "Search all articles in all ZIM files. Results are ranked best first (an exact \
-             title match always comes first); each result has the ZIM file name, the article \
+            "Search all articles in all ZIM files. Results are ranked best first: an exact \
+             title match comes first, followed by articles whose titles contain the query \
+             words, then full-text matches; each result has the ZIM file name, the article \
              path, the page title, and preview - the article's first paragraph when the query \
              matches the title or that paragraph, otherwise the sentence that best matches \
              the query together with \"sections\", the matching regions' names (the intro \

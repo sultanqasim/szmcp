@@ -10,8 +10,9 @@ browsers) or as one-shot CLI subcommands.
 
 - **`zim_search`** — full-text search across all ZIM files. Multi-word queries
   rank articles containing all the words higher, but partial matches are
-  still returned; an article whose title or redirect exactly matches the
-  query comes first. Each result has the ZIM file name (relative to the ZIM
+  still returned. Articles whose titles match the query words (found in the
+  archive's embedded title index) come right after exact title matches,
+  ahead of the body-text matches. Each result has the ZIM file name (relative to the ZIM
   directory), the article path, the title, and `preview` — the article's first
   paragraph when the query matches the title or that paragraph, otherwise
   the sentence with the most query matches (followed by the rest of its

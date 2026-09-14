@@ -1,8 +1,9 @@
 //! Minimal read-only ZIM container reader.
 //!
 //! Just enough of the [ZIM file format](https://wiki.openzim.org/wiki/ZIM_file_format)
-//! to serve articles and open the Xapian full-text index embedded in the
-//! archive (`X/fulltext/xapian`) in place, with no copy.
+//! to serve articles and open the Xapian search indexes embedded in the
+//! archive (`X/fulltext/xapian`, plus `X/title/xapian` when present) in
+//! place, with no copy.
 //!
 //! All multi-byte integers are little-endian. Archives may be a single
 //! `.zim` file or a chunked archive (`.zimaa`, `.zimab`, ...).
@@ -551,16 +552,26 @@ impl Zim {
         Ok(data[s as usize..(s + take) as usize].to_vec())
     }
 
-    /// The directory index of the full-text Xapian index entry, if the
-    /// archive carries one (a cheap directory probe; no database is opened).
-    fn fulltext_index_entry(&self) -> io::Result<Option<u32>> {
-        const CANDIDATES: &[(u8, &str)] = &[
-            (b'X', "fulltext/xapian"),
-            (b'X', "X/fulltext/xapian"),
-            (b'X', "fulltextindex/xapian/FullTextIndex"),
-            (b'X', "X/fulltextindex/xapian/FullTextIndex"),
-        ];
-        for (ns, url) in CANDIDATES {
+    /// Directory names under which a ZIM may embed its two search indexes:
+    /// the current openZIM layout first, then the historical variants.
+    const FULLTEXT_INDEX_NAMES: &[(u8, &str)] = &[
+        (b'X', "fulltext/xapian"),
+        (b'X', "X/fulltext/xapian"),
+        (b'X', "fulltextindex/xapian/FullTextIndex"),
+        (b'X', "X/fulltextindex/xapian/FullTextIndex"),
+    ];
+    const TITLE_INDEX_NAMES: &[(u8, &str)] = &[
+        (b'X', "title/xapian"),
+        (b'X', "X/title/xapian"),
+        (b'X', "titleindex/xapian/TitleIndex"),
+        (b'X', "X/titleindex/xapian/TitleIndex"),
+    ];
+
+    /// The directory index of an embedded Xapian index stored under one of
+    /// `candidates`, probed in order (a cheap directory probe; no database
+    /// is opened).
+    fn index_entry(&self, candidates: &[(u8, &str)]) -> io::Result<Option<u32>> {
+        for (ns, url) in candidates {
             if let Some(i) = self.find_entry(*ns, url)? {
                 return Ok(Some(i));
             }
@@ -568,14 +579,31 @@ impl Zim {
         Ok(None)
     }
 
-    /// Open the archive's full-text Xapian index, preferring the zero-copy
-    /// path (opening the in-file glass database at the blob's offset).
-    /// Returns `Ok(None)` when the archive carries no full-text index.
-    pub fn open_fulltext_xapian(&self) -> io::Result<Option<XapianDatabase>> {
-        let Some(idx) = self.fulltext_index_entry()? else { return Ok(None) };
+    /// The directory index of the full-text Xapian index entry, if the
+    /// archive carries one.
+    fn fulltext_index_entry(&self) -> io::Result<Option<u32>> {
+        self.index_entry(Self::FULLTEXT_INDEX_NAMES)
+    }
+
+    /// The directory index of the title Xapian index entry, if the archive
+    /// carries one.
+    fn title_index_entry(&self) -> io::Result<Option<u32>> {
+        self.index_entry(Self::TITLE_INDEX_NAMES)
+    }
+
+    /// Open the Xapian database stored as the content of directory entry
+    /// `idx`, preferring the zero-copy path (opening the in-file glass
+    /// database at the blob's offset), falling back to a temp-file copy.
+    /// `what` names the index in errors ("full-text", "title"). The `Option`
+    /// keeps the shape of the entry probes above; after the entry exists the
+    /// function never yields `Ok(None)`.
+    fn open_index_entry(&self, idx: u32, what: &str) -> io::Result<Option<XapianDatabase>> {
         let entry = self.get_entry(idx)?;
         let Target::Cluster(cluster, blob) = entry.target else {
-            return Err(io::Error::new(ErrorKind::InvalidData, "full-text index entry has no content"));
+            return Err(io::Error::new(
+                ErrorKind::InvalidData,
+                format!("{what} index entry has no content"),
+            ));
         };
         let loc = self.locate_blob(cluster, blob)?;
         if let Some(voff) = loc.file_offset {
@@ -602,6 +630,29 @@ impl Zim {
             .map(Some)
             .map_err(|e| io::Error::new(ErrorKind::InvalidData, e.msg()))
     }
+
+    /// Open the archive's full-text Xapian index.
+    /// Returns `Ok(None)` when the archive carries no full-text index.
+    pub fn open_fulltext_xapian(&self) -> io::Result<Option<XapianDatabase>> {
+        match self.fulltext_index_entry()? {
+            Some(idx) => self.open_index_entry(idx, "full-text"),
+            None => Ok(None),
+        }
+    }
+
+    /// Open the archive's title Xapian index (`X/title/xapian`), the second
+    /// index openZIM archives embed: one document per article whose terms
+    /// are the article title's words (lowercased Porter2 stems, unprefixed,
+    /// exactly like the full-text index), whose data is the article path and
+    /// whose value slot 0 is the article title. Both indexes share one
+    /// docid space (libzim indexes the same article set in the same order).
+    /// Returns `Ok(None)` when the archive carries no title index.
+    pub fn open_title_xapian(&self) -> io::Result<Option<XapianDatabase>> {
+        match self.title_index_entry()? {
+            Some(idx) => self.open_index_entry(idx, "title"),
+            None => Ok(None),
+        }
+    }
 }
 
 /// An article served from an archive: the final (post-redirect) entry plus
@@ -613,15 +664,28 @@ pub struct Article {
     pub bytes: Vec<u8>,
 }
 
-/// A ZIM archive plus a pool of Xapian search-database handles.
+/// The Xapian search databases of one archive, opened together: the
+/// full-text index plus, when the archive carries one, the title index.
+pub(crate) struct XapianHandles {
+    /// The full-text index (`X/fulltext/xapian`); every searchable archive
+    /// has one.
+    pub(crate) fulltext: XapianDatabase,
+    /// The title index (`X/title/xapian`), optional: one document per
+    /// article, terms = the title's words (the same unprefixed stems the
+    /// full-text index uses), document data = the article path, value slot
+    /// 0 = the article title. `None` for archives without a title index.
+    pub(crate) title: Option<XapianDatabase>,
+}
+
+/// A ZIM archive plus a pool of Xapian search-database handle sets.
 pub struct Archive {
     /// Archive name relative to the ZIM directory (e.g. "wikipedia.zim").
     pub name: String,
     pub zim: Zim,
-    /// Idle full-text Xapian handles. Handles are moved in and out of the
-    /// pool, never shared: `XapianDatabase` is `Send` (not `Sync`) because
-    /// Xapian does not support concurrent calls on one database object.
-    xapian_pool: Mutex<Vec<XapianDatabase>>,
+    /// Idle Xapian handle sets. Handles are moved in and out of the pool,
+    /// never shared: `XapianDatabase` is `Send` (not `Sync`) because Xapian
+    /// does not support concurrent calls on one database object.
+    xapian_pool: Mutex<Vec<XapianHandles>>,
 }
 
 impl Archive {
@@ -639,34 +703,53 @@ impl Archive {
         self.zim.fulltext_index_entry().map(|idx| idx.is_some()).unwrap_or(false)
     }
 
-    /// Run `f` with a handle on this archive's full-text Xapian index.
+    /// Run `f` with handles on this archive's Xapian search indexes (full
+    /// text, plus the title index when the archive embeds one).
     ///
-    /// Handles are pooled and moved in and out of the pool under the lock,
-    /// so no handle is ever reachable from two threads at once; `f` runs
-    /// outside the lock. This amortizes the ~0.15 s open cost per archive
-    /// without ever sharing a Xapian object between searches (the documented
-    /// thread-safety contract forbids concurrent calls on one database
-    /// object; separate handles to the same file are fine).
+    /// Handle sets are pooled and moved in and out of the pool under the
+    /// lock, so no handle is ever reachable from two threads at once; `f`
+    /// runs outside the lock. This amortizes the ~0.15 s open cost per
+    /// archive and index without ever sharing a Xapian object between
+    /// searches (the documented thread-safety contract forbids concurrent
+    /// calls on one database object; separate handles to the same file are
+    /// fine).
     ///
-    /// Returns `Ok(None)` when the archive carries no full-text index.
+    /// Returns `Ok(None)` when the archive carries no full-text index (it
+    /// then has no search band at all). A title index that exists but fails
+    /// to open only downgrades to no title band - it never fails the search.
     pub fn with_xapian<T, E>(
         &self,
-        f: impl FnOnce(&XapianDatabase) -> Result<T, E>,
+        f: impl FnOnce(&XapianHandles) -> Result<T, E>,
     ) -> Result<Option<T>, E>
     where
         E: From<io::Error>,
     {
         // `XapianDatabase` is `Send`: moving handles in/out of the pool is sound.
         let mut pool = self.xapian_pool.lock().unwrap();
-        let db = match pool.pop() {
-            Some(db) => db,
-            None => match self.zim.open_fulltext_xapian()? {
-                Some(db) => db,
-                None => return Ok(None),
-            },
+        let handles = match pool.pop() {
+            Some(handles) => handles,
+            None => {
+                let Some(fulltext) = self.zim.open_fulltext_xapian()? else {
+                    return Ok(None);
+                };
+                // A title index that exists but cannot be opened is a
+                // downgrade (warn + no title band), never a failed search:
+                // the full-text band works without it.
+                let title = match self.zim.open_title_xapian() {
+                    Ok(title) => title,
+                    Err(e) => {
+                        tracing::warn!(
+                            "opening the title index of {} failed ({e}); ranking by full text only",
+                            self.name
+                        );
+                        None
+                    }
+                };
+                XapianHandles { fulltext, title }
+            }
         };
-        let result = f(&db);
-        pool.push(db);
+        let result = f(&handles);
+        pool.push(handles);
         result.map(Some)
     }
 
@@ -953,9 +1036,8 @@ pub(crate) mod testutil {
         out
     }
 
-    /// Assemble a complete in-memory ZIM. `index`, when given, is stored as
-    /// an uncompressed `X/fulltext/xapian` content entry (a single-blob
-    /// cluster), like a real archive's embedded Xapian full-text index.
+    /// Assemble a complete in-memory ZIM with an optional full-text index;
+    /// see `build_archive_indexes` for the general shape.
     pub fn build_archive(
         mime_types: &[&str],
         content: &[TestEntry],
@@ -963,9 +1045,25 @@ pub(crate) mod testutil {
         main_page_content: usize,
         index: Option<&[u8]>,
     ) -> Vec<u8> {
-        let has_index = index.is_some();
-        let entry_count = (content.len() + redirects.len() + has_index as usize) as u32;
-        let cluster_count = (content.len() + has_index as usize) as u32;
+        build_archive_indexes(mime_types, content, redirects, main_page_content, index, None)
+    }
+
+    /// Assemble a complete in-memory ZIM. `fulltext_index`/`title_index`,
+    /// when given, are stored as uncompressed `X/fulltext/xapian` /
+    /// `X/title/xapian` content entries (single-blob clusters), like a real
+    /// archive's embedded Xapian databases.
+    pub fn build_archive_indexes(
+        mime_types: &[&str],
+        content: &[TestEntry],
+        redirects: &[TestRedirect],
+        main_page_content: usize,
+        fulltext_index: Option<&[u8]>,
+        title_index: Option<&[u8]>,
+    ) -> Vec<u8> {
+        let has_index = fulltext_index.is_some();
+        let has_title_index = title_index.is_some();
+        let entry_count = (content.len() + redirects.len() + has_index as usize + has_title_index as usize) as u32;
+        let cluster_count = (content.len() + has_index as usize + has_title_index as usize) as u32;
 
         let mut mime_blob = Vec::new();
         for m in mime_types {
@@ -976,7 +1074,7 @@ pub(crate) mod testutil {
         enum Logical<'a> {
             Content { e: &'a TestEntry, cluster: u32 },
             Redirect { r: &'a TestRedirect },
-            Index { bytes: &'a [u8], cluster: u32 },
+            Index { url: &'static str, cluster: u32 },
         }
         let mut logical: Vec<(u8, &str, Logical)> = Vec::new();
         for (ci, e) in content.iter().enumerate() {
@@ -985,12 +1083,13 @@ pub(crate) mod testutil {
         for r in redirects {
             logical.push((r.namespace, r.url, Logical::Redirect { r }));
         }
-        if let Some(ix) = index {
-            logical.push((
-                b'X',
-                "fulltext/xapian",
-                Logical::Index { bytes: ix, cluster: content.len() as u32 },
-            ));
+        let mut next_cluster = content.len() as u32;
+        if let Some(_ix) = fulltext_index {
+            logical.push((b'X', "fulltext/xapian", Logical::Index { url: "fulltext/xapian", cluster: next_cluster }));
+            next_cluster += 1;
+        }
+        if let Some(_ix) = title_index {
+            logical.push((b'X', "title/xapian", Logical::Index { url: "title/xapian", cluster: next_cluster }));
         }
         logical.sort_by(|a, b| (a.0, a.1).cmp(&(b.0, b.1)));
 
@@ -1026,23 +1125,25 @@ pub(crate) mod testutil {
                     push_zstring(&mut b, r.url);
                     push_zstring(&mut b, r.title);
                 }
-                Logical::Index { bytes, cluster } => {
+                Logical::Index { url, cluster } => {
                     b.extend_from_slice(&0u16.to_le_bytes());
                     b.push(0);
                     b.push(*ns);
                     b.extend_from_slice(&0u32.to_le_bytes());
                     b.extend_from_slice(&cluster.to_le_bytes());
                     b.extend_from_slice(&0u32.to_le_bytes());
-                    push_zstring(&mut b, "fulltext/xapian");
+                    push_zstring(&mut b, url);
                     push_zstring(&mut b, "Xapian index");
-                    let _ = bytes;
                 }
             }
             entry_bodies.push(b);
         }
 
         let mut clusters: Vec<Vec<u8>> = content.iter().map(|e| build_cluster(e.body)).collect();
-        if let Some(ix) = index {
+        if let Some(ix) = fulltext_index {
+            clusters.push(build_cluster(ix));
+        }
+        if let Some(ix) = title_index {
             clusters.push(build_cluster(ix));
         }
 
