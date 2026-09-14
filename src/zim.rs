@@ -11,7 +11,7 @@ use memmap2::Mmap;
 use std::fs::File;
 use std::io::{self, ErrorKind};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Mutex};
 
 use xapian2::Database as XapianDatabase;
 
@@ -551,24 +551,28 @@ impl Zim {
         Ok(data[s as usize..(s + take) as usize].to_vec())
     }
 
-    /// Open the archive's full-text Xapian index, preferring the zero-copy
-    /// path (opening the in-file glass database at the blob's offset).
-    /// Returns `Ok(None)` when the archive carries no full-text index.
-    pub fn open_fulltext_xapian(&self) -> io::Result<Option<XapianDatabase>> {
+    /// The directory index of the full-text Xapian index entry, if the
+    /// archive carries one (a cheap directory probe; no database is opened).
+    fn fulltext_index_entry(&self) -> io::Result<Option<u32>> {
         const CANDIDATES: &[(u8, &str)] = &[
             (b'X', "fulltext/xapian"),
             (b'X', "X/fulltext/xapian"),
             (b'X', "fulltextindex/xapian/FullTextIndex"),
             (b'X', "X/fulltextindex/xapian/FullTextIndex"),
         ];
-        let mut idx = None;
         for (ns, url) in CANDIDATES {
             if let Some(i) = self.find_entry(*ns, url)? {
-                idx = Some(i);
-                break;
+                return Ok(Some(i));
             }
         }
-        let Some(idx) = idx else { return Ok(None) };
+        Ok(None)
+    }
+
+    /// Open the archive's full-text Xapian index, preferring the zero-copy
+    /// path (opening the in-file glass database at the blob's offset).
+    /// Returns `Ok(None)` when the archive carries no full-text index.
+    pub fn open_fulltext_xapian(&self) -> io::Result<Option<XapianDatabase>> {
+        let Some(idx) = self.fulltext_index_entry()? else { return Ok(None) };
         let entry = self.get_entry(idx)?;
         let Target::Cluster(cluster, blob) = entry.target else {
             return Err(io::Error::new(ErrorKind::InvalidData, "full-text index entry has no content"));
@@ -609,40 +613,61 @@ pub struct Article {
     pub bytes: Vec<u8>,
 }
 
-/// A ZIM archive plus lazily-opened, cached Xapian search database.
+/// A ZIM archive plus a pool of Xapian search-database handles.
 pub struct Archive {
     /// Archive name relative to the ZIM directory (e.g. "wikipedia.zim").
     pub name: String,
     pub zim: Zim,
-    xapian: RwLock<Option<Arc<XapianDatabase>>>,
+    /// Idle full-text Xapian handles. Handles are moved in and out of the
+    /// pool, never shared: `XapianDatabase` is `Send` (not `Sync`) because
+    /// Xapian does not support concurrent calls on one database object.
+    xapian_pool: Mutex<Vec<XapianDatabase>>,
 }
 
 impl Archive {
     pub fn new(name: String, zim: Zim) -> Self {
-        Self { name, zim, xapian: RwLock::new(None) }
+        Self { name, zim, xapian_pool: Mutex::new(Vec::new()) }
     }
 
     pub fn article_count(&self) -> u32 {
         self.zim.entry_count()
     }
 
-    /// Whether this archive carries an openable full-text Xapian index.
+    /// Whether this archive carries a full-text Xapian index - a cheap
+    /// directory-existence probe; no database is opened.
     pub fn searchable(&self) -> bool {
-        self.zim.open_fulltext_xapian().map(|db| db.is_some()).unwrap_or(false)
+        self.zim.fulltext_index_entry().map(|idx| idx.is_some()).unwrap_or(false)
     }
 
-    /// The full-text Xapian database, opened (and cached) on first use.
-    pub fn xapian_db(&self) -> io::Result<Option<Arc<XapianDatabase>>> {
-        let mut guard = self.xapian.write().unwrap();
-        if let Some(db) = guard.as_ref() {
-            return Ok(Some(db.clone()));
-        }
-        let db = match self.zim.open_fulltext_xapian()? {
-            Some(db) => Arc::new(db),
-            None => return Ok(None),
+    /// Run `f` with a handle on this archive's full-text Xapian index.
+    ///
+    /// Handles are pooled and moved in and out of the pool under the lock,
+    /// so no handle is ever reachable from two threads at once; `f` runs
+    /// outside the lock. This amortizes the ~0.15 s open cost per archive
+    /// without ever sharing a Xapian object between searches (the documented
+    /// thread-safety contract forbids concurrent calls on one database
+    /// object; separate handles to the same file are fine).
+    ///
+    /// Returns `Ok(None)` when the archive carries no full-text index.
+    pub fn with_xapian<T, E>(
+        &self,
+        f: impl FnOnce(&XapianDatabase) -> Result<T, E>,
+    ) -> Result<Option<T>, E>
+    where
+        E: From<io::Error>,
+    {
+        // `XapianDatabase` is `Send`: moving handles in/out of the pool is sound.
+        let mut pool = self.xapian_pool.lock().unwrap();
+        let db = match pool.pop() {
+            Some(db) => db,
+            None => match self.zim.open_fulltext_xapian()? {
+                Some(db) => db,
+                None => return Ok(None),
+            },
         };
-        *guard = Some(db.clone());
-        Ok(Some(db))
+        let result = f(&db);
+        pool.push(db);
+        result.map(Some)
     }
 
     /// Exact-match `query` against the ZIM directory itself (not the search

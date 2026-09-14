@@ -349,11 +349,14 @@ pub enum StemStrategy {
 
 /// A read-only Xapian database.
 ///
-/// In Xapian 2.x a `Database` is a reference-counted handle; sharing one
-/// across threads for concurrent searches is the normal use case
-/// (`Send + Sync`). To search with multiple threads, create one [`Enquire`]
-/// per thread from the same `Database` - each `Enquire` holds its own
-/// reference to the database.
+/// `Send` but **not** `Sync`: per Xapian's documented thread-safety contract
+/// (docs/overview.rst, "Thread safety"), concurrent calls on *one* database
+/// object are unsupported - the application must police access itself. Glass
+/// databases mutate lazily cached tables even on read-only operations, so
+/// concurrent `get_mset`/`get_document` on a shared object corrupts it.
+/// Handles to the same database *file* are safe to use concurrently ("no
+/// different to accessing the same database from two different processes"):
+/// open one `Database` per thread or per request.
 pub struct Database {
     ptr: NonNull<c_void>,
 }
@@ -462,11 +465,11 @@ impl Drop for Database {
     }
 }
 
-// SAFETY: Xapian read-only databases are reference-counted handles and glass
-// databases support concurrent readers; all exposed methods take &self and
-// are read-only.
+// SAFETY: the handle is a heap C++ object owned by this value and freed in
+// `Drop`, so it may be moved (and dropped) on another thread. It must NOT be
+// shared across threads for concurrent use: Xapian only supports concurrent
+// access through separate Database objects (see the type's doc comment).
 unsafe impl Send for Database {}
-unsafe impl Sync for Database {}
 
 // ---------------------------------------------------------------------------
 // Document

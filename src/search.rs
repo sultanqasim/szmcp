@@ -173,26 +173,32 @@ pub fn search(library: &ZimLibrary, query: &str) -> Result<SearchResults, ToolEr
     }
 
     // Per-archive ranked hit lists: (weight, path, title from the index).
-    // libzim stores the article title in Xapian value slot 0.
+    // libzim stores the article title in Xapian value slot 0. Each archive's
+    // Xapian handle is checked out of that archive's pool for the duration
+    // of the search: concurrent searches never share a handle (Xapian does
+    // not support concurrent calls on one database object).
     let mut per_archive: Vec<(&Arc<Archive>, Vec<(f64, String, String)>)> = Vec::new();
     for arc in &library.archives {
-        let Some(db) = arc.xapian_db()? else {
+        let Some(list) = arc.with_xapian(|db| -> Result<_, ToolError> {
+            let mut enquire = Enquire::new(db)?;
+            enquire.set_query(&xquery)?;
+            enquire.set_sort_by_relevance();
+            let mset = enquire.get_mset(0, SEARCH_LIMIT, 0)?;
+            let mut list = Vec::with_capacity(mset.size() as usize);
+            for (j, m) in mset.iter().enumerate() {
+                let mut doc = mset.document(j as u32)?;
+                let path = doc.data_str()?;
+                if path.is_empty() {
+                    continue;
+                }
+                let title = String::from_utf8_lossy(&doc.value(0)?).into_owned();
+                list.push((m.weight, path, title));
+            }
+            Ok(list)
+        })?
+        else {
             continue;
         };
-        let mut enquire = Enquire::new(&db)?;
-        enquire.set_query(&xquery)?;
-        enquire.set_sort_by_relevance();
-        let mset = enquire.get_mset(0, SEARCH_LIMIT, 0)?;
-        let mut list = Vec::with_capacity(mset.size() as usize);
-        for (j, m) in mset.iter().enumerate() {
-            let mut doc = mset.document(j as u32)?;
-            let path = doc.data_str()?;
-            if path.is_empty() {
-                continue;
-            }
-            let title = String::from_utf8_lossy(&doc.value(0)?).into_owned();
-            list.push((m.weight, path, title));
-        }
         per_archive.push((arc, list));
     }
 
@@ -602,6 +608,51 @@ Meltwater streams out of the ice.
             ZimSearchTool::invoke(&server, params),
             Err(ToolError::InvalidArgument(_))
         ));
+    }
+
+    #[test]
+    fn e2e_search_concurrent_threads_on_one_library() {
+        // Concurrent searches against ONE shared library: every thread runs
+        // `search` at the same time (synchronized on the barrier) and must
+        // get the correct results. Each search checks a Xapian handle out of
+        // the per-archive pool and uses it alone; when the archives shared
+        // one cached handle, concurrent searches corrupted the database
+        // state and crashed the process - Xapian does not support concurrent
+        // calls on one Database object (see xapian2/README.md).
+        let (server, _keep) = test_server();
+        let queries = ["apple", "apple", "computing", "banana apple", "apple", "computing"];
+        let barrier = Arc::new(std::sync::Barrier::new(queries.len()));
+        std::thread::scope(|scope| {
+            let mut handles = Vec::new();
+            for query in queries {
+                let server = &server;
+                let barrier = barrier.clone();
+                handles.push(scope.spawn(move || {
+                    barrier.wait();
+                    let hits = search(server, query);
+                    match query {
+                        // Stemmed full-text hit ("computing" -> "comput").
+                        "computing" => {
+                            assert_eq!(hits.len(), 1, "{hits:?}");
+                            assert_eq!(hits[0].path, "C/Apple");
+                        }
+                        // OR of two terms from different articles.
+                        "banana apple" => {
+                            assert_eq!(hits.len(), 2, "{hits:?}");
+                        }
+                        // Exact title match, identical on every thread.
+                        _ => {
+                            assert_eq!(hits[0].path, "C/Apple", "{hits:?}");
+                            assert_eq!(hits[0].title, "Apple");
+                            assert_eq!(hits[0].preview, "An apple is the fruit of <rosaceae> trees.");
+                        }
+                    }
+                }));
+            }
+            for handle in handles {
+                handle.join().unwrap();
+            }
+        });
     }
 
     #[test]

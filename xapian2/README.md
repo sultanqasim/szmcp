@@ -21,7 +21,7 @@ there is no `open_memview`, the default query operator is `Or`, etc.).
 
 | Type | Key methods | Send / Sync |
 | --- | --- | --- |
-| `Database` | `open(path)`, `open_at(path, offset)`, `doc_count()`, `get_document(id)`, `compact_to(dir)`, `compact_single_file(path)` | `Send + Sync` |
+| `Database` | `open(path)`, `open_at(path, offset)`, `doc_count()`, `get_document(id)`, `compact_to(dir)`, `compact_single_file(path)` | `Send` only |
 | `Document` | `id()`, `data()`, `value(slot)`, `termlist_count()`, `set_data/add_term/set_value` (mutable) | `Send` only |
 | `Query` | `term(t)`, `match_all()`, `combine(op, a, b)` | `Send + Sync` |
 | `QueryParser` | `new()`, `parse_query(s)`, `set_default_op(op)`, `add_prefix`, `add_boolean_prefix`, `set_stemmer`, `set_database` | `Send` only |
@@ -90,7 +90,16 @@ for m in mset.iter() {
 
 ## Concurrency model
 
-- One shared `Database` (cheap to hold in a server struct).
-- One `Enquire` (and one `QueryParser`) per request/thread - both are
-  `Send` but not `Sync`.
+Per Xapian's documented thread-safety contract (`docs/overview.rst`,
+"Thread safety" - there is no locking inside Xapian), concurrent calls on
+*one* `Database` object are unsupported: glass databases mutate lazily cached
+tables (postlist/position tables, value stats) even on read-only operations,
+so sharing a `Database` across threads corrupts it. Instead:
+
+- One `Database` object **per thread or per request**. Separate handles to
+  the same database file are safe to use concurrently - Xapian itself says
+  this is "no different to accessing the same database from two different
+  processes" (read-only glass databases take no locks).
+- One `Enquire` (and one `QueryParser`) per search - both are `Send` but not
+  `Sync`.
 - `MSet`s and `Document`s are free to move across threads.
