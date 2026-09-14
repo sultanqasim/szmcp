@@ -48,8 +48,13 @@ fn decode_entity(s: &str, i: usize) -> Option<(String, usize)> {
 
 /// Elements whose whole content is invisible or not part of an article's
 /// lead: CSS/JS, tables (an infobox precedes the lead in MediaWiki output),
-/// figures (image captions) and reference markers.
-const INTRO_SKIP_TAGS: [&str; 5] = ["style", "script", "table", "figure", "sup"];
+/// figures (image captions) and reference markers. `title` and `h1` are
+/// skipped too: they carry the page title (`<title>` in the head;
+/// `<h1 id="firstHeading">` inside the body on pages from older scrapers,
+/// which lack the `mw-content-text` marker) and the title is already a
+/// separate field of every search hit, so it must not open the intro as
+/// well. Other heading levels are content and pass through.
+const INTRO_SKIP_TAGS: [&str; 7] = ["style", "script", "table", "figure", "sup", "title", "h1"];
 
 /// The value of attribute `name` in an open tag's attribute text (the part
 /// of the tag left over after the tag name), or `None`. Names match
@@ -125,14 +130,23 @@ fn element_end(html: &str, open_i: usize, tag_name: &str) -> usize {
 /// The region of a MediaWiki page that holds the article. Scanning the whole
 /// HTML would pick up browser-chrome text (title bar, navigation menus), so
 /// cut the page at the content div (`id="mw-content-text"`) and its matching
-/// close when the page has one.
+/// close when the page has one. The article preview is only a prefix of the
+/// page, and on real MediaWiki pages the content div's close tag lies far
+/// beyond that prefix: the div then never closes within the scanned text,
+/// and the fallback must stay inside the div - everything from its open tag
+/// onward is the article body. Widening back to the whole document there
+/// (as this once did) silently defeats the scoping and leaks the head
+/// chrome (`<title>`, `<h1 id="firstHeading">`) into the intro. Likewise,
+/// when the prefix ends inside the div's own open tag (no `>` after the
+/// marker), nothing of the article has arrived and the body is empty
+/// rather than the whole document.
 fn article_body(html: &str) -> &str {
     const MARKER: &str = "id=\"mw-content-text\"";
     let Some(i) = html.find(MARKER) else { return html };
     let after = &html[i + MARKER.len()..];
     // Skip the rest of the content div's own open tag, then find its close
     // by counting nested <div>/</div> tags.
-    let Some(gt) = after.find('>') else { return html };
+    let Some(gt) = after.find('>') else { return "" };
     let after = &after[gt + 1..];
     let mut depth = 1usize; // inside the content div
     let mut pos = 0usize;
@@ -157,15 +171,19 @@ fn article_body(html: &str) -> &str {
         }
         pos += lt + 1;
     }
-    html
+    // Never closed within the scanned text: we are inside the div, so the
+    // rest of the scanned text is the article body.
+    after
 }
 
 /// Strip HTML tags, decode common entities, and collapse whitespace into
 /// single spaces. Stops after producing `max_chars` characters of text;
 /// markup and whitespace never consume the budget. MediaWiki hatnotes
-/// (`{{about}}` and friends, marked by `is_hatnote_attrs`) are skipped
-/// whole, so intros start with the article lead - as the Markdown path
-/// already does.
+/// (`{{about}}` and friends, marked by `is_hatnote_attrs`) and the page
+/// title's own elements (`<title>`, `<h1>` - see `INTRO_SKIP_TAGS`) are
+/// skipped whole, so intros start with the article lead and never open
+/// with the article name, which every search hit already reports as its
+/// own field - as the Markdown path already does.
 pub fn intro_from_html(html: &str, max_chars: usize) -> String {
     let html = article_body(html);
     let bytes = html.as_bytes();
@@ -451,7 +469,11 @@ mod tests {
     #[test]
     fn intro_strips_tags_scripts_and_entities() {
         let intro = intro_from_html(WIKI, 100);
-        assert!(intro.contains("apple is the fruit of <rosaceae> trees"), "{intro:?}");
+        // The <title> and <h1> carry the page title, which every search hit
+        // already reports as its own field: their text must not open the
+        // intro, so it starts at the lead paragraph.
+        assert!(intro.starts_with("An apple is the fruit of <rosaceae> trees"), "{intro:?}");
+        assert!(!intro.starts_with("Apple"), "{intro:?}");
         assert!(!intro.contains("var x"), "{intro:?}");
         assert!(!intro.contains("p{}"), "{intro:?}");
         // The hatnote before the lead (note text and its inner link) is
@@ -490,6 +512,55 @@ mod tests {
         assert!(!intro.contains("hydrocarbon"), "{intro:?}");
         assert!(!intro.contains("Navigation"), "{intro:?}");
         assert!(!intro.contains("Wikipedia"), "{intro:?}");
+    }
+
+    #[test]
+    fn intro_when_content_div_never_closes_in_prefix() {
+        // A real page is read as a prefix (64 KiB) that ends inside the
+        // content div - its close tag lies far beyond it. Before the fix
+        // the never-closed fallback widened back to the whole document,
+        // so the head chrome (<title>, <h1>) opened the intro ("Salt Salt
+        // Salt is a mineral ..."); the intro must hold only lead text.
+        let page = "<html><head><title>Salt - Wikipedia</title></head>\
+            <body><h1 id=\"firstHeading\" class=\"firstHeading mw-first-heading\">Salt</h1>\
+            <div id=\"mw-content-text\"><div class=\"mw-parser-output\">\
+            <p><b>Salt</b> is a mineral composed primarily of sodium chloride.</p>\
+            <p>It is an ionic compound.</p>";
+        let intro = intro_from_html(page, 200);
+        assert_eq!(
+            intro,
+            "Salt is a mineral composed primarily of sodium chloride. It is an ionic compound.",
+            "{intro:?}"
+        );
+    }
+
+    #[test]
+    fn intro_skips_title_and_first_heading_without_marker() {
+        // Pages lacking the mw-content-text marker (older scrapers put the
+        // <h1 id="firstHeading"> inside the body): the title's text must
+        // not open the intro even there, so <title> and <h1> contents are
+        // skipped like hatnotes; the intro starts at the lead paragraph.
+        let page = "<html><head><title>Beryllium - Wikipedia</title></head>\
+            <body><h1 id=\"firstHeading\">Beryllium</h1>\
+            <p>It is a lightweight metal.</p></body></html>";
+        let intro = intro_from_html(page, 100);
+        assert_eq!(intro, "It is a lightweight metal.");
+    }
+
+    #[test]
+    fn article_body_fallbacks_when_div_never_closes() {
+        // Prefix ends inside the content div (a real page's close tag lies
+        // beyond the prefix): everything from the div's open tag onward is
+        // the article body - not the whole document, whose head chrome
+        // would leak into the intro ("Salt Salt Salt is ...").
+        let page = "<html><title>Salt</title><h1>Salt</h1>\
+            <div id=\"mw-content-text\" class=\"x\"><p>Lead.</p>";
+        assert_eq!(article_body(page), "<p>Lead.</p>");
+        // Prefix ends inside the div's own open tag (no `>` after the
+        // marker): nothing of the article has arrived, so the body is
+        // empty rather than the whole document.
+        let page = "<html><title>Salt</title><div id=\"mw-content-text\" cla";
+        assert_eq!(article_body(page), "");
     }
 
     #[test]

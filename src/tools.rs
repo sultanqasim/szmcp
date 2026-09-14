@@ -518,7 +518,9 @@ Ancient India smelted zinc early.
         let server = ZimMcpServer::new(library);
 
         // Search: the intro is plain text derived from the Markdown, free of
-        // markup (title, hatnote, then the lead paragraph).
+        // markup, and starts with the lead paragraph - the leading `# Zinc`
+        // title line (a separate field of every hit) and the hatnote are
+        // dropped.
         let params = serde_json::from_value::<ZimSearchParams>(
             serde_json::json!({ "query": "zinc" }),
         )
@@ -527,11 +529,10 @@ Ancient India smelted zinc early.
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].zim, "md.zim");
         assert_eq!(hits[0].path, "C/Zinc");
-        // The intro starts with the lead text; the hatnote is dropped.
         assert!(
             hits[0]
                 .intro
-                .starts_with("Zinc Zinc is a chemical element with the symbol Zn."),
+                .starts_with("Zinc is a chemical element with the symbol Zn."),
             "{:?}",
             hits[0].intro
         );

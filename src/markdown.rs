@@ -109,17 +109,22 @@ fn is_hatnote(para: &str) -> bool {
         && !t[1..t.len() - 1].contains('*')
 }
 
-/// Plain-text preview of the start of a Markdown article: the title text,
-/// then the paragraphs that follow, until `max_chars` characters of text
-/// have been produced. Headings lose their `#` markers, emphasis and
-/// inline-code markers are stripped, wikilinks become their text, list
-/// bullets and pipe-table cell separators vanish, fenced code blocks are
-/// skipped entirely, and raw HTML lines are handed to `intro_from_html`
-/// for tag stripping. Hatnote paragraphs (standalone paragraphs wrapped in
-/// single asterisks, how wikizim_parser renders "For other uses..." notes)
-/// are dropped, so the intro starts with the actual lead text. Whitespace
-/// collapses to single spaces; markup and whitespace never consume the
-/// character budget.
+/// Plain-text preview of the start of a Markdown article: the paragraphs
+/// after the leading title line, until `max_chars` characters of text have
+/// been produced. The leading ATX heading is the article title - a separate
+/// field of every search hit - and is not emitted; emitting it as well made
+/// intros read "Photosynthesis Photosynthesis (/ˌfoʊtə... ) is ...". The
+/// rule is positional: a heading reached before any text has been emitted
+/// is the title and is skipped, a heading reached after that is content and
+/// keeps its text (only the leading title line is special). Headings lose
+/// their `#` markers, emphasis and inline-code markers are stripped,
+/// wikilinks become their text, list bullets and pipe-table cell separators
+/// vanish, fenced code blocks are skipped entirely, and raw HTML lines are
+/// handed to `intro_from_html` for tag stripping. Hatnote paragraphs
+/// (standalone paragraphs wrapped in single asterisks, how wikizim_parser
+/// renders "For other uses..." notes) are dropped, so the intro starts with
+/// the actual lead text. Whitespace collapses to single spaces; markup and
+/// whitespace never consume the character budget.
 pub fn intro_from_markdown(md: &str, max_chars: usize) -> String {
     let mut out = String::new();
     let mut in_fence = false;
@@ -158,9 +163,16 @@ pub fn intro_from_markdown(md: &str, max_chars: usize) -> String {
         }
         let level = heading_level(t);
         if level > 0 {
-            // ATX heading: the `#` markers are markup, the text is content.
-            let text = strip_inline(t[level as usize..].trim_start());
-            push_text(&mut out, &text, max_chars);
+            // ATX heading: the `#` markers are markup, the text is content -
+            // except while no text has been emitted yet, when the heading is
+            // the article's leading title line (wikizim_parser opens every
+            // article with `# Title`, already reported as its own field of
+            // every search hit) and is skipped. Once text flows, headings
+            // are content, even another level-1 one.
+            if !out.is_empty() {
+                let text = strip_inline(t[level as usize..].trim_start());
+                push_text(&mut out, &text, max_chars);
+            }
             continue;
         }
         if t.starts_with('|') {
@@ -344,12 +356,13 @@ That is all.
     #[test]
     fn intro_strips_markup_and_resolves_wikilinks() {
         let intro = intro_from_markdown(CHEMISTRY, 400);
-        // Title text, then the lead: the hatnote paragraph is dropped, so
-        // the intro starts with the actual article text.
+        // The leading `# Chemistry` title line is not emitted (the title is
+        // a separate field of every search hit): the hatnote paragraph is
+        // dropped, so the intro starts with the actual article text - the
+        // bold article name inside the lead sentence is sentence text and
+        // stays.
         assert!(
-            intro.starts_with(
-                "Chemistry Chemistry is the scientific study of the matter and its properties"
-            ),
+            intro.starts_with("Chemistry is the scientific study of the matter and its properties"),
             "{intro:?}"
         );
         assert!(!intro.contains("For other uses"), "{intro:?}");
@@ -360,6 +373,30 @@ That is all.
     }
 
     #[test]
+    fn intro_excludes_the_leading_title_line() {
+        // The leading `# Title` line must not reach the intro: the title is
+        // a separate field of every search hit, and emitting it as well made
+        // intros read "Kyoto Kyoto is ...". A lead that does not start with
+        // the title word makes the rule observable.
+        let md = "# Kyoto\n\n*Not to be confused with [[Kyoto Prefecture]].*\n\n\
+                  It was the imperial capital of Japan for over a thousand years.\n";
+        let intro = intro_from_markdown(md, 200);
+        assert_eq!(intro, "It was the imperial capital of Japan for over a thousand years.");
+        // The hatnote following the title is still dropped.
+        assert!(!intro.contains("confused with"), "{intro:?}");
+    }
+
+    #[test]
+    fn intro_emits_mid_document_h1_headings() {
+        // Only the leading title line is special: a heading reached after
+        // text has been emitted is content and keeps its text, even a
+        // level-1 one.
+        let md = "# Doc\n\nLead text first.\n\n# Appendix\n\nTrailing note.\n";
+        let intro = intro_from_markdown(md, 200);
+        assert_eq!(intro, "Lead text first. Appendix Trailing note.");
+    }
+
+    #[test]
     fn intro_skips_hatnotes() {
         // Hatnotes are standalone paragraphs wrapped in single asterisks,
         // possibly wrapped over several lines. Bold paragraphs do not match.
@@ -367,13 +404,13 @@ That is all.
                   *A second hatnote\nwrapped over two lines.*\n\n\
                   **X** is a thing of great importance.\n";
         let intro = intro_from_markdown(md, 200);
-        assert_eq!(intro, "X X is a thing of great importance.");
+        assert_eq!(intro, "X is a thing of great importance.");
 
         // Hatnotes further in (before a section) are dropped as well.
         let md = "# Y\n\n**Y** leads here.\n\n## Section\n\n\
                   *Main article: [[Something else]]*\n\nSection text follows.\n";
         let intro = intro_from_markdown(md, 200);
-        assert_eq!(intro, "Y Y leads here. Section Section text follows.");
+        assert_eq!(intro, "Y leads here. Section Section text follows.");
     }
 
     #[test]
@@ -384,7 +421,7 @@ That is all.
         let intro = intro_from_markdown(md, 300);
         assert_eq!(
             intro,
-            "T See Earth's age, Mean anomaly, Chemical element, p-block and [He] atoms."
+            "See Earth's age, Mean anomaly, Chemical element, p-block and [He] atoms."
         );
     }
 
@@ -393,7 +430,7 @@ That is all.
         let md = "# Code\n\n```rust\nlet x = 1;\n## not a heading\n```\n\n\
                   | a | b |\n| --- | --- |\n| x | y |\n\n~~~\nfence two\n~~~\n\nAfter.";
         let intro = intro_from_markdown(md, 200);
-        assert_eq!(intro, "Code a b x y After.");
+        assert_eq!(intro, "a b x y After.");
     }
 
     #[test]
@@ -401,7 +438,7 @@ That is all.
         let md = "# KF\n\n- **[[Atomic number]] (Z)**: 8\n  - shells fill in order\n\
                   1. ordered item\n";
         let intro = intro_from_markdown(md, 200);
-        assert_eq!(intro, "KF Atomic number (Z): 8 shells fill in order ordered item");
+        assert_eq!(intro, "Atomic number (Z): 8 shells fill in order ordered item");
     }
 
     #[test]
@@ -411,7 +448,7 @@ That is all.
         let md = "# H\n\n<p>plain &amp; <b>bold</b></p>\n\n\
                   <table>\n<tr><td>cells</td></tr>\n</table>\n\nAfter.";
         let intro = intro_from_markdown(md, 100);
-        assert_eq!(intro, "H plain & bold After.");
+        assert_eq!(intro, "plain & bold After.");
     }
 
     #[test]
@@ -425,7 +462,7 @@ That is all.
         // Hundreds of separator rows (pure markup) must not crowd the real
         // text out of the character budget.
         let md = format!("# T\n\n{}\nreal text here", "| --- |\n".repeat(400));
-        assert_eq!(intro_from_markdown(&md, 20), "T real text here");
+        assert_eq!(intro_from_markdown(&md, 20), "real text here");
     }
 
     #[test]
