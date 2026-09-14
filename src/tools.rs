@@ -107,7 +107,8 @@ impl ToolBase for ZimSearchTool {
             "Search all articles in all ZIM files. Results are ranked best first: an exact \
              title match comes first, followed by articles whose titles contain the query \
              words - titles containing all the query words ahead of partial title matches - \
-             then full-text matches; each result has the ZIM file name, the article \
+             then full-text matches, where articles containing all of the query's distinctive \
+             words rank higher; each result has the ZIM file name, the article \
              path, the page title, and preview - the article's first paragraph when the query \
              matches the title or that paragraph, otherwise the sentence that best matches \
              the query together with \"sections\", the matching regions' names (the intro \

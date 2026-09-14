@@ -95,6 +95,16 @@ uint32_t xapian2_db_doccount(const Xapian::Database *db) {
     return 0;
 }
 
+// The term's document frequency (`get_termfreq`); 0 for an absent term.
+uint32_t xapian2_db_termfreq(const Xapian::Database *db, const char *term, uint32_t len) {
+    try {
+        return static_cast<uint32_t>(db->get_termfreq(std::string_view(term, len)));
+    } catch (const Xapian::Error &e) {
+        g_error = describe(e);
+    }
+    return 0;
+}
+
 XDoc *xapian2_db_get_document(const Xapian::Database *db, uint32_t did) {
     try {
         return new XDoc{db->get_document(did), {}};

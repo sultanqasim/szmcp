@@ -9,7 +9,7 @@ use crate::zim::{Archive, ZimLibrary};
 use schemars::JsonSchema;
 use serde::Serialize;
 use std::sync::Arc;
-use xapian2::{Enquire, Operator, Query, QueryParser, Stem, StemStrategy};
+use xapian2::{Database, Enquire, Operator, Query, QueryParser, Stem, StemStrategy};
 
 /// Number of results `zim_search` returns in total (across all archives).
 const SEARCH_LIMIT: u32 = 20;
@@ -25,14 +25,26 @@ const HIT_READ_BYTES: u64 = 1024 * 1024;
 /// reporting is truncated to `INTRO_CHARS` separately.
 const PARA_MATCH_CHARS: usize = 2000;
 
-/// Common English words dropped when collecting an all-terms query boost.
-/// They are stopped at index time (libzim's TermGenerator), so they are
-/// absent from the index terms and an AND over them would match nothing.
+/// Common English words dropped when collecting the query's stemmed terms
+/// (they drive the all-words branch, the title-index band, and the paragraph
+/// matching). They are stopped at index time (libzim's TermGenerator), so
+/// they are absent from the index terms and an AND over them would match
+/// nothing.
 const STOPWORDS: &[&str] = &[
     "a", "an", "and", "are", "as", "at", "be", "but", "by", "for", "from", "has", "have", "in",
     "is", "it", "its", "not", "of", "on", "or", "that", "the", "these", "this", "those", "to",
     "was", "were", "which", "with",
 ];
+
+/// A stemmed query term is *specific* enough to define the all-words tier
+/// when its document frequency in the archive's full-text index is at most
+/// this fraction of the archive's document count. A term occurring in more
+/// than 1% of the archive is background vocabulary - in a Wikipedia edition
+/// "attractions"/"attraction"/"attractive" all stem to one term present in
+/// 5.7% of all articles - so its incidental occurrences in near-random
+/// documents must not define the all-words tier, and a genuinely relevant
+/// article that happens to miss that one word must not sink under it.
+const AND_TERM_MAX_DF_FRAC: f64 = 0.01;
 
 /// One search result.
 #[derive(Serialize, JsonSchema, Debug)]
@@ -85,6 +97,43 @@ fn query_terms(query: &str, stem: &mut Stemmer) -> Vec<String> {
     terms
 }
 
+/// Combine `terms` (non-empty) with `op`, left to right; Xapian flattens
+/// the resulting tree itself.
+fn combine_terms<T: AsRef<str>>(op: Operator, terms: &[T]) -> xapian2::Result<Query> {
+    let mut query = Query::term(terms[0].as_ref())?;
+    for term in &terms[1..] {
+        query = Query::combine(op, &query, &Query::term(term.as_ref())?)?;
+    }
+    Ok(query)
+}
+
+/// The all-words branch of one archive's full-text query: an AND over the
+/// query's *specific* terms (see [`AND_TERM_MAX_DF_FRAC`]) when at least
+/// two of them qualify, else `None` - the parsed OR query runs alone. BM25
+/// sums term weights across OR branches, so ORing this AND with the parsed
+/// query ranks articles containing every specific word above partial
+/// matches, while partial matches still return; the branch is built per
+/// archive because document frequencies are per database. (OP_PHRASE and
+/// OP_NEAR are no substitute: the indexes carry no positional data. A
+/// misspelled word matches nothing here while the parsed OR side still
+/// retrieves results for the good words.)
+fn all_words_branch(
+    fulltext: &Database,
+    terms: &[String],
+    max_df_frac: f64,
+) -> xapian2::Result<Option<Query>> {
+    let cap = max_df_frac * f64::from(fulltext.doc_count());
+    let specific: Vec<&str> = terms
+        .iter()
+        .map(String::as_str)
+        .filter(|t| f64::from(fulltext.termfreq(t)) <= cap)
+        .collect();
+    if specific.len() < 2 {
+        return Ok(None);
+    }
+    Ok(Some(combine_terms(Operator::And, &specific)?))
+}
+
 /// A stemmer that remembers the stem of every word it has seen. Natural
 /// text repeats its words heavily, and every uncached stem crosses the
 /// Xapian FFI; one instance serves a whole search (the query terms and all
@@ -133,31 +182,13 @@ pub fn search(library: &ZimLibrary, query: &str) -> Result<SearchResults, ToolEr
         .parse_query(query)
         .map_err(|e| ToolError::InvalidArgument(format!("failed to parse query: {e}")))?;
 
-    // Multi-word queries: rank articles containing ALL the words above
-    // articles containing only some of them, by ORing the parsed query with
-    // an AND over the stemmed terms (the classic Xapian all-terms boost).
-    // BM25 sums contributions across OR branches, so an all-words article
-    // scores higher than one with a subset, while partial matches still
-    // appear. Positional operators cannot approximate exact matching here -
-    // the ZIM indexes carry no positional data, so OP_PHRASE/OP_NEAR match
-    // nothing - and the indexes have no spelling data, so a misspelled word
-    // simply matches nothing in the AND branch while the parsed OR branch
-    // still retrieves results for the good words.
-    // The query's terms drive three things: the all-terms boost below, the
-    // title-index band, and the paragraph matching when the hits are built
-    // - one stemmer serves all three.
+    // The query's terms drive three things: the all-words branch of the
+    // full-text query (built per archive below, from that archive's term
+    // statistics - see `all_words_branch`), the title-index band, and the
+    // paragraph matching when the hits are built - one stemmer serves all
+    // three. The parsed OR side of the full-text query is final here.
     let mut stemmer = Stemmer::new("english")?;
     let terms = query_terms(query, &mut stemmer);
-    let xquery = if terms.len() >= 2 {
-        // Fold the AND left to right; Xapian flattens the tree itself.
-        let mut all_terms = Query::term(&terms[0])?;
-        for term in &terms[1..] {
-            all_terms = Query::combine(Operator::And, &all_terms, &Query::term(term)?)?;
-        }
-        Query::combine(Operator::Or, &all_terms, &xquery)?
-    } else {
-        xquery
-    };
 
     /// Which band produced a hit. Exact and title-index hits are title
     /// matches: their preview is the lead paragraph and `sections` is
@@ -224,18 +255,12 @@ pub fn search(library: &ZimLibrary, query: &str) -> Result<SearchResults, ToolEr
                     // title with all the words also matches any subset of
                     // them), so the OR pass skips the docids the AND pass
                     // already reported.
-                    let mut and_query: Option<Query> = None;
-                    if terms.len() >= 2 {
-                        let mut all_terms = Query::term(&terms[0])?;
-                        for term in &terms[1..] {
-                            all_terms = Query::combine(Operator::And, &all_terms, &Query::term(term)?)?;
-                        }
-                        and_query = Some(all_terms);
-                    }
-                    let mut or_query = Query::term(&terms[0])?;
-                    for term in &terms[1..] {
-                        or_query = Query::combine(Operator::Or, &or_query, &Query::term(term)?)?;
-                    }
+                    let and_query = if terms.len() >= 2 {
+                        Some(combine_terms(Operator::And, &terms)?)
+                    } else {
+                        None
+                    };
+                    let or_query = combine_terms(Operator::Or, &terms)?;
                     let mut taken: std::collections::HashSet<u32> = std::collections::HashSet::new();
                     let mut enquire = Enquire::new(title_db)?;
                     enquire.set_sort_by_relevance();
@@ -284,10 +309,16 @@ pub fn search(library: &ZimLibrary, query: &str) -> Result<SearchResults, ToolEr
                 }
             }
 
-            // The full-text band, unchanged: the parsed query (with the
-            // all-terms boost folded in).
+            // The full-text band: the parsed OR query, with this archive's
+            // all-words branch OR-ed in when its term statistics produce
+            // one (see `all_words_branch`).
             let mut enquire = Enquire::new(&h.fulltext)?;
-            enquire.set_query(&xquery)?;
+            match all_words_branch(&h.fulltext, &terms, AND_TERM_MAX_DF_FRAC)? {
+                Some(and_query) => {
+                    enquire.set_query(&Query::combine(Operator::Or, &and_query, &xquery)?)?
+                }
+                None => enquire.set_query(&xquery)?,
+            }
             enquire.set_sort_by_relevance();
             let mset = enquire.get_mset(0, SEARCH_LIMIT, 0)?;
             let mut list = Vec::with_capacity(mset.size() as usize);
@@ -565,7 +596,7 @@ pub(crate) mod tests {
     use crate::zim::testutil::{build_archive, build_archive_indexes, TestEntry, TestRedirect};
     use rmcp::handler::server::router::tool::AsyncTool;
     use std::future::Future;
-    use xapian2::{Document, WritableDatabase};
+    use xapian2::{Database, Document, Enquire, WritableDatabase};
 
     /// Run an async tool invocation to completion on this thread: the tools
     /// are async (each hops to a blocking thread), and these tests are sync
@@ -659,6 +690,16 @@ A glacier is a body of dense ice.
 Glaciers move under their own weight. The flow is slower than a river. \
 Meltwater streams out of the ice.
 ";
+
+    /// Bodies for the all-words-tier pathology test (`e2e_search_common_word_does_not_block_all_words_tier`).
+    const BEACONSFIELD_QUEBEC_HTML: &str = "<html><body><h1>Beaconsfield, Quebec</h1>\
+        <p>Beaconsfield is a suburban borough of Montreal, Quebec, Canada.</p></body></html>";
+
+    const CANADIAN_AMATEUR_HTML: &str = "<html><body><h1>Canadian Amateur Championship</h1>\
+        <p>The Canadian Amateur Championship is a golf tournament.</p></body></html>";
+
+    const FREDERICK_STANLEY_HTML: &str = "<html><body><h1>Frederick Stanley</h1>\
+        <p>Frederick Stanley, 16th Earl of Derby, was Governor General of Canada.</p></body></html>";
 
     fn search(server: &ZimMcpServer, query: &str) -> Vec<SearchHit> {
         let params = serde_json::from_value::<ZimSearchParams>(
@@ -1228,31 +1269,135 @@ Meltwater streams out of the ice.
         );
     }
 
-    #[test]
-    fn e2e_search_multi_word_ranks_all_words_first() {
-        // BM25 alone ranks the "Cherry" document first: thirty repetitions
-        // of one term in a short document outweigh a document mentioning
-        // each term once. The all-terms AND branch must lift "Dessert
-        // Recipes" (the only document with BOTH terms) above it, while the
-        // partial match still appears. Two filler documents carry "pie" too,
-        // so this is a real re-ranking, not a tie.
+    /// A single-archive server whose full-text index holds `fillers` filler
+    /// documents (the shared term "filler" 29 times plus one unique term:
+    /// 30 terms each) ahead of `docs`' documents. This is big enough for
+    /// real-corpus-style document frequencies: on the few-document archives
+    /// of the other tests EVERY term exceeds the production all-words
+    /// threshold (see `AND_TERM_MAX_DF_FRAC`), so the all-words tier never
+    /// fires there and tests of the tier itself need an archive that keeps
+    /// the query terms' df under 1%.
+    ///
+    /// `docs` entries are (path, index terms, title, body); the filler
+    /// documents carry no content entries (they never match a query, so
+    /// their articles are never read).
+    fn big_archive_test_server(
+        fillers: usize,
+        docs: &[(&'static str, String, &'static str, &'static str)],
+    ) -> (ZimMcpServer, tempfile::TempDir) {
         let dir = tempfile::tempdir().unwrap();
-        let cherri_terms = "cherri ".repeat(30);
-        let dessert_terms = format!("cherri pie{}", " filler".repeat(8));
-        let index = make_index(&[
-            ("C/Cherry", &cherri_terms, "Cherry"),
-            ("C/Dessert_Recipes", &dessert_terms, "Dessert Recipes"),
-            ("C/Pie_1", "pie pie", "Pie 1"),
-            ("C/Pie_2", "pie pie", "Pie 2"),
-        ]);
-        let content = [
-            TestEntry { namespace: b'C', url: "Cherry", title: "Cherry", mime: 0, body: CHERRY_HTML.as_bytes() },
-            TestEntry { namespace: b'C', url: "Dessert_Recipes", title: "Dessert Recipes", mime: 0, body: CHERRY_HTML.as_bytes() },
-        ];
+        let padding = vec!["filler"; 29].join(" ");
+        let mut index_docs: Vec<(String, String, String)> = (0..fillers)
+            .map(|i| {
+                (
+                    format!("C/Filler_{i}"),
+                    format!("{padding} unicum{i}"),
+                    format!("Filler {i}"),
+                )
+            })
+            .collect();
+        for (path, terms, title, _) in docs {
+            index_docs.push(((*path).to_string(), terms.clone(), (*title).to_string()));
+        }
+        let refs: Vec<(&str, &str, &str)> = index_docs
+            .iter()
+            .map(|(p, t, ti)| (p.as_str(), t.as_str(), ti.as_str()))
+            .collect();
+        let index = make_index(&refs);
+        let content: Vec<TestEntry> = docs
+            .iter()
+            .map(|&(path, _, title, body)| TestEntry {
+                namespace: b'C',
+                url: path.strip_prefix("C/").unwrap_or(path),
+                title,
+                mime: 0,
+                body: body.as_bytes(),
+            })
+            .collect();
         let bytes = build_archive(&["text/html"], &content, &[], 0, Some(&index));
         std::fs::write(dir.path().join("test.zim"), &bytes).unwrap();
         let library = Arc::new(ZimLibrary::scan(dir.path()).unwrap());
-        let server = ZimMcpServer::new(library);
+        assert!(library.archives[0].searchable());
+        (ZimMcpServer::new(library), dir)
+    }
+
+    #[test]
+    fn all_words_branch_gates_terms_by_document_frequency() {
+        // 300 documents: "rarea"/"rareb" in two of them (df 0.7%), "common"
+        // in six (df 2%). The tier decision is parameterized by the df
+        // fraction, so both sides of it are exercised here: the production
+        // threshold and the forced extremes.
+        let dir = tempfile::tempdir().unwrap();
+        let mut wdb = WritableDatabase::create(dir.path().join("db")).unwrap();
+        for i in 0..300u32 {
+            let mut doc = Document::new().unwrap();
+            doc.set_data(format!("C/D{i}")).unwrap();
+            if i < 2 {
+                doc.add_term("rarea", 1).unwrap();
+                doc.add_term("rareb", 1).unwrap();
+            }
+            if (10..16).contains(&i) {
+                doc.add_term("common", 1).unwrap();
+            }
+            wdb.add_document(&doc).unwrap();
+        }
+        wdb.commit().unwrap();
+        let db = Database::open(dir.path().join("db")).unwrap();
+        assert_eq!(db.doc_count(), 300);
+
+        let terms = vec!["common".into(), "rarea".into(), "rareb".into()];
+        let mut enquire = Enquire::new(&db).unwrap();
+        // At the production threshold the two rare terms are specific and
+        // "common" is gated out: the branch is an AND over exactly those
+        // two terms, matching only the documents carrying both. (An AND
+        // that included "common" would match none of them.)
+        let branch = all_words_branch(&db, &terms, AND_TERM_MAX_DF_FRAC)
+            .unwrap()
+            .unwrap();
+        enquire.set_query(&branch).unwrap();
+        let mset = enquire.get_mset(0, 10, 0).unwrap();
+        assert_eq!(mset.size(), 2, "{:?}", (0..mset.size()).map(|i| mset.docid(i)).collect::<Vec<_>>());
+
+        // At df fraction 0 nothing is specific: no branch. At 1 every term
+        // is specific: the branch is the old all-terms AND, which here
+        // matches nothing (no document carries all three terms).
+        assert!(all_words_branch(&db, &terms, 0.0).unwrap().is_none());
+        let all = all_words_branch(&db, &terms, 1.0).unwrap().unwrap();
+        enquire.set_query(&all).unwrap();
+        assert_eq!(enquire.get_mset(0, 10, 0).unwrap().size(), 0);
+
+        // Fewer than two specific terms, no branch (an AND over one term is
+        // plain OR with the term counted twice); a single-term query never
+        // gets a branch.
+        let two = vec!["common".into(), "rarea".into()];
+        assert!(all_words_branch(&db, &two, AND_TERM_MAX_DF_FRAC).unwrap().is_none());
+        let one = vec!["rarea".into()];
+        assert!(all_words_branch(&db, &one, 1.0).unwrap().is_none());
+    }
+
+    #[test]
+    fn e2e_search_all_words_tier_ranks_full_matches_first() {
+        // BM25 alone ranks the "Cherry" document first: thirty repetitions
+        // of one term in a short document outweigh a document mentioning
+        // each term once. The all-words branch must lift "Dessert Recipes"
+        // (the only document with BOTH terms) above it, while the partial
+        // match still appears. The archive is big (see
+        // `big_archive_test_server`) so that "cherri" (2 of 404 documents)
+        // and "pie" (3 of 404) stay under the production df threshold and
+        // the tier actually fires - on a tiny archive every term exceeds
+        // 1% df and the branch would never be built.
+        let cherri_terms = "cherri ".repeat(30);
+        let dessert_terms = format!("cherri pie{}", " filler".repeat(28));
+        let pie_terms = format!("pie pie{}", " filler".repeat(28));
+        let (server, _keep) = big_archive_test_server(
+            400,
+            &[
+                ("C/Cherry", cherri_terms, "Cherry", CHERRY_HTML),
+                ("C/Dessert_Recipes", dessert_terms, "Dessert Recipes", CHERRY_HTML),
+                ("C/Pie_1", pie_terms.clone(), "Pie 1", CHERRY_HTML),
+                ("C/Pie_2", pie_terms, "Pie 2", CHERRY_HTML),
+            ],
+        );
 
         let hits = search(&server, "cherry pie");
         assert_eq!(hits[0].path, "C/Dessert_Recipes", "{hits:?}");
@@ -1264,6 +1409,65 @@ Meltwater streams out of the ice.
         // is the intro's matching paragraph.
         assert_eq!(hits[0].sections, Some(vec!["_intro".to_string()]));
         assert!(hits[0].preview.contains("cherry is the fruit"), "{:?}", hits[0].preview);
+    }
+
+    #[test]
+    fn e2e_search_common_word_does_not_block_all_words_tier() {
+        // The measured pathology this change fixes, synthetic: for
+        // "beaconsfield quebec attractions" the term "attract" is common
+        // (10 of 411 documents, 2.4% - gated), while "beaconsfield" and
+        // "quebec" are specific (3 of 411 each). The target document is
+        // missing the common word entirely; the incidental documents carry
+        // it once. Under the old all-terms AND the target got nothing from
+        // the AND branch while the incidentals were double-counted (they
+        // match AND and OR), so they outranked it; with the common word
+        // gated out, the target's strong beaconsfield/quebec matches put it
+        // on top and the incidentals sink below it.
+        let beaconsfield_terms = format!(
+            "{}{}{}",
+            " filler".repeat(12),
+            " beaconsfield".repeat(10),
+            " quebec".repeat(8)
+        );
+        let amateur_terms = format!("beaconsfield quebec attract{}", " filler".repeat(27));
+        let stanley_terms = format!("beaconsfield quebec attract{}", " filler".repeat(27));
+        let attract_filler = format!("attract{}", " filler".repeat(29));
+        let (server, _keep) = big_archive_test_server(
+            400,
+            &[
+                ("C/Beaconsfield,_Quebec", beaconsfield_terms, "Beaconsfield, Quebec", BEACONSFIELD_QUEBEC_HTML),
+                ("C/Canadian_Amateur_Championship", amateur_terms, "Canadian Amateur Championship", CANADIAN_AMATEUR_HTML),
+                ("C/Frederick_Stanley", stanley_terms, "Frederick Stanley", FREDERICK_STANLEY_HTML),
+                ("C/Attract_Filler_1", attract_filler.clone(), "Attract Filler 1", CANADIAN_AMATEUR_HTML),
+                ("C/Attract_Filler_2", attract_filler.clone(), "Attract Filler 2", CANADIAN_AMATEUR_HTML),
+                ("C/Attract_Filler_3", attract_filler.clone(), "Attract Filler 3", CANADIAN_AMATEUR_HTML),
+                ("C/Attract_Filler_4", attract_filler.clone(), "Attract Filler 4", CANADIAN_AMATEUR_HTML),
+                ("C/Attract_Filler_5", attract_filler.clone(), "Attract Filler 5", CANADIAN_AMATEUR_HTML),
+                ("C/Attract_Filler_6", attract_filler.clone(), "Attract Filler 6", CANADIAN_AMATEUR_HTML),
+                ("C/Attract_Filler_7", attract_filler.clone(), "Attract Filler 7", CANADIAN_AMATEUR_HTML),
+                ("C/Attract_Filler_8", attract_filler, "Attract Filler 8", CANADIAN_AMATEUR_HTML),
+            ],
+        );
+
+        let hits = search(&server, "beaconsfield quebec attractions");
+        assert_eq!(hits[0].path, "C/Beaconsfield,_Quebec", "{hits:?}");
+        assert_eq!(hits[0].title, "Beaconsfield, Quebec");
+        // The incidental documents (which carry the gated common word) rank
+        // behind the target, and the attract-only filler documents behind
+        // them.
+        let pos = |p: &str| {
+            hits.iter()
+                .position(|h| h.path == p)
+                .unwrap_or_else(|| panic!("{p} missing from {hits:?}"))
+        };
+        let amateur = pos("C/Canadian_Amateur_Championship");
+        let stanley = pos("C/Frederick_Stanley");
+        assert!(amateur > 0 && stanley > 0, "{hits:?}");
+        let first_filler = hits
+            .iter()
+            .position(|h| h.title.starts_with("Attract Filler"))
+            .unwrap_or(hits.len());
+        assert!(first_filler > amateur && first_filler > stanley, "{hits:?}");
     }
 
     #[test]
@@ -1281,8 +1485,9 @@ Meltwater streams out of the ice.
         let (server, _keep) = test_server();
 
         // The indexes have no spelling data, so a nonsense word matches
-        // nothing: the all-terms AND branch is empty, but the parsed OR
-        // branch still retrieves the results for the real word.
+        // nothing: on this tiny archive no term is specific, so there is no
+        // all-words branch at all, and the parsed OR query still retrieves
+        // the results for the real word.
         let hits = search(&server, "apple zzzzqq");
         assert!(!hits.is_empty(), "{hits:?}");
         assert_eq!(hits[0].path, "C/Apple", "{hits:?}");

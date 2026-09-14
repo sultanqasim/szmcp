@@ -78,6 +78,7 @@ mod ffi {
         pub fn xapian2_db_open(path: *const c_char, flags: c_int) -> *mut c_void;
         pub fn xapian2_db_open_fd(fd: c_int, flags: c_int) -> *mut c_void;
         pub fn xapian2_db_doccount(db: *mut c_void) -> u32;
+        pub fn xapian2_db_termfreq(db: *mut c_void, term: *const c_char, len: u32) -> u32;
         pub fn xapian2_db_get_document(db: *mut c_void, did: u32) -> *mut c_void;
         pub fn xapian2_db_compact(db: *mut c_void, output: *const c_char) -> c_int;
         pub fn xapian2_db_compact_single_file(db: *mut c_void, output: *const c_char) -> c_int;
@@ -421,6 +422,17 @@ impl Database {
     pub fn doc_count(&self) -> u32 {
         // SAFETY: the handle is valid for the lifetime of `self`.
         unsafe { ffi::xapian2_db_doccount(self.handle()) }
+    }
+
+    /// The number of documents in the database that index `term`
+    /// (`get_termfreq`, the term's document frequency); 0 for a term absent
+    /// from the index.
+    pub fn termfreq(&self, term: &str) -> u32 {
+        let bytes = term.as_bytes();
+        // SAFETY: `bytes` is a valid byte slice; the shim copies it.
+        unsafe {
+            ffi::xapian2_db_termfreq(self.handle(), bytes.as_ptr() as *const _, bytes.len() as u32)
+        }
     }
 
     /// Fetch the document with the given id.

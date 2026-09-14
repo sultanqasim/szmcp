@@ -9,9 +9,11 @@ browsers) or as one-shot CLI subcommands.
 ## Tools
 
 - **`zim_search`** — full-text search across all ZIM files. Multi-word queries
-  rank articles containing all the words higher, but partial matches are
-  still returned. Articles whose titles match the query words (found in the
-  archive's embedded title index) come right after exact title matches —
+  rank articles containing all of the query's distinctive words higher (a
+  word shared by more than ~1% of the archive's articles is not distinctive),
+  but partial matches are still returned. Articles whose titles match the
+  query words (found in the archive's embedded title index) come right after
+  exact title matches —
   titles containing all the query words before partial title matches —
   ahead of the body-text matches. Each result has the ZIM file name (relative to the ZIM
   directory), the article path, the title, and `preview` — the article's first
