@@ -109,134 +109,6 @@ fn is_hatnote(para: &str) -> bool {
         && !t[1..t.len() - 1].contains('*')
 }
 
-/// Plain-text preview of the start of a Markdown article: the paragraphs
-/// after the leading title line, until `max_chars` characters of text have
-/// been produced. The leading ATX heading is the article title - a separate
-/// field of every search hit - and is not emitted; emitting it as well made
-/// intros read "Photosynthesis Photosynthesis (/ˌfoʊtə... ) is ...". The
-/// rule is positional: a heading reached before any text has been emitted
-/// is the title and is skipped, a heading reached after that is content and
-/// keeps its text (only the leading title line is special). Headings lose
-/// their `#` markers, emphasis and inline-code markers are stripped,
-/// wikilinks become their text, list bullets and pipe-table cell separators
-/// vanish, fenced code blocks are skipped entirely, and raw HTML lines are
-/// handed to `intro_from_html` for tag stripping. Hatnote paragraphs
-/// (standalone paragraphs wrapped in single asterisks, how wikizim_parser
-/// renders "For other uses..." notes) are dropped, so the intro starts with
-/// the actual lead text. Whitespace collapses to single spaces; markup and
-/// whitespace never consume the character budget.
-///
-/// Not used by the search hit path anymore (`sections` shapes its text and
-/// also reports where in the article the query matched), but kept beside it:
-/// unlike `sections` it walks the document once and stops as soon as the
-/// budget is full, and it emits mid-document heading text, so rebuilding it
-/// on `sections` would change its observable behavior.
-#[allow(dead_code)]
-pub fn intro_from_markdown(md: &str, max_chars: usize) -> String {
-    let mut out = String::new();
-    let mut in_fence = false;
-    let mut lines = md.lines().peekable();
-    while let Some(line) = lines.next() {
-        if out.chars().count() >= max_chars {
-            break;
-        }
-        let t = line.trim_start();
-        if is_fence(t) {
-            in_fence = !in_fence;
-            continue;
-        }
-        if in_fence {
-            continue;
-        }
-        if t.is_empty() {
-            continue;
-        }
-        // Raw HTML block (a complex table, its styles): the HTML helpers
-        // strip tags and drop table/style content. Such blocks run to the
-        // next blank line, the way wikizim_parser emits them.
-        if t.starts_with('<') {
-            let mut block = String::from(line);
-            while let Some(next) = lines.peek() {
-                if next.trim().is_empty() {
-                    break;
-                }
-                block.push('\n');
-                block.push_str(next);
-                lines.next();
-            }
-            let text = html::intro_from_html(&block, max_chars.saturating_sub(out.chars().count()));
-            push_text(&mut out, &text, max_chars);
-            continue;
-        }
-        let level = heading_level(t);
-        if level > 0 {
-            // ATX heading: the `#` markers are markup, the text is content -
-            // except while no text has been emitted yet, when the heading is
-            // the article's leading title line (wikizim_parser opens every
-            // article with `# Title`, already reported as its own field of
-            // every search hit) and is skipped. Once text flows, headings
-            // are content, even another level-1 one.
-            if !out.is_empty() {
-                let text = strip_inline(t[level as usize..].trim_start());
-                push_text(&mut out, &text, max_chars);
-            }
-            continue;
-        }
-        if t.starts_with('|') {
-            // Pipe-table row: cells become text; a dash-only separator row
-            // is pure markup. Wikilinks are resolved first - their `|` is a
-            // label separator, not a cell boundary.
-            let row = strip_inline(t).replace('|', " ");
-            let row = row.trim();
-            if !row.is_empty() && !row.chars().all(|c| matches!(c, '-' | ':' | ' ')) {
-                push_text(&mut out, row, max_chars);
-            }
-            continue;
-        }
-        // List items: drop the bullet marker, keep the text. A body made
-        // only of dashes/colons carries no text.
-        if let Some(n) = list_marker_len(t) {
-            let body = &t[n..];
-            if !body.chars().all(|c| matches!(c, '-' | ':' | ' ')) {
-                let text = strip_inline(body);
-                push_text(&mut out, &text, max_chars);
-            }
-            continue;
-        }
-        // A plain paragraph: gather its remaining lines so a hatnote (see
-        // `is_hatnote`) can be skipped whole. Any special line - heading,
-        // list, table, fence, HTML, a textless dash row - ends the
-        // paragraph and is handled on its own turn through the loop.
-        let mut para = String::from(t);
-        while let Some(next) = lines.peek() {
-            let n = next.trim_start();
-            if n.is_empty()
-                || is_fence(n)
-                || heading_level(n) > 0
-                || n.starts_with('|')
-                || n.starts_with('<')
-                || list_marker_len(n).is_some()
-                || n.chars().all(|c| matches!(c, '-' | ':' | ' '))
-            {
-                break;
-            }
-            para.push('\n');
-            para.push_str(next);
-            lines.next();
-        }
-        // A line made only of dashes/colons (a thematic break) carries no text.
-        if para.chars().all(|c| matches!(c, '-' | ':' | ' ')) {
-            continue;
-        }
-        if is_hatnote(&para) {
-            continue;
-        }
-        let text = strip_inline(&para);
-        push_text(&mut out, &text, max_chars);
-    }
-    out.trim().to_string()
-}
-
 /// Append one cleaned paragraph to the list, capped at `max_para_chars`
 /// characters (whitespace collapses the way [`push_text`] collapses it).
 fn push_paragraph(paras: &mut Vec<String>, text: &str, max_para_chars: usize) {
@@ -248,7 +120,7 @@ fn push_paragraph(paras: &mut Vec<String>, text: &str, max_para_chars: usize) {
 }
 
 /// The cleaned paragraph texts of one Markdown region: each
-/// blank-line-separated block, cleaned the way `intro_from_markdown` cleans
+/// blank-line-separated block, cleaned the way paragraphs are cleaned everywhere in this module
 /// its text (wikilinks resolved, emphasis and inline-code markers stripped,
 /// hatnotes dropped, fenced blocks skipped, raw HTML blocks handed to
 /// `intro_from_html`), each capped at `max_para_chars`. Deeper headings
@@ -369,7 +241,7 @@ fn md_paragraphs(lines: &[&str], max_para_chars: usize) -> Vec<String> {
 /// `###`'s paragraphs belong to its own entry and to the enclosing `##`'s.
 /// The leading `# Title` heading is the article title - a separate field of
 /// every search hit - not a section: when the document opens with a
-/// heading, it is dropped (the positional rule `intro_from_markdown`
+/// heading, it is dropped (the positional rule documented on [`sections`]
 /// applies to that line) and the intro region runs from after it.
 pub fn sections(md: &str, max_para_chars: usize) -> Vec<(String, Vec<String>)> {
     let lines: Vec<&str> = md.lines().collect();
@@ -525,118 +397,6 @@ That is all.
 ";
 
     #[test]
-    fn intro_strips_markup_and_resolves_wikilinks() {
-        let intro = intro_from_markdown(CHEMISTRY, 400);
-        // The leading `# Chemistry` title line is not emitted (the title is
-        // a separate field of every search hit): the hatnote paragraph is
-        // dropped, so the intro starts with the actual article text - the
-        // bold article name inside the lead sentence is sentence text and
-        // stays.
-        assert!(
-            intro.starts_with("Chemistry is the scientific study of the matter and its properties"),
-            "{intro:?}"
-        );
-        assert!(!intro.contains("For other uses"), "{intro:?}");
-        // No markdown markup survives into the intro.
-        assert!(!intro.contains("**") && !intro.contains("[["), "{intro:?}");
-        assert!(!intro.contains('#'), "{intro:?}");
-        assert!(!intro.contains('*'), "{intro:?}");
-    }
-
-    #[test]
-    fn intro_excludes_the_leading_title_line() {
-        // The leading `# Title` line must not reach the intro: the title is
-        // a separate field of every search hit, and emitting it as well made
-        // intros read "Kyoto Kyoto is ...". A lead that does not start with
-        // the title word makes the rule observable.
-        let md = "# Kyoto\n\n*Not to be confused with [[Kyoto Prefecture]].*\n\n\
-                  It was the imperial capital of Japan for over a thousand years.\n";
-        let intro = intro_from_markdown(md, 200);
-        assert_eq!(intro, "It was the imperial capital of Japan for over a thousand years.");
-        // The hatnote following the title is still dropped.
-        assert!(!intro.contains("confused with"), "{intro:?}");
-    }
-
-    #[test]
-    fn intro_emits_mid_document_h1_headings() {
-        // Only the leading title line is special: a heading reached after
-        // text has been emitted is content and keeps its text, even a
-        // level-1 one.
-        let md = "# Doc\n\nLead text first.\n\n# Appendix\n\nTrailing note.\n";
-        let intro = intro_from_markdown(md, 200);
-        assert_eq!(intro, "Lead text first. Appendix Trailing note.");
-    }
-
-    #[test]
-    fn intro_skips_hatnotes() {
-        // Hatnotes are standalone paragraphs wrapped in single asterisks,
-        // possibly wrapped over several lines. Bold paragraphs do not match.
-        let md = "# X\n\n*For the village, see [[X (village)]].*\n\n\
-                  *A second hatnote\nwrapped over two lines.*\n\n\
-                  **X** is a thing of great importance.\n";
-        let intro = intro_from_markdown(md, 200);
-        assert_eq!(intro, "X is a thing of great importance.");
-
-        // Hatnotes further in (before a section) are dropped as well.
-        let md = "# Y\n\n**Y** leads here.\n\n## Section\n\n\
-                  *Main article: [[Something else]]*\n\nSection text follows.\n";
-        let intro = intro_from_markdown(md, 200);
-        assert_eq!(intro, "Y leads here. Section Section text follows.");
-    }
-
-    #[test]
-    fn intro_resolves_wikilink_forms() {
-        let md = "# T\n\nSee [[Earth's age]], [[Mean anomaly#Mean anomaly at epoch]], \
-                  [[Chemical_element]], [[Block (periodic table)#p-block|p-block]] \
-                  and [[[Helium|He]]] atoms.";
-        let intro = intro_from_markdown(md, 300);
-        assert_eq!(
-            intro,
-            "See Earth's age, Mean anomaly, Chemical element, p-block and [He] atoms."
-        );
-    }
-
-    #[test]
-    fn intro_skips_fences_and_separator_rows() {
-        let md = "# Code\n\n```rust\nlet x = 1;\n## not a heading\n```\n\n\
-                  | a | b |\n| --- | --- |\n| x | y |\n\n~~~\nfence two\n~~~\n\nAfter.";
-        let intro = intro_from_markdown(md, 200);
-        assert_eq!(intro, "a b x y After.");
-    }
-
-    #[test]
-    fn intro_strips_list_bullets() {
-        let md = "# KF\n\n- **[[Atomic number]] (Z)**: 8\n  - shells fill in order\n\
-                  1. ordered item\n";
-        let intro = intro_from_markdown(md, 200);
-        assert_eq!(intro, "Atomic number (Z): 8 shells fill in order ordered item");
-    }
-
-    #[test]
-    fn intro_feeds_html_blocks_through_the_html_helpers() {
-        // Tags and entities are handled by intro_from_html; a raw <table>
-        // block (what complex tables stay as) is skipped like in HTML pages.
-        let md = "# H\n\n<p>plain &amp; <b>bold</b></p>\n\n\
-                  <table>\n<tr><td>cells</td></tr>\n</table>\n\nAfter.";
-        let intro = intro_from_markdown(md, 100);
-        assert_eq!(intro, "plain & bold After.");
-    }
-
-    #[test]
-    fn intro_respects_char_limit() {
-        let intro = intro_from_markdown(CHEMISTRY, 10);
-        assert!(intro.chars().count() <= 10, "{intro:?}");
-    }
-
-    #[test]
-    fn intro_budget_ignores_markup() {
-        // Hundreds of separator rows (pure markup) must not crowd the real
-        // text out of the character budget.
-        let md = format!("# T\n\n{}\nreal text here", "| --- |\n".repeat(400));
-        assert_eq!(intro_from_markdown(&md, 20), "real text here");
-    }
-
-    #[test]
     fn section_extraction() {
         let (name, etym) = section_content(CHEMISTRY, "etymology").unwrap();
         assert_eq!(name, "Etymology");
@@ -748,6 +508,21 @@ That is all.
             assert!(!paras.iter().any(|p| p.contains('#')), "{name}: {paras:?}");
             assert!(!paras.iter().any(|p| p.contains("**") || p.contains("[[")), "{name}: {paras:?}");
         }
+    }
+
+    #[test]
+    fn sections_resolve_wikilink_forms() {
+        // Labels win over targets; bare targets lose their `#anchor` and
+        // read underscores as spaces; a literal bracket next to a link
+        // (`[[[Helium|He]]]`, electron-configuration notation) stays text.
+        let md = "# Doc\n\nSee [[Earth's age]], [[Mean anomaly#Mean anomaly at epoch]], \
+                  [[Chemical_element]], [[Block (periodic table)#p-block|p-block]] \
+                  and [[[Helium|He]]] atoms.";
+        let secs = sections(md, 300);
+        assert_eq!(
+            secs[0].1,
+            vec!["See Earth's age, Mean anomaly, Chemical element, p-block and [He] atoms.".to_string()]
+        );
     }
 
     #[test]
