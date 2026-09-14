@@ -184,6 +184,21 @@ pub struct Zim {
     mime_types: Vec<String>,
 }
 
+/// Uppercase the first character of `s` (the rest is left untouched).
+fn upper_first(s: &str) -> String {
+    let mut chars = s.chars();
+    match chars.next() {
+        Some(first) => first.to_uppercase().collect::<String>() + chars.as_str(),
+        None => String::new(),
+    }
+}
+
+/// Capitalize every '_'-separated word: "salt_lake_city" -> "Salt_Lake_City",
+/// the shape MediaWiki gives article URLs.
+fn title_case(s: &str) -> String {
+    s.split('_').map(upper_first).collect::<Vec<_>>().join("_")
+}
+
 #[inline]
 fn u16le(b: &[u8]) -> u16 {
     u16::from_le_bytes([b[0], b[1]])
@@ -598,6 +613,53 @@ impl Archive {
         };
         *guard = Some(db.clone());
         Ok(Some(db))
+    }
+
+    /// Exact-match `query` against the ZIM directory itself (not the search
+    /// index): the query is interpreted as an article URL (spaces become
+    /// underscores, plus case variants, since callers cannot know the
+    /// archive's exact casing) or as an explicit path ("C/Chemistry").
+    ///
+    /// Returns the entry's own full path and its directory title (often
+    /// empty in modern openZIM archives - callers apply fallbacks).
+    /// Redirects are deliberately NOT followed: a redirect is a legitimate
+    /// exact match, and redirect entries exist only in the directory, never
+    /// in the full-text index - so this lookup is the only way a query that
+    /// names a redirect finds it.
+    pub fn lookup_exact(&self, query: &str) -> io::Result<Option<(String, String)>> {
+        let base = query.trim().replace(' ', "_");
+        if base.is_empty() {
+            return Ok(None);
+        }
+        let lower = base.to_lowercase();
+        // Candidates in probe order: the query as typed first (an exact URL
+        // or path match must not be shadowed by case variants), then the
+        // case shapes an article URL might use.
+        let mut candidates: Vec<String> = Vec::new();
+        for candidate in [
+            base.clone(),
+            upper_first(&base),
+            upper_first(&lower),
+            title_case(&lower),
+            base.to_uppercase(),
+        ] {
+            if !candidates.contains(&candidate) {
+                candidates.push(candidate);
+            }
+        }
+        for candidate in &candidates {
+            if let Some(idx) = self.zim.resolve_path(candidate)? {
+                let entry = self.zim.get_entry(idx)?;
+                let path = full_path(&entry);
+                // `X/` entries are internal (embedded search indexes), not
+                // articles; a query that spells one out must not surface it.
+                if path.starts_with("X/") {
+                    continue;
+                }
+                return Ok(Some((path, entry.title)));
+            }
+        }
+        Ok(None)
     }
 
     /// Resolve `path` (following redirects) and read the article's content.

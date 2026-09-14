@@ -187,6 +187,20 @@ fn search_impl(library: &ZimLibrary, query: &str) -> Result<SearchResults, ToolE
         .parse_query(query)
         .map_err(|e| ToolError::InvalidArgument(format!("failed to parse query: {e}")))?;
 
+    // Exact title/URL matches, found in the ZIM directory itself: redirects
+    // are not in the full-text index, and a query that names an article
+    // exactly must rank first no matter what BM25 produces. One probe per
+    // archive; a failed probe simply contributes nothing. The title falls
+    // back to the query (spaces restored) because modern openZIM archives
+    // leave directory-entry titles empty.
+    let mut merged: Vec<(&Arc<Archive>, String, String, bool)> = Vec::new();
+    for arc in &library.archives {
+        if let Some((path, title)) = arc.lookup_exact(query)? {
+            let title = if title.is_empty() { query.replace('_', " ") } else { title };
+            merged.push((arc, path, title, true));
+        }
+    }
+
     // Per-archive ranked hit lists: (weight, path, title from the index).
     // libzim stores the article title in Xapian value slot 0.
     let mut per_archive: Vec<(&Arc<Archive>, Vec<(f64, String, String)>)> = Vec::new();
@@ -221,14 +235,14 @@ fn search_impl(library: &ZimLibrary, query: &str) -> Result<SearchResults, ToolE
     // Xapian weights are computed from per-database statistics and are not
     // comparable across archives, so merge the archives' ranked lists by
     // rotation instead of by weight: every archive contributes its best
-    // match before any archive contributes its second best.
-    let mut merged: Vec<(&Arc<Archive>, String, String)> = Vec::new();
+    // match before any archive contributes its second best. Exact matches
+    // were already placed first in `merged`.
     let mut rank = 0usize;
     loop {
         let mut picked = false;
         for (arc, list) in &per_archive {
             if let Some((_, path, title)) = list.get(rank) {
-                merged.push((arc, path.clone(), title.clone()));
+                merged.push((arc, path.clone(), title.clone(), false));
                 picked = true;
             }
         }
@@ -241,23 +255,28 @@ fn search_impl(library: &ZimLibrary, query: &str) -> Result<SearchResults, ToolE
     // The same article is often present in several archives (e.g. an HTML
     // and a Markdown edition of the same ZIM): dedupe by normalized title
     // so each article is reported once, from the archive ranked first.
+    // Exact matches come first, so duplicates of them drop out here.
     let mut seen = std::collections::HashSet::new();
-    merged.retain(|(_, path, title)| {
+    merged.retain(|(_, path, title, _)| {
         let key = if title.is_empty() { path.as_str() } else { title.as_str() };
         seen.insert(html::normalize(key))
     });
     merged.truncate(SEARCH_LIMIT as usize);
 
     let mut hits = Vec::with_capacity(merged.len());
-    for (arc, path, idx_title) in &merged {
+    for (arc, path, idx_title, exact) in &merged {
         let (entry_title, mime, bytes) = match arc.article_preview(path, INTRO_READ_BYTES) {
             Ok(Some((entry_title, mime, bytes))) => (entry_title, mime, bytes),
             _ => (String::new(), None, Vec::new()),
         };
-        // Prefer the entry's own title; many openZIM archives leave the
+        // An exact match's title is already final - the redirect's own
+        // title, not the target's (which `entry_title` is). For the rest,
+        // prefer the entry's own title; many openZIM archives leave the
         // directory-entry title empty and only carry the title in the
         // index (which we already read as `idx_title`).
-        let title = if !entry_title.is_empty() {
+        let title = if *exact {
+            idx_title.clone()
+        } else if !entry_title.is_empty() {
             entry_title
         } else if !idx_title.is_empty() {
             idx_title.clone()
@@ -284,7 +303,7 @@ fn search_impl(library: &ZimLibrary, query: &str) -> Result<SearchResults, ToolE
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::zim::testutil::{build_archive, TestEntry};
+    use crate::zim::testutil::{build_archive, TestEntry, TestRedirect};
     use xapian2::{Document, WritableDatabase};
 
     const APPLE_HTML: &str = "<html><head><title>Apple</title></head><body>\
@@ -309,6 +328,22 @@ mod tests {
     const NITROGEN_HTML: &str = "<html><body><h1>Nitrogen</h1>\
         <p>Nitrogen is a colorless, odorless gas.</p>\
         </body></html>";
+
+    const ATMOSPHERE_HTML: &str = "<html><body><h1>Atmosphere</h1>\
+        <p>The atmosphere is mostly nitrogen and oxygen.</p>\
+        </body></html>";
+
+    const AERONAUTICS_HTML: &str = "<html><body><h1>Aeronautics</h1>\
+        <p>Aeronautics is the science of flight.</p>\
+        </body></html>";
+
+    fn search(server: &ZimMcpServer, query: &str) -> Vec<SearchHit> {
+        let params = serde_json::from_value::<ZimSearchParams>(
+            serde_json::json!({ "query": query }),
+        )
+        .unwrap();
+        ZimSearchTool::invoke(server, params).unwrap().results
+    }
 
     /// Build a single-file glass Xapian index, the way openZIM does: the
     /// document data is the article's full path inside the archive, the
@@ -425,13 +460,97 @@ mod tests {
         let library = Arc::new(ZimLibrary::scan(dir.path()).unwrap());
         let server = ZimMcpServer::new(library);
 
-        let params = serde_json::from_value::<ZimSearchParams>(
-            serde_json::json!({ "query": "nitrogen" }),
-        )
-        .unwrap();
-        let hits = ZimSearchTool::invoke(&server, params).unwrap().results;
+        // Not an exact title/URL match ("nitrogen gas" is nobody's title),
+        // so the hit comes from the full-text index: with the directory
+        // title empty, the title falls back to the index title (value slot
+        // 0). (The plain query "nitrogen" now resolves as an exact match.)
+        let hits = search(&server, "nitrogen gas");
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].title, "Nitrogen", "{hits:?}");
+    }
+
+    /// An archive where BM25 alone ranks the wrong article first: the
+    /// "Atmosphere" document repeats the term "nitrogen" seven times, so it
+    /// out-scores the "Nitrogen" article for the query "nitrogen". "NACA"
+    /// and "Usa" are redirects onto the Aeronautics article; redirect
+    /// entries live only in the directory, not in the search index.
+    fn exact_test_server() -> (ZimMcpServer, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        // Index terms are the stems the query parser produces ("atmosphere"
+        // -> "atmospher"), unprefixed, as libzim indexes with STEM_ALL.
+        let index = make_index(&[
+            ("C/Nitrogen", "nitrogen colorless odorless gas", "Nitrogen"),
+            ("C/Atmosphere", "nitrogen nitrogen nitrogen nitrogen nitrogen nitrogen nitrogen naca naca atmospher", "Atmosphere"),
+            ("C/Aeronautics", "aeronautics naca aviation wind tunnel flight", "Aeronautics"),
+        ]);
+        let content = [
+            TestEntry { namespace: b'C', url: "Nitrogen", title: "Nitrogen", mime: 0, body: NITROGEN_HTML.as_bytes() },
+            TestEntry { namespace: b'C', url: "Atmosphere", title: "Atmosphere", mime: 0, body: ATMOSPHERE_HTML.as_bytes() },
+            TestEntry { namespace: b'C', url: "Aeronautics", title: "Aeronautics", mime: 0, body: AERONAUTICS_HTML.as_bytes() },
+        ];
+        let redirects = [
+            TestRedirect { namespace: b'C', url: "NACA", title: "NACA", target_content: 2 },
+            // Empty directory title, as in modern openZIM archives.
+            TestRedirect { namespace: b'C', url: "Usa", title: "", target_content: 2 },
+        ];
+        let bytes = build_archive(&["text/html"], &content, &redirects, 0, Some(&index));
+        std::fs::write(dir.path().join("test.zim"), &bytes).unwrap();
+        let library = Arc::new(ZimLibrary::scan(dir.path()).unwrap());
+        (ZimMcpServer::new(library), dir)
+    }
+
+    #[test]
+    fn e2e_search_exact_title_ranks_first() {
+        let (server, _keep) = exact_test_server();
+
+        // "nitrogen" is exactly the title/URL of C/Nitrogen, yet BM25 ranks
+        // the Atmosphere document first (it repeats the term seven times):
+        // the exact match must come out on top.
+        let hits = search(&server, "nitrogen");
+        assert_eq!(hits[0].path, "C/Nitrogen", "{hits:?}");
+        assert_eq!(hits[0].title, "Nitrogen");
+        assert_eq!(hits[0].zim, "test.zim");
+        assert!(hits[0].intro.contains("colorless"), "{:?}", hits[0].intro);
+        // The BM25 runner-up is still reported, behind the exact match.
+        assert_eq!(hits[1].path, "C/Atmosphere", "{hits:?}");
+    }
+
+    #[test]
+    fn e2e_search_exact_redirect_title_ranks_first() {
+        let (server, _keep) = exact_test_server();
+
+        // "NACA" is a redirect (directory title "NACA") onto the Aeronautics
+        // article. Redirects are not in the full-text index, so without the
+        // directory lookup this query would report Atmosphere first (it
+        // mentions "naca" twice).
+        let hits = search(&server, "NACA");
+        assert_eq!(hits[0].path, "C/NACA", "{hits:?}");
+        assert_eq!(hits[0].title, "NACA");
+        // The intro is built from the redirect target's content.
+        assert!(hits[0].intro.contains("science of flight"), "{:?}", hits[0].intro);
+        // Fulltext hits follow in BM25 order.
+        assert_eq!(hits[1].path, "C/Atmosphere", "{hits:?}");
+        assert_eq!(hits[2].path, "C/Aeronautics", "{hits:?}");
+
+        // A redirect with an empty directory title: the query becomes the
+        // title, and the all-lowercase query still finds the redirect via
+        // the case variants of its URL.
+        let hits = search(&server, "usa");
+        assert_eq!(hits[0].path, "C/Usa", "{hits:?}");
+        assert_eq!(hits[0].title, "usa");
+    }
+
+    #[test]
+    fn e2e_search_query_without_exact_match_keeps_ranking() {
+        let (server, _keep) = exact_test_server();
+
+        // "nitrogen atmosphere" is nobody's title or URL, so the ranking is
+        // the unchanged BM25 order: the document containing both terms
+        // first, the one containing only "nitrogen" second.
+        let hits = search(&server, "nitrogen atmosphere");
+        assert_eq!(hits.len(), 2, "{hits:?}");
+        assert_eq!(hits[0].path, "C/Atmosphere", "{hits:?}");
+        assert_eq!(hits[1].path, "C/Nitrogen", "{hits:?}");
     }
 
     #[test]
