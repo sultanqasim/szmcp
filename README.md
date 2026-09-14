@@ -59,8 +59,8 @@ its first argument (folders are scanned recursively; chunked archives
 szmcp serve /path/to/zim-folder [--bind 127.0.0.1] [-p 3001]
 szmcp search /path/to/zim-folder "query"
 szmcp search /path/to/one-file.zim "query"
-szmcp get /path/to/zim-folder file.zim C/SomeArticle
-szmcp get_section /path/to/zim-folder file.zim C/SomeArticle "History"
+szmcp get /path/to/file.zim C/SomeArticle
+szmcp get_section /path/to/file.zim C/SomeArticle "History"
 ```
 
 - `serve` runs the MCP server. The endpoint is served at the root path
@@ -68,8 +68,9 @@ szmcp get_section /path/to/zim-folder file.zim C/SomeArticle "History"
   `127.0.0.1`), `-p`/`--port` the port (default `3001`).
 - `search`, `get` and `get_section` run the matching tool once and print its
   response JSON to stdout — the same JSON the MCP tool returns, without the
-  MCP wrapper. The ZIM file name is relative to the ZIM directory, as given
-  in search results. Errors go to stderr and exit non-zero.
+  MCP wrapper. `get` and `get_section` take the ZIM file itself — the archive
+  is identified by its own path; search results name ZIM files relative to
+  the scanned directory. Errors go to stderr and exit non-zero.
 
 ## Notes
 

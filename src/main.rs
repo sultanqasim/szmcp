@@ -48,19 +48,15 @@ enum Command {
     },
     /// Get the full content of an article from a ZIM file
     Get {
-        /// Path to a ZIM file or a folder containing ZIM files
+        /// Path to the ZIM file
         zim_path: PathBuf,
-        /// ZIM file name, relative to the ZIM directory (as given in search results)
-        zim: String,
         /// Path of the article inside the ZIM file
         path: String,
     },
     /// Get one section of an article from a ZIM file, by its heading text
     GetSection {
-        /// Path to a ZIM file or a folder containing ZIM files
+        /// Path to the ZIM file
         zim_path: PathBuf,
-        /// ZIM file name, relative to the ZIM directory (as given in search results)
-        zim: String,
         /// Path of the article inside the ZIM file
         path: String,
         /// Name of the section (heading text) to retrieve
@@ -85,6 +81,34 @@ fn open_library(zim_path: &Path) -> Result<Arc<zim::ZimLibrary>, String> {
     library.map(Arc::new)
 }
 
+/// Open the one ZIM file at `zim_path` for the `get`/`get_section`
+/// subcommands: there the archive is identified by its own path, so the
+/// argument must be a ZIM file - a directory would name several archives
+/// while the tool call looks up one article in one archive.
+fn open_single_zim(zim_path: &Path) -> Result<Arc<zim::ZimLibrary>, String> {
+    let path = std::fs::canonicalize(zim_path)
+        .map_err(|e| format!("Invalid ZIM path {}: {e}", zim_path.display()))?;
+    if path.is_dir() {
+        return Err(format!("expected a ZIM file, not a directory: {}", path.display()));
+    }
+    if !path.is_file() {
+        return Err(format!("{}: not a ZIM file", path.display()));
+    }
+    zim::ZimLibrary::single(&path)
+        .map_err(|e| format!("Failed to open ZIM file {}: {e}", zim_path.display()))
+        .map(Arc::new)
+}
+
+/// The name of the one archive a single-file library holds - the `zim`
+/// argument the tool pipelines expect.
+fn single_archive_name(library: &zim::ZimLibrary) -> Result<String, String> {
+    library
+        .archives
+        .first()
+        .map(|a| a.name.clone())
+        .ok_or_else(|| "no ZIM archive was loaded".to_string())
+}
+
 /// Print one tool response to stdout as pretty JSON - the same JSON the MCP
 /// tool returns, without the MCP wrapper. Nothing else may reach stdout.
 fn print_result<T: serde::Serialize>(result: &T) -> Result<(), String> {
@@ -100,13 +124,15 @@ async fn run(command: Command) -> Result<(), String> {
             let results = search(&library, &query).map_err(|e| e.to_string())?;
             print_result(&results)
         }
-        Command::Get { zim_path, zim, path } => {
-            let library = open_library(&zim_path)?;
+        Command::Get { zim_path, path } => {
+            let library = open_single_zim(&zim_path)?;
+            let zim = single_archive_name(&library)?;
             let result = get_article(&library, &zim, &path).map_err(|e| e.to_string())?;
             print_result(&result)
         }
-        Command::GetSection { zim_path, zim, path, section } => {
-            let library = open_library(&zim_path)?;
+        Command::GetSection { zim_path, path, section } => {
+            let library = open_single_zim(&zim_path)?;
+            let zim = single_archive_name(&library)?;
             let result = get_section(&library, &zim, &path, &section).map_err(|e| e.to_string())?;
             print_result(&result)
         }
@@ -195,4 +221,39 @@ async fn serve(zim_path: &Path, bind: String, port: u16) -> Result<(), String> {
     axum::serve(listener, app).await.map_err(|e| e.to_string())?;
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::zim::testutil::{build_archive, TestEntry};
+
+    #[test]
+    fn open_single_zim_rejects_directories() {
+        let dir = tempfile::tempdir().unwrap();
+        let canonical = std::fs::canonicalize(dir.path()).unwrap();
+        let Err(err) = open_single_zim(dir.path()) else {
+            panic!("a directory must be rejected");
+        };
+        assert!(err.contains("expected a ZIM file, not a directory"), "{err}");
+        assert!(err.contains(&canonical.display().to_string()), "{err}");
+    }
+
+    #[test]
+    fn open_single_zim_opens_a_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let content = [TestEntry {
+            namespace: b'C',
+            url: "Apple",
+            title: "Apple",
+            mime: 0,
+            body: b"<html><body><p>An apple is a fruit.</p></body></html>",
+        }];
+        let bytes = build_archive(&["text/html"], &content, &[], 0, None);
+        let file = dir.path().join("mini.zim");
+        std::fs::write(&file, &bytes).unwrap();
+        let library = open_single_zim(&file).unwrap();
+        assert_eq!(library.archives.len(), 1);
+        assert_eq!(library.archives[0].name, "mini.zim");
+    }
 }
