@@ -22,12 +22,16 @@ browsers) or as one-shot CLI subcommands.
   the title or the first intro paragraph.
   Use `zim` + `path` with `zim_get`/`zim_get_section`.
 - **`zim_get`** — get the full content of an article/page/object. Arguments:
-  the ZIM file name and the article path. Returns the title, final path (after
+  the ZIM file name and the article path — or an article title such as
+  `"Beaconsfield, Quebec"`, converted to its `C/` path (Wikipedia ZIMs);
+  a failed lookup reports the converted path, so the exact path from search
+  results can be retried. Returns the title, final path (after
   redirects), MIME type, and all of the content (UTF-8 text, or base64 for
   binary objects).
 - **`zim_get_section`** — get a single section of an article, identified by
   its heading text (e.g. `"History"`), or the special name `_intro` for the
-  introduction (the region before the first heading). Returns the page
+  introduction (the region before the first heading). The article is
+  addressed by its path or its title, as in `zim_get`. Returns the page
   title, the section name, and the section content.
 
 ## HTML and Markdown archives

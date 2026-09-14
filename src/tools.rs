@@ -135,7 +135,7 @@ impl AsyncTool<ZimMcpServer> for ZimSearchTool {
 pub struct ZimGetParams {
     /// ZIM file name, relative to the ZIM directory (as given in search results)
     pub zim: String,
-    /// Path of the article/page inside the ZIM file
+    /// Path of the article inside the ZIM file, or an article title such as "Beaconsfield, Quebec"
     pub path: String,
 }
 
@@ -152,9 +152,9 @@ impl ToolBase for ZimGetTool {
     fn description() -> Option<Cow<'static, str>> {
         Some(
             "Get the full content of an article or page from a ZIM file. Arguments: the ZIM file \
-             name and the article/page path (as returned by zim_search). Returns the title, \
-             final path, MIME type, and the full content (UTF-8 text, or base64 for binary \
-             objects)."
+             name, and the article/page path (as returned by zim_search) or an article title \
+             such as \"Beaconsfield, Quebec\". Returns the title, final path, MIME type, and the \
+             full content (UTF-8 text, or base64 for binary objects)."
                 .into(),
         )
     }
@@ -177,7 +177,7 @@ impl AsyncTool<ZimMcpServer> for ZimGetTool {
 pub struct ZimGetSectionParams {
     /// ZIM file name, relative to the ZIM directory (as given in search results)
     pub zim: String,
-    /// Path of the article/page inside the ZIM file
+    /// Path of the article inside the ZIM file, or an article title such as "Beaconsfield, Quebec"
     pub path: String,
     /// Name of the section to retrieve: heading text, or `_intro` for the
     /// introduction
@@ -198,8 +198,9 @@ impl ToolBase for ZimGetSectionTool {
         Some(
             "Get a single section of an article or page from a ZIM file, identified by its \
              heading text (e.g. \"History\"), or by the special name \"_intro\" for the \
-             introduction (the content before the first heading). Returns the page title, \
-             the section name, and the section's content."
+             introduction (the content before the first heading). The article is given by its \
+             path (as returned by zim_search) or its title (e.g. \"Beaconsfield, Quebec\"). \
+             Returns the page title, the section name, and the section's content."
                 .into(),
         )
     }

@@ -44,6 +44,29 @@ fn find_archive(library: &ZimLibrary, name: &str) -> Result<Arc<Archive>, ToolEr
 /// indexes), not article content, and can run to hundreds of megabytes.
 const MAX_ZIM_GET_BYTES: usize = 16 * 1024 * 1024;
 
+/// Normalize the `path` argument of the article lookups: a namespaced ZIM
+/// path (`C/Salt`, `A/Foo`, `-/x`) is returned unchanged, anything else is
+/// treated as a Wikipedia article title and mapped to the path layout
+/// Wikipedia ZIMs use: `"C/" + title with spaces replaced by underscores`.
+///
+/// A path is recognized by its shape: the first byte an ASCII letter or `-`
+/// and the second byte `/`. That keeps every explicit path working - legacy
+/// namespaces, the `-` namespace, and non-Wikipedia ZIMs' opaque URL paths -
+/// while bare titles (which never contain `/`) convert. The conversion
+/// cannot know an archive's exact path spelling, so a title must match the
+/// ZIM's path casing; if the lookup fails, the error reports the converted
+/// path and the caller can retry with the exact path from search results.
+fn article_path(raw: &str) -> String {
+    let bytes = raw.as_bytes();
+    if bytes.len() >= 2
+        && bytes[1] == b'/'
+        && (bytes[0].is_ascii_alphabetic() || bytes[0] == b'-')
+    {
+        return raw.to_string();
+    }
+    format!("C/{}", raw.replace(" ", "_"))
+}
+
 #[derive(Serialize, JsonSchema)]
 pub struct ZimGetResult {
     /// Page/article title
@@ -68,7 +91,9 @@ pub fn get_article(
     path: &str,
 ) -> Result<ZimGetResult, ToolError> {
     let arc = find_archive(library, zim)?;
-    let article = not_found_if_missing(arc.get_article(path))?;
+    // Accept a bare article title as well as a namespaced path.
+    let path = article_path(path);
+    let article = not_found_if_missing(arc.get_article(&path))?;
     if article.full_path.starts_with("X/") {
         return Err(ToolError::InvalidArgument(format!(
             "{} is an internal entry (embedded search index); article content lives under C/ or A/",
@@ -117,7 +142,11 @@ pub fn get_section(
     section: &str,
 ) -> Result<ZimGetSectionResult, ToolError> {
     let arc = find_archive(library, zim)?;
-    let article = not_found_if_missing(arc.get_article(path))?;
+    // Accept a bare article title as well as a namespaced path; converting
+    // first also makes the not-found / section errors below report the
+    // converted path.
+    let path = article_path(path);
+    let article = not_found_if_missing(arc.get_article(&path))?;
     let text = std::str::from_utf8(&article.bytes).map_err(|_| {
         ToolError::Internal(format!(
             "article content of {} is not UTF-8 text; section extraction requires text",
@@ -205,6 +234,85 @@ mod tests {
         )
         .unwrap();
         assert!(matches!(block_on(ZimGetTool::invoke(&server, params)), Err(ToolError::NotFound(_))));
+    }
+
+    #[test]
+    fn article_path_maps_titles_and_keeps_paths() {
+        // Titles convert to the C/ path layout Wikipedia ZIMs use.
+        assert_eq!(article_path("Beaconsfield, Quebec"), "C/Beaconsfield,_Quebec");
+        assert_eq!(article_path("Salt"), "C/Salt");
+        assert_eq!(
+            article_path("17α-Hydroxycorticosteroid"),
+            "C/17α-Hydroxycorticosteroid"
+        );
+        // Namespaced paths pass through unchanged: modern, legacy, and `-`.
+        assert_eq!(article_path("C/Salt"), "C/Salt");
+        assert_eq!(article_path("A/Foo"), "A/Foo");
+        assert_eq!(article_path("-/x"), "-/x");
+    }
+
+    #[test]
+    fn e2e_get_accepts_article_titles() {
+        let dir = tempfile::tempdir().unwrap();
+        let content = [
+            TestEntry {
+                namespace: b'C',
+                url: "Salt",
+                title: "Salt",
+                mime: 0,
+                body: b"<html><body><h1>Salt</h1><p>Salt is a mineral.</p>",
+            },
+            TestEntry {
+                namespace: b'C',
+                url: "Dishwasher_salt",
+                title: "Dishwasher salt",
+                mime: 0,
+                body: b"<html><body><h1>Dishwasher salt</h1><p>Dishwasher salt is coarse-grained.</p>",
+            },
+        ];
+        let bytes = build_archive(&["text/html"], &content, &[], 0, None);
+        std::fs::write(dir.path().join("salt.zim"), &bytes).unwrap();
+        let library = Arc::new(ZimLibrary::scan(dir.path()).unwrap());
+        let server = ZimMcpServer::new(library);
+
+        // A single-word title resolves to its C/ path.
+        let params = serde_json::from_value::<ZimGetParams>(
+            serde_json::json!({ "zim": "salt.zim", "path": "Salt" }),
+        )
+        .unwrap();
+        let result = block_on(ZimGetTool::invoke(&server, params)).unwrap();
+        assert_eq!(result.path, "C/Salt");
+        assert_eq!(result.title, "Salt");
+
+        // A multi-word title maps to the underscored path - a bare path
+        // containing a space could never resolve by itself.
+        let params = serde_json::from_value::<ZimGetParams>(
+            serde_json::json!({ "zim": "salt.zim", "path": "Dishwasher salt" }),
+        )
+        .unwrap();
+        let result = block_on(ZimGetTool::invoke(&server, params)).unwrap();
+        assert_eq!(result.path, "C/Dishwasher_salt");
+        assert_eq!(result.title, "Dishwasher salt");
+
+        // zim_get_section takes titles too.
+        let params = serde_json::from_value::<ZimGetSectionParams>(
+            serde_json::json!({ "zim": "salt.zim", "path": "Salt", "section": "_intro" }),
+        )
+        .unwrap();
+        let result = block_on(ZimGetSectionTool::invoke(&server, params)).unwrap();
+        assert_eq!(result.section, "_intro");
+        assert_eq!(result.title, "Salt");
+        assert!(result.content.contains("Salt is a mineral"), "{:?}", result.content);
+
+        // A title that matches nothing errors with the converted path.
+        let params = serde_json::from_value::<ZimGetParams>(
+            serde_json::json!({ "zim": "salt.zim", "path": "No Such Article" }),
+        )
+        .unwrap();
+        assert!(matches!(
+            block_on(ZimGetTool::invoke(&server, params)),
+            Err(ToolError::NotFound(msg)) if msg.contains("C/No_Such_Article")
+        ));
     }
 
     #[test]
