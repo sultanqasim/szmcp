@@ -603,10 +603,27 @@ fn trim_trailing_open_tag(s: &str) -> &str {
 /// level), then earliest, heading wins. Returns the heading's actual text
 /// plus the raw HTML fragment between that heading and the next
 /// same-or-higher-level heading, trimmed.
+///
+/// The reserved name [`INTRO_SECTION`] (matched like a heading name,
+/// case-insensitively) names no heading; it selects the article's
+/// introduction instead: the raw HTML of the intro region bounded by
+/// [`intro_region_end`] - exactly the region [`sections`] reports first, so
+/// the two can never disagree. It may carry hatnote or infobox markup, and
+/// it always exists (an article opening with a heading has an empty
+/// intro), so an empty region is returned as empty content, never `None`.
 pub fn section_content(html: &str, name: &str) -> Option<(String, String)> {
     let target = normalize(name);
     if target.is_empty() {
         return None;
+    }
+    // The reserved intro name can never match a heading text, so it is
+    // special-cased before the heading search.
+    if target == normalize(INTRO_SECTION) {
+        let body = article_body(html);
+        let headings = collect_headings(body);
+        let content = strip_style_script(&body[..intro_region_end(body, &headings)]);
+        let content = trim_trailing_open_tag(&content);
+        return Some((INTRO_SECTION.to_string(), content.trim().to_string()));
     }
     let headings = collect_headings(html);
     let best = headings
@@ -858,6 +875,33 @@ mod tests {
 
         assert!(section_content(WIKI, "Nope").is_none());
         assert!(section_content(WIKI, "").is_none());
+    }
+
+    #[test]
+    fn section_content_intro_region() {
+        // The reserved intro name returns the intro region: everything
+        // before the first h2, including the hatnote div (it is the
+        // region's HTML), with style/script stripped like any section.
+        let (name, intro) = section_content(WIKI, "_intro").unwrap();
+        assert_eq!(name, "_intro");
+        assert!(intro.contains("An <b>apple</b> is the fruit of &lt;rosaceae&gt; trees."), "{intro:?}");
+        assert!(intro.contains("This article is about the fruit"), "{intro:?}");
+        assert!(!intro.contains("var x"), "{intro:?}");
+        assert!(!intro.contains("p{}"), "{intro:?}");
+        // Bounded by the first heading, and the next section's heading
+        // wrapper is trimmed off the end like in a named section.
+        assert!(!intro.contains("grown for 10,000 years"), "{intro:?}");
+        assert!(!intro.contains("<h2"), "{intro:?}");
+        assert!(!intro.contains("mw-heading2"), "{intro:?}");
+
+        // Matched case-insensitively, like heading names.
+        assert!(section_content(WIKI, "_Intro").is_some());
+
+        // The introduction always exists: an article opening with a heading
+        // has an empty intro, not an error.
+        let (name, intro) = section_content("<h2>Only</h2><p>Body.</p>", "_intro").unwrap();
+        assert_eq!(name, "_intro");
+        assert_eq!(intro, "");
     }
 
     #[test]

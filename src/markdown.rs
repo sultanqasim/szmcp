@@ -354,6 +354,14 @@ fn collect_headings(lines: &[&str]) -> Vec<Heading> {
 /// the most prominent (lowest level), then earliest, heading wins. Returns
 /// the heading text as written plus the raw Markdown between that heading
 /// and the next heading of the same or higher level, trimmed.
+///
+/// The reserved name [`INTRO_SECTION`] (matched like a heading name,
+/// case-insensitively) names no heading; it selects the article's
+/// introduction instead: the raw Markdown from after the leading `# Title`
+/// line (dropped by the [`title_split`] rule, as in [`sections`], so the
+/// two agree on the intro's extent) to the first heading. The introduction
+/// always exists (an empty region is possible), so it is returned as empty
+/// content, never `None`.
 pub fn section_content(md: &str, name: &str) -> Option<(String, String)> {
     let target = normalize(name);
     if target.is_empty() {
@@ -361,6 +369,16 @@ pub fn section_content(md: &str, name: &str) -> Option<(String, String)> {
     }
     let lines: Vec<&str> = md.lines().collect();
     let headings = collect_headings(&lines);
+    // The reserved intro name can never match a heading text, so it is
+    // special-cased before the heading search.
+    if target == normalize(INTRO_SECTION) {
+        let (intro_start, first_section) = title_split(&lines, &headings);
+        let end = headings
+            .get(first_section)
+            .map_or(lines.len(), |h| h.line);
+        let content = lines[intro_start..end].join("\n");
+        return Some((INTRO_SECTION.to_string(), content.trim().to_string()));
+    }
     let best = headings
         .iter()
         .enumerate()
@@ -447,6 +465,41 @@ That is all.
 
         assert!(section_content(CHEMISTRY, "Nope").is_none());
         assert!(section_content(CHEMISTRY, "").is_none());
+    }
+
+    #[test]
+    fn section_content_intro_region() {
+        // The reserved intro name returns the region between the leading
+        // `# Title` line and the first heading: hatnote and lead paragraph,
+        // raw, under the reserved name.
+        let (name, intro) = section_content(CHEMISTRY, "_intro").unwrap();
+        assert_eq!(name, "_intro");
+        assert!(
+            intro.contains("*For other uses, see [[Chemistry (disambiguation)]]."),
+            "{intro:?}"
+        );
+        assert!(
+            intro.contains("**Chemistry** is the scientific study of the [[Matter|matter]]"),
+            "{intro:?}"
+        );
+        // From after the title line, to (not including) the first heading.
+        assert!(!intro.starts_with('#'), "{intro:?}");
+        assert!(!intro.contains("Etymology"), "{intro:?}");
+
+        // Matched case-insensitively, like heading names.
+        assert!(section_content(CHEMISTRY, "_Intro").is_some());
+
+        // Without a leading title heading, the intro starts at the first
+        // line.
+        let (_, intro) =
+            section_content("Plain lead.\n\n## Section\n\nBody.\n", "_intro").unwrap();
+        assert_eq!(intro, "Plain lead.");
+
+        // The introduction always exists: nothing between the title line
+        // and the first heading is an empty intro, not an error.
+        let (name, intro) = section_content("# Doc\n\n## Section\n\nBody.\n", "_intro").unwrap();
+        assert_eq!(name, "_intro");
+        assert_eq!(intro, "");
     }
 
     #[test]

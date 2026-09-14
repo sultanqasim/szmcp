@@ -1085,6 +1085,24 @@ Ancient India smelted zinc early.
         assert!(result.content.contains("ancient times"), "{:?}", result.content);
         assert!(result.content.contains("Ancient India smelted zinc early"));
 
+        // The reserved intro name: the Markdown between the leading title
+        // line and the first heading (hatnote and lead, raw), echoed as its
+        // reserved name.
+        let params = serde_json::from_value::<ZimGetSectionParams>(
+            serde_json::json!({ "zim": "md.zim", "path": "Zinc", "section": "_intro" }),
+        )
+        .unwrap();
+        let result = ZimGetSectionTool::invoke(&server, params).unwrap();
+        assert_eq!(result.section, "_intro");
+        assert!(
+            result.content.contains("For other uses, see [[Zinc (disambiguation)]]."),
+            "{:?}",
+            result.content
+        );
+        assert!(result.content.contains("with the symbol **Zn**"), "{:?}", result.content);
+        assert!(!result.content.starts_with('#'), "{:?}", result.content);
+        assert!(!result.content.contains("History"), "{:?}", result.content);
+
         // Missing section: same error shape as the HTML path.
         let params = serde_json::from_value::<ZimGetSectionParams>(
             serde_json::json!({ "zim": "md.zim", "path": "Zinc", "section": "Nope" }),
@@ -1188,6 +1206,21 @@ Ancient India smelted zinc early.
         let result = ZimGetSectionTool::invoke(&server, params).unwrap();
         assert_eq!(result.section, "Growth");
         assert!(result.content.contains("herbaceous plants"));
+
+        // The reserved intro name: the intro region (everything before the
+        // first heading), echoed as its reserved name.
+        let params = serde_json::from_value::<ZimGetSectionParams>(
+            serde_json::json!({ "zim": "test.zim", "path": "Apple", "section": "_intro" }),
+        )
+        .unwrap();
+        let result = ZimGetSectionTool::invoke(&server, params).unwrap();
+        assert_eq!(result.section, "_intro");
+        assert!(
+            result.content.contains("An <b>apple</b> is the fruit of"),
+            "{:?}",
+            result.content
+        );
+        assert!(!result.content.contains("10,000 years"), "{:?}", result.content);
 
         // Missing section.
         let params = serde_json::from_value::<ZimGetSectionParams>(
@@ -1297,7 +1330,8 @@ pub struct ZimGetSectionParams {
     pub zim: String,
     /// Path of the article/page inside the ZIM file
     pub path: String,
-    /// Name of the section (heading text) to retrieve
+    /// Name of the section to retrieve: heading text, or `_intro` for the
+    /// introduction
     pub section: String,
 }
 
@@ -1324,8 +1358,9 @@ impl ToolBase for ZimGetSectionTool {
     fn description() -> Option<Cow<'static, str>> {
         Some(
             "Get a single section of an article or page from a ZIM file, identified by its \
-             heading text (e.g. \"History\"). Returns the page title, the section name, and \
-             the section's content."
+             heading text (e.g. \"History\"), or by the special name \"_intro\" for the \
+             introduction (the content before the first heading). Returns the page title, \
+             the section name, and the section's content."
                 .into(),
         )
     }

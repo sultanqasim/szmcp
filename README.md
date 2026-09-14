@@ -23,8 +23,9 @@ browsers) or as one-shot CLI subcommands.
   redirects), MIME type, and all of the content (UTF-8 text, or base64 for
   binary objects).
 - **`zim_get_section`** — get a single section of an article, identified by
-  its heading text (e.g. `"History"`). Returns the page title, the section
-  name, and the section content.
+  its heading text (e.g. `"History"`), or the special name `_intro` for the
+  introduction (the region before the first heading). Returns the page
+  title, the section name, and the section content.
 
 ## HTML and Markdown archives
 
