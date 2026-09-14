@@ -1,5 +1,7 @@
+mod get;
 mod html;
 mod markdown;
+mod search;
 mod tools;
 mod zim;
 
