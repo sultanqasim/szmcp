@@ -131,7 +131,12 @@ impl Stemmer {
     /// (accents folded - see [`fold_accents`] - then lowercased Porter2
     /// stems). Hit-preview paragraph matching feeds raw article words
     /// through here, so the fold keeps them comparable with the folded
-    /// query terms (the index never saw the accents either).
+    /// query terms (the index never saw the accents either). The fold runs
+    /// only on a cache miss - the memoization dedupes it to once per
+    /// distinct word. Folding EVERY occurrence instead (cache hit or not)
+    /// was measured at 4.7x the search time on fr.zim ("cathédrale
+    /// notre-dame de paris" 9.7s against 2.0s): two Unicode normalization
+    /// passes over every word of every scanned paragraph are not free.
     fn stem(&mut self, word: &str) -> &str {
         if !self.cache.contains_key(word) {
             let folded = fold_accents(word);
@@ -139,6 +144,22 @@ impl Stemmer {
             self.cache.insert(word.to_string(), stemmed);
         }
         self.cache[word].as_str()
+    }
+
+    /// [`Stemmer::stem`] for the query path: those words arrive
+    /// accent-folded once in `search` (see [`fold_accents`]), so the fold
+    /// would be an identity pass and is skipped. Same cache, keyed on the
+    /// word as received - a raw article word that folds to the same form
+    /// stems to the same thing.
+    fn stem_folded(&mut self, folded: &str) -> &str {
+        if !self.cache.contains_key(folded) {
+            let stemmed = self
+                .stem
+                .apply(folded)
+                .unwrap_or_else(|_| folded.to_string());
+            self.cache.insert(folded.to_string(), stemmed);
+        }
+        self.cache[folded].as_str()
     }
 }
 
@@ -173,10 +194,12 @@ impl ArchiveQuery {
         let mut stemmer = Stemmer::new(&language).map_err(|e| {
             ToolError::Internal(format!("failed to create {language} stemmer: {}", e.msg()))
         })?;
+        // `query` arrives accent-folded (see `search`), so the tier words
+        // stem through the no-second-fold path (`stem_folded`).
         let title_words = title_words(query);
         let mut terms: Vec<String> = Vec::new();
         for word in &title_words {
-            let stemmed = stemmer.stem(word).to_string();
+            let stemmed = stemmer.stem_folded(word).to_string();
             if !terms.contains(&stemmed) {
                 terms.push(stemmed);
             }
@@ -218,17 +241,18 @@ pub fn search(library: &ZimLibrary, query: &str) -> Result<SearchResults, ToolEr
         return Err(ToolError::InvalidArgument("query must not be empty".into()));
     }
 
-    // Fold the query like the index text (see `fold_accents`): the parsed
-    // full-text query and the stemmed terms must use the index's folded
-    // vocabulary ("révolution" is indexed as "revolution"). The exact
-    // title/URL probe below still gets the raw query - article paths and
-    // directory titles carry their accents ("C/Université").
-    let folded_query = fold_accents(query);
     // Quoted phrases build OP_PHRASE subqueries, but the indexes carry no
     // positional data (libzim indexes `index_text_without_positions`), so
     // a phrase matches nothing and silently loses the whole full-text
     // band: strip the quotes and parse the words (BM25 OR over them).
-    let fulltext_query = folded_query.replace('"', " ");
+    // The accent fold (see `fold_accents`) is computed ONCE, over the
+    // quote-stripped query, and the SAME folded string serves every tier:
+    // `ArchiveQuery::build` tokenizes the title tier's words from it and
+    // parses the full-text query from it, so accented words reach Xapian's
+    // stemmer in the index's folded form ("révolution" -> "revolution").
+    // The exact title/URL probe below still gets the raw query - article
+    // paths and directory titles carry their accents ("C/Université").
+    let fulltext_query = fold_accents(&query.replace('"', " "));
 
     // Which tier produced a hit. Exact and title-tier hits are title
     // matches: their preview is the first intro sentence and `sections` is
@@ -874,6 +898,14 @@ Meltwater streams out of the ice.
         let plural = fr.stem("élections").to_string();
         assert_eq!(plural, fr.stem("élection"));
         assert_eq!(plural, "elect");
+        // The already-folded query path (see `search`): no fold pass, the
+        // same stems as the raw-word path (whose fold runs once per
+        // distinct word, on a cache miss only).
+        assert_eq!(fr.stem_folded("elections"), "elect");
+        assert_eq!(
+            fr.stem("Élections").to_string(),
+            fr.stem_folded("elections").to_string()
+        );
         // It still stems deeper than the English stemmer where the
         // languages genuinely diverge ("chevaux": French "cheval",
         // English leaves the word whole).
@@ -966,6 +998,57 @@ Meltwater streams out of the ice.
         // Nothing matches a term absent from the index.
         let hits = search(&server, "zzzzz");
         assert!(hits.is_empty());
+    }
+
+    /// An e2e proof that the FULLTEXT tier's parsed query is built from the
+    /// accent-FOLDED words (see `search`): the synthetic index is built the
+    /// way libzim builds a full-text index (`make_index_stemmed` folds
+    /// before stemming), so it carries ONLY folded French stems - the shape
+    /// measured on the extracted fr.zim full-text index ("revolu" df 11042,
+    /// "francais" 26817; the accented variants "révolution"/"français" df 0).
+    /// An unfolded parse would stem "révolution" to a term the index does
+    /// not carry, and this query would match nothing.
+    #[test]
+    fn e2e_search_fulltext_query_folds_accents() {
+        let dir = tempfile::tempdir().unwrap();
+        let index = make_index_stemmed(
+            Some("fra"),
+            &[(
+                "C/Révolution",
+                "la révolution française éclate en 1789 la monarchie est \
+                 renversée la république proclamée",
+                "Révolution",
+            )],
+        );
+        let html: &'static [u8] = "<html><body><h1>Révolution</h1>\
+            <p>La Révolution française éclate en 1789. La monarchie est \
+            renversée et la république proclamée.</p></body></html>".as_bytes();
+        let content = [
+            TestEntry { namespace: b'C', url: "Révolution", title: "Révolution", mime: 0, body: html },
+            language_metadata_entry("fra"),
+        ];
+        let bytes = build_archive(&["text/html"], &content, &[], 0, Some(&index));
+        std::fs::write(dir.path().join("fr.zim"), &bytes).unwrap();
+        let library = Arc::new(ZimLibrary::scan(dir.path()).unwrap());
+        let server = ZimMcpServer::new(library);
+
+        // Not an exact title/URL hit ("révolution française" is not the
+        // article's title/URL) and the archive has no title index, so the
+        // ONLY route to the article is the full-text tier - which matches
+        // only because the parsed query's words were folded first
+        // ("révolution" -> "revolution" -> the stem "revolu"; the index
+        // carries no "révolution"/"révolut" term, as on the real fr.zim).
+        let hits = search(&server, "révolution française");
+        assert_eq!(hits.len(), 1, "{hits:?}");
+        assert_eq!(hits[0].path, "C/Révolution");
+        // A full-text hit whose lead paragraph covers every query term:
+        // the whole two-sentence lead is the preview (a title-match
+        // preview would be the first sentence only).
+        assert_eq!(
+            hits[0].preview,
+            "La Révolution française éclate en 1789. La monarchie est renversée et la république proclamée."
+        );
+        assert_eq!(hits[0].sections, None);
     }
 
     #[test]
