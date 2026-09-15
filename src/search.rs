@@ -1,7 +1,8 @@
 //! The search pipeline behind the `zim_search` tool: three simple tiers
-//! (exact title/URL probe, all-words title match, full-text OR), ranked
-//! against the ZIM embedded Xapian indexes, merged across archives, and
-//! reported with per-hit previews.
+//! (exact title/URL probe, all-words title match, full-text OR over the
+//! words that are not the archive's background vocabulary), ranked against
+//! the ZIM embedded Xapian indexes, merged across archives, and reported
+//! with per-hit previews.
 
 use crate::html;
 use crate::markdown;
@@ -27,6 +28,22 @@ const HIT_READ_BYTES: u64 = 1024 * 1024;
 /// paragraphs keep matching far into their text. A paragraph chosen for
 /// reporting is truncated to `INTRO_CHARS` separately.
 const PARA_MATCH_CHARS: usize = 2000;
+/// A fulltext query word whose document frequency exceeds this fraction of
+/// the archive's documents is dropped from the FULLTEXT query (and only
+/// from it - the title tier keeps every word, and hit previews score every
+/// query term).
+///
+/// A word appearing in more than half the archive's documents is background
+/// vocabulary, not a query discriminator - English "the" (59% of the md1m
+/// fulltext index), "of" (63%), "and" (56%); French "de" (79% of fr.zim),
+/// "la" (74%), "un" (71%). It cannot separate the wanted articles from the
+/// rest, and BM25 - whose IDF already down-weights it - still floods the
+/// query with its huge postlist. This is the language-agnostic replacement
+/// for a stopword list: no hand-picked list works across languages, while
+/// the >50% document-frequency rule is computed from the archive itself and
+/// drops exactly the true background words of whatever language(s) the
+/// archive is written in.
+const FT_WORD_MAX_DF_FRAC: f64 = 0.5;
 
 /// One search result.
 #[derive(Serialize, JsonSchema, Debug)]
@@ -164,13 +181,18 @@ impl Stemmer {
 }
 
 /// One archive's view of a query (see [`search`]): the archive's stemmer,
-/// the query's terms stemmed with it, and the query parsed with the same
-/// stemmer. All three depend on the archive's language - libzim builds
-/// each archive's embedded index with the stemmer chosen from the
-/// archive's `Language` metadata, so querying a French archive with an
-/// English stemmer finds nothing (and vice versa).
+/// the query's words stemmed with it, and the resolved stemmer language.
+/// All of it depends on the archive's language - libzim builds each
+/// archive's embedded index with the stemmer chosen from the archive's
+/// `Language` metadata, so querying a French archive with an English
+/// stemmer finds nothing (and vice versa). The fulltext query is built per
+/// archive too ([`fulltext_query`], inside the search's pool closure): the
+/// words it keeps are decided by the archive's own document frequencies.
 struct ArchiveQuery {
     stemmer: Stemmer,
+    /// The archive's resolved stemmer language (see `build`): the stemmer
+    /// was created with it, and so is the fulltext query's parser.
+    language: String,
     /// Folded stems of the query's words (deduped, first-occurrence
     /// order): the hit previews' paragraph matching, scored against the
     /// archive's full-text vocabulary.
@@ -178,9 +200,19 @@ struct ArchiveQuery {
     /// The query's folded surface words (see [`title_words`]): the title
     /// tier's AND query, one term per word.
     title_words: Vec<String>,
-    /// The query parsed with the archive's stemmer (default op OR): the
-    /// full-text tier, plain BM25 over all query terms.
-    xquery: Query,
+    /// The folded query's whitespace tokens, as written (see `search`):
+    /// the fulltext query is parsed from the KEPT ones (see
+    /// [`FT_WORD_MAX_DF_FRAC`], [`fulltext_query`]). Tokens, not the title
+    /// tier's alphanumeric-only words, because the QueryParser tokenizes
+    /// intra-word punctuation itself - "notre-dame" must reach it whole,
+    /// or the hyphen fusion ("notredame") builds a term the index never
+    /// carries and the Cathédrale Notre-Dame article drops out of its own
+    /// query (measured).
+    ft_words: Vec<String>,
+    /// The stems of `ft_words`' alphanumeric-only forms, same order: the
+    /// df filter's lookup keys (the index's terms are folded Porter2
+    /// stems of such forms).
+    ft_stems: Vec<String>,
 }
 
 impl ArchiveQuery {
@@ -204,23 +236,96 @@ impl ArchiveQuery {
                 terms.push(stemmed);
             }
         }
-
-        // openZIM's full-text indexes contain unprefixed, accent-folded
-        // Porter2 stems (libzim indexes STEM_ALL over removeAccents'd
-        // text), so queries must be stemmed the same way - Xapian's default
-        // strategy would turn lowercase terms into "Z"-prefixed stem terms
-        // that never match. The query arrives accent-folded (see `search`),
-        // so the parser's unstemmed terms land in the index's folded
-        // vocabulary too. Default combining op is OR.
-        let mut qp = QueryParser::new()?;
-        qp.set_stemmer(&language)?;
-        qp.set_stemming_strategy(StemStrategy::All)?;
-        qp.set_default_op(Operator::Or)?;
-        let xquery = qp
-            .parse_query(query)
-            .map_err(|e| ToolError::InvalidArgument(format!("failed to parse query: {e}")))?;
-        Ok(Self { stemmer, terms, title_words, xquery })
+        // The fulltext tier's filterable words: the folded query's tokens
+        // as written, each paired with the stem of its alphanumeric-only
+        // form - what the archive's index carries, so what the df filter
+        // (see `fulltext_query`) looks up. A punctuation-only token ("-",
+        // "!" ... after the fold) has no alphanumeric form; its empty stem
+        // matches nothing, df 0, and the token is kept - the parser sees
+        // it, as it did before the filter existed.
+        let mut ft_words: Vec<String> = Vec::new();
+        let mut ft_stems: Vec<String> = Vec::new();
+        for token in query.split_whitespace() {
+            let bare: String = token
+                .chars()
+                .filter(|c| c.is_alphanumeric())
+                .collect::<String>()
+                .to_lowercase();
+            let stem = if bare.is_empty() {
+                String::new()
+            } else {
+                stemmer.stem_folded(&bare).to_string()
+            };
+            ft_words.push(token.to_string());
+            ft_stems.push(stem);
+        }
+        Ok(Self { stemmer, language, terms, title_words, ft_words, ft_stems })
     }
+}
+
+/// The fulltext query of one archive: `words` (the folded query's
+/// whitespace tokens, as written) minus background vocabulary, joined by
+/// single spaces and parsed by the QueryParser exactly as the whole query
+/// was parsed before the filter existed (the archive-language stemmer,
+/// `STEM_ALL`, default op OR).
+///
+/// A word whose document frequency in THIS archive's fulltext index is more
+/// than [`FT_WORD_MAX_DF_FRAC`] of the archive's document count is dropped:
+/// a word matching half the archive is background vocabulary ("the", French
+/// "de"), not a query discriminator. The dfs come off the archive's own
+/// fulltext handle (`Database::doc_count` + `Database::termfreq` on the
+/// STEMS in `stems` - the index's terms are folded Porter2 stems), so the
+/// kept set differs per archive: the query is per archive in a second way
+/// (the stemmer language was the first). That is also why the parse happens
+/// here, inside `search`'s pool closure, instead of in
+/// `ArchiveQuery::build` - the handle exists only there.
+///
+/// Returns `None` when EVERY word is dropped (the query "the" against an
+/// archive where "the" is 59% of the documents): the caller skips the
+/// fulltext band, and the exact/title tiers serve the results.
+///
+/// What is lost: the raw query's boolean syntax. The kept words are
+/// lowercased query words, so AND/OR/NOT/parentheses reach the parser as
+/// ordinary words - and the ultra-common operator words are usually dropped
+/// by the 50% rule anyway. (Uppercase operators had already lost their case
+/// to the accent fold - Xapian's operator keywords are case-sensitive, so
+/// "AND" has been an ordinary word on this tier since c8fb6d4; the filter
+/// only adds the drop.) Quotes were already stripped (see `search`).
+fn fulltext_query(
+    words: &[String],
+    stems: &[String],
+    language: &str,
+    fulltext: &xapian2::Database,
+) -> Result<Option<Query>, ToolError> {
+    let doc_count = fulltext.doc_count();
+    let kept: Vec<&str> = words
+        .iter()
+        .zip(stems)
+        // Not MORE than half the archive: kept. Exactly half can still
+        // discriminate, barely.
+        .filter(|(_, stem)| {
+            fulltext.termfreq(stem) as f64 <= FT_WORD_MAX_DF_FRAC * doc_count as f64
+        })
+        .map(|(word, _)| word.as_str())
+        .collect();
+    if kept.is_empty() {
+        return Ok(None);
+    }
+    // openZIM's full-text indexes contain unprefixed, accent-folded
+    // Porter2 stems (libzim indexes STEM_ALL over removeAccents'd text),
+    // so queries must be stemmed the same way - Xapian's default strategy
+    // would turn lowercase terms into "Z"-prefixed stem terms that never
+    // match. The words arrive accent-folded (see `search`), so the
+    // parser's terms land in the index's folded vocabulary too. Default
+    // combining op is OR.
+    let mut qp = QueryParser::new()?;
+    qp.set_stemmer(language)?;
+    qp.set_stemming_strategy(StemStrategy::All)?;
+    qp.set_default_op(Operator::Or)?;
+    let xquery = qp
+        .parse_query(&kept.join(" "))
+        .map_err(|e| ToolError::InvalidArgument(format!("failed to parse query: {e}")))?;
+    Ok(Some(xquery))
 }
 
 /// A display title derived from an article path: the namespace prefix
@@ -247,12 +352,15 @@ pub fn search(library: &ZimLibrary, query: &str) -> Result<SearchResults, ToolEr
     // band: strip the quotes and parse the words (BM25 OR over them).
     // The accent fold (see `fold_accents`) is computed ONCE, over the
     // quote-stripped query, and the SAME folded string serves every tier:
-    // `ArchiveQuery::build` tokenizes the title tier's words from it and
-    // parses the full-text query from it, so accented words reach Xapian's
-    // stemmer in the index's folded form ("révolution" -> "revolution").
-    // The exact title/URL probe below still gets the raw query - article
-    // paths and directory titles carry their accents ("C/Université").
-    let fulltext_query = fold_accents(&query.replace('"', " "));
+    // `ArchiveQuery::build` tokenizes both tiers' words from it, so
+    // accented words reach Xapian's stemmer in the index's folded form
+    // ("révolution" -> "revolution"). The full-text tier parses the KEPT
+    // words per archive (see `fulltext_query`) - background vocabulary is
+    // an archive-local judgment, made on the archive's own document
+    // frequencies inside the pool closure below. The exact title/URL probe
+    // still gets the raw query - article paths and directory titles carry
+    // their accents ("C/Université").
+    let folded_query = fold_accents(&query.replace('"', " "));
 
     // Which tier produced a hit. Exact and title-tier hits are title
     // matches: their preview is the first intro sentence and `sections` is
@@ -277,7 +385,7 @@ pub fn search(library: &ZimLibrary, query: &str) -> Result<SearchResults, ToolEr
     let mut queries: Vec<ArchiveQuery> = library
         .archives
         .iter()
-        .map(|arc| ArchiveQuery::build(arc, &fulltext_query))
+        .map(|arc| ArchiveQuery::build(arc, &folded_query))
         .collect::<Result<_, ToolError>>()?;
 
     // Tier 1 - exact title/URL matches, found in the ZIM directory itself:
@@ -308,22 +416,22 @@ pub fn search(library: &ZimLibrary, query: &str) -> Result<SearchResults, ToolEr
     // queries are the one-word AND. The band is skipped for archives
     // without a title index and queries with no usable words.
     //
-    // Tier 3 - the full-text tier is the parsed query alone: plain BM25
-    // OR over all query terms. Xapian's BM25 weights every term by its
-    // document frequency, so the common words cannot out-rank the rare
-    // ones that identify the topic; no all-words AND branch is layered
-    // on top.
+    // Tier 3 - the full-text tier is the parsed query over the KEPT words:
+    // plain BM25 OR, after words matching more than half the archive's
+    // documents were dropped as background vocabulary (`FT_WORD_MAX_DF_FRAC`,
+    // `fulltext_query` - the language-agnostic replacement for a stopword
+    // list). BM25's IDF still down-weights the merely common words, and no
+    // all-words AND branch is layered on top (both deleted in e98568c - the
+    // hand-rolled AND double-counted every document that matched it).
     let mut title_lists: Vec<(&Arc<Archive>, Vec<(String, String)>)> = Vec::new();
     // Full-text tier: (weight, path, title from the index).
     let mut per_archive: Vec<(&Arc<Archive>, Vec<(f64, String, String)>)> = Vec::new();
     for (arc, query_state) in library.archives.iter().zip(queries.iter_mut()) {
-        let title_words = &query_state.title_words;
-        let xquery = &query_state.xquery;
         let Some((title_list, list)) = arc.with_xapian(|h| -> Result<_, ToolError> {
             let mut title_list = Vec::new();
-            if !title_words.is_empty() {
+            if !query_state.title_words.is_empty() {
                 if let Some(title_db) = &h.title {
-                    let and_query = combine_terms(Operator::And, title_words)?;
+                    let and_query = combine_terms(Operator::And, &query_state.title_words)?;
                     let mut enquire = Enquire::new(title_db)?;
                     enquire.set_sort_by_relevance();
                     enquire.set_query(&and_query)?;
@@ -356,9 +464,20 @@ pub fn search(library: &ZimLibrary, query: &str) -> Result<SearchResults, ToolEr
                 }
             }
 
-            // The full-text tier: plain BM25 over the parsed query.
+            // The full-text tier: plain BM25 over the parsed query, built
+            // HERE inside the pool closure because the background-vocabulary
+            // filter reads the archive's own fulltext index (document
+            // frequencies - see `fulltext_query`). `None` - every query word
+            // is background vocabulary on THIS archive ("the" at 59% of
+            // md1m) - skips the band: the exact/title tiers still serve
+            // results.
+            let Some(xquery) =
+                fulltext_query(&query_state.ft_words, &query_state.ft_stems, &query_state.language, &h.fulltext)?
+            else {
+                return Ok((title_list, Vec::new()));
+            };
             let mut enquire = Enquire::new(&h.fulltext)?;
-            enquire.set_query(xquery)?;
+            enquire.set_query(&xquery)?;
             enquire.set_sort_by_relevance();
             let mset = enquire.get_mset(0, SEARCH_LIMIT, 0)?;
             let mut list = Vec::with_capacity(mset.size() as usize);
@@ -1013,18 +1132,37 @@ Meltwater streams out of the ice.
         let dir = tempfile::tempdir().unwrap();
         let index = make_index_stemmed(
             Some("fra"),
-            &[(
-                "C/Révolution",
-                "la révolution française éclate en 1789 la monarchie est \
-                 renversée la république proclamée",
-                "Révolution",
-            )],
+            &[
+                (
+                    "C/Révolution",
+                    "la révolution française éclate en 1789 la monarchie est \
+                     renversée la république proclamée",
+                    "Révolution",
+                ),
+                // Fillers: a one-document index makes every term 100%-df,
+                // which the fulltext query's background-vocabulary filter
+                // (FT_WORD_MAX_DF_FRAC) drops - this query would match
+                // nothing. Three documents keep the query words at 33% and
+                // the folded-parse proof below unchanged.
+                (
+                    "C/Géographie",
+                    "la géographie étudie les paysages et les reliefs de la terre",
+                    "Géographie",
+                ),
+                (
+                    "C/École",
+                    "une école primaire accueille les enfants du village",
+                    "École",
+                ),
+            ],
         );
         let html: &'static [u8] = "<html><body><h1>Révolution</h1>\
             <p>La Révolution française éclate en 1789. La monarchie est \
             renversée et la république proclamée.</p></body></html>".as_bytes();
         let content = [
             TestEntry { namespace: b'C', url: "Révolution", title: "Révolution", mime: 0, body: html },
+            TestEntry { namespace: b'C', url: "Géographie", title: "Géographie", mime: 0, body: "<html><body><h1>Géographie</h1><p>La géographie étudie les paysages.</p></body></html>".as_bytes() },
+            TestEntry { namespace: b'C', url: "École", title: "École", mime: 0, body: "<html><body><h1>École</h1><p>Une école primaire accueille les enfants.</p></body></html>".as_bytes() },
             language_metadata_entry("fra"),
         ];
         let bytes = build_archive(&["text/html"], &content, &[], 0, Some(&index));
@@ -1049,6 +1187,99 @@ Meltwater streams out of the ice.
             "La Révolution française éclate en 1789. La monarchie est renversée et la république proclamée."
         );
         assert_eq!(hits[0].sections, None);
+    }
+
+    /// The fulltext tier's background-vocabulary filter ([`fulltext_query`],
+    /// [`FT_WORD_MAX_DF_FRAC`]), white-box: a word in MORE than half the
+    /// archive's documents is dropped from the parsed fulltext query, a word
+    /// in at most half is kept, and a query of ONLY background words yields
+    /// `None` (the caller skips the band; exact/title still serve results).
+    /// Fixture via the raw `WritableDatabase` (the same shape `make_index`
+    /// builds): 10 documents, "commonword" in 6 (60%), "halfword" in 5
+    /// (exactly 50%), "rarea"/"rareb" in one each, "middling" in 2. The
+    /// terms are the STEMS - what the filter looks up (the index's terms are
+    /// folded Porter2 stems) and what the STEM_ALL parser produces.
+    #[test]
+    fn fulltext_query_drops_words_over_half_the_archive() {
+        let mut stemmer = Stemmer::new(&resolve_stem_language("en")).unwrap();
+        let s_common = stemmer.stem_folded("commonword").to_string();
+        let s_half = stemmer.stem_folded("halfword").to_string();
+        let s_rarea = stemmer.stem_folded("rarea").to_string();
+        let s_rareb = stemmer.stem_folded("rareb").to_string();
+        let s_middling = stemmer.stem_folded("middling").to_string();
+        let dir = tempfile::tempdir().unwrap();
+        let db_dir = dir.path().join("db");
+        {
+            let mut wdb = WritableDatabase::create(&db_dir).unwrap();
+            for i in 0..10 {
+                let mut doc = Document::new().unwrap();
+                doc.set_data(format!("C/D{i}")).unwrap();
+                if i < 6 {
+                    doc.add_term(&s_common, 1).unwrap();
+                }
+                if i < 5 {
+                    doc.add_term(&s_half, 1).unwrap();
+                }
+                if i == 6 {
+                    doc.add_term(&s_rarea, 1).unwrap();
+                }
+                if i == 7 {
+                    doc.add_term(&s_rareb, 1).unwrap();
+                }
+                if i >= 8 {
+                    doc.add_term(&s_middling, 1).unwrap();
+                }
+                wdb.add_document(&doc).unwrap();
+            }
+            wdb.commit().unwrap();
+        }
+        let db = xapian2::Database::open(&db_dir).unwrap();
+        assert_eq!(db.doc_count(), 10);
+
+        // Run a built query and return the matched documents' paths, sorted.
+        let matches = |q: &Query| -> Vec<String> {
+            let mut enquire = Enquire::new(&db).unwrap();
+            enquire.set_query(q).unwrap();
+            enquire.set_sort_by_relevance();
+            let mset = enquire.get_mset(0, 10, 0).unwrap();
+            let mut out = Vec::new();
+            for j in 0..mset.size() {
+                out.push(mset.document(j).unwrap().data_str().unwrap());
+            }
+            out.sort();
+            out
+        };
+        let words = |ws: &[&str]| ws.iter().map(|w| w.to_string()).collect::<Vec<String>>();
+        let query = |ws: &[&str], stems: &[String]| fulltext_query(&words(ws), stems, "en", &db);
+
+        // 6 of 10 documents (60% > 50%): "commonword" is dropped, "rarea"
+        // (10%) kept - the parsed query matches ONLY the rarea document
+        // (the unfiltered OR would match 7).
+        let q = query(&["commonword", "rarea"], &[s_common.clone(), s_rarea.clone()])
+            .unwrap()
+            .unwrap();
+        assert_eq!(matches(&q), vec!["C/D6"]);
+
+        // 5 of 10 is exactly half, not MORE than half: kept - the parsed
+        // query matches its 5 documents.
+        let q = query(&["halfword"], &[s_half.clone()]).unwrap().unwrap();
+        assert_eq!(matches(&q).len(), 5);
+
+        // 2 of 10 (20%): kept, next to the dropped common word.
+        let q = query(&["commonword", "middling"], &[s_common.clone(), s_middling.clone()])
+            .unwrap()
+            .unwrap();
+        assert_eq!(matches(&q), vec!["C/D8", "C/D9"]);
+
+        // Both rare words kept: the OR matches both.
+        let q = query(&["rarea", "rareb"], &[s_rarea.clone(), s_rareb.clone()])
+            .unwrap()
+            .unwrap();
+        assert_eq!(matches(&q), vec!["C/D6", "C/D7"]);
+
+        // EVERY word is background vocabulary: no fulltext query at all.
+        let q = query(&["commonword"], &[s_common.clone()]).unwrap();
+        assert!(q.is_none());
     }
 
     #[test]
@@ -1188,6 +1419,14 @@ Meltwater streams out of the ice.
         let index = make_index(&[
             ("C/Nitrogen_Gas_Effects", "nitrogen gas surround effect unavoid", "Nitrogen Gas Effects"),
             ("C/Weather", "weather forecast describ effect air pressur gas law explan atmospher", "Weather"),
+            // Fillers: on the two-document index above, "effect" and "gas"
+            // (shared by both documents) are 100%-df background words, which
+            // the fulltext query's filter (FT_WORD_MAX_DF_FRAC) drops - and
+            // the "Weather" fulltext hit below would vanish. Four documents
+            // hold the shared words at exactly 50%: kept (the rule drops
+            // only MORE than half the archive).
+            ("C/Banana", "banana tree tall herbaceou plant growth", "Banana"),
+            ("C/Glacier", "glacier ice dens movem weight flow", "Glacier"),
         ]);
         let titles = make_index(&[
             ("C/Nitrogen_Gas_Effects", "effects of nitrogen gas", "Effects of Nitrogen Gas"),
@@ -1203,6 +1442,8 @@ Meltwater streams out of the ice.
             TestEntry { namespace: b'C', url: "Nitrogen_Gas_Effects", title: "", mime: 0, body: NITROGEN_GAS_EFFECTS_HTML.as_bytes() },
             TestEntry { namespace: b'C', url: "Weather", title: "Weather", mime: 0, body: WEATHER_HTML.as_bytes() },
             TestEntry { namespace: b'C', url: "History_Of_Salt", title: "", mime: 0, body: b"<html><body><h1>History of Salt</h1><p>Salt has been traded for centuries.</p></body></html>" },
+            TestEntry { namespace: b'C', url: "Banana", title: "Banana", mime: 0, body: BANANA_HTML.as_bytes() },
+            TestEntry { namespace: b'C', url: "Glacier", title: "Glacier", mime: 0, body: b"<html><body><h1>Glacier</h1><p>A glacier is a body of dense ice.</p></body></html>" },
         ];
         let bytes = build_archive_indexes(&["text/html"], &content, &[], 0, Some(&index), Some(&titles));
         std::fs::write(dir.path().join("test.zim"), &bytes).unwrap();
@@ -1266,7 +1507,10 @@ Meltwater streams out of the ice.
         let index = make_index(&[
             ("C/New_York_City", "new york citi largest unit state", "New York City"),
             ("C/Quebec_City", "quebec citi capit provinc", "Quebec City"),
-            ("C/Kansas_City", "kansas citi straddl state", "Kansas City"),
+            // "kansa", not "kansas": the index terms are the STEMS the
+            // query parser produces (Porter2 strips the s), as libzim
+            // indexes them.
+            ("C/Kansas_City", "kansa citi straddl state", "Kansas City"),
             ("C/Mexico_City", "mexico citi capit", "Mexico City"),
             ("C/Weather", "weather forecast effect atmospher", "Weather"),
         ]);
@@ -1344,12 +1588,21 @@ Meltwater streams out of the ice.
             ("C/Physics2", "black hole graviti spacetime", "Black holes"),
             ("C/Movie1", "hole plot movi", "Holes"),
             ("C/Movie2", "movi film", "The Movie"),
+            // Fillers: on the four-document index above "hole" (the stem of
+            // both "hole" and "holes") covers 3 of 4 documents (>50%) - a
+            // background word the fulltext query's filter
+            // (FT_WORD_MAX_DF_FRAC) drops, and the body matches below would
+            // lose Movie1. Six documents hold it at exactly 50%: kept.
+            ("C/Banana", "banana tree tall herbaceou plant growth", "Banana"),
+            ("C/Glacier", "glacier ice dens movem weight flow", "Glacier"),
         ]);
         let content = [
             TestEntry { namespace: b'C', url: "Physics1", title: "", mime: 0, body: b"<html><body><h1>Black hole</h1><p>A black hole bends spacetime.</p></body></html>" },
             TestEntry { namespace: b'C', url: "Physics2", title: "", mime: 0, body: b"<html><body><h1>Black holes</h1><p>Black holes bend spacetime.</p></body></html>" },
             TestEntry { namespace: b'C', url: "Movie1", title: "", mime: 0, body: b"<html><body><h1>Holes</h1><p>The plot of Holes moves to a camp.</p></body></html>" },
             TestEntry { namespace: b'C', url: "Movie2", title: "", mime: 0, body: b"<html><body><h1>The Movie</h1><p>The movie film runs two hours.</p></body></html>" },
+            TestEntry { namespace: b'C', url: "Banana", title: "", mime: 0, body: BANANA_HTML.as_bytes() },
+            TestEntry { namespace: b'C', url: "Glacier", title: "", mime: 0, body: b"<html><body><h1>Glacier</h1><p>A glacier is a body of dense ice.</p></body></html>" },
         ];
         let bytes = build_archive_indexes(&["text/html"], &content, &[], 0, Some(&index), Some(&titles));
         std::fs::write(dir.path().join("test.zim"), &bytes).unwrap();
@@ -1401,11 +1654,18 @@ Meltwater streams out of the ice.
             ("C/Nitrogen", "nitrogen colorless odorless gas", "Nitrogen"),
             ("C/Atmosphere", "nitrogen nitrogen nitrogen nitrogen nitrogen nitrogen nitrogen naca naca atmospher", "Atmosphere"),
             ("C/Aeronautics", "aeronautics naca aviation wind tunnel flight", "Aeronautics"),
+            // Filler: on the three-document index above, "nitrogen" and
+            // "naca" each cover 2 of 3 documents (>50%) - background words
+            // the fulltext query's filter (FT_WORD_MAX_DF_FRAC) drops, and
+            // the BM25 runner-up assertions below need both words matched.
+            // Four documents hold both at exactly 50%: kept.
+            ("C/Weather", "weather forecast rain snow climat", "Weather"),
         ]);
         let content = [
             TestEntry { namespace: b'C', url: "Nitrogen", title: "Nitrogen", mime: 0, body: NITROGEN_HTML.as_bytes() },
             TestEntry { namespace: b'C', url: "Atmosphere", title: "Atmosphere", mime: 0, body: ATMOSPHERE_HTML.as_bytes() },
             TestEntry { namespace: b'C', url: "Aeronautics", title: "Aeronautics", mime: 0, body: AERONAUTICS_HTML.as_bytes() },
+            TestEntry { namespace: b'C', url: "Weather", title: "Weather", mime: 0, body: b"<html><body><h1>Weather</h1><p>Weather forecasts describe rain and snow.</p></body></html>" },
         ];
         let redirects = [
             TestRedirect { namespace: b'C', url: "NACA", title: "NACA", target_content: 2 },
@@ -1588,18 +1848,42 @@ Meltwater streams out of the ice.
         let dir = tempfile::tempdir().unwrap();
         // Index terms are the stems the query parser produces ("beds" ->
         // "bed"), unprefixed, as libzim indexes with STEM_ALL.
-        let index = make_index(&[(
-            "C/Salt",
-            "salt mineral chlorid sodium himalaya deposit rock bed form sea season food",
-            "Salt",
-        )]);
-        let content = [TestEntry {
-            namespace: b'C',
-            url: "Salt",
-            title: "Salt",
-            mime: 0,
-            body: SALT_HTML.as_bytes(),
-        }];
+        let index = make_index(&[
+            (
+                "C/Salt",
+                "salt mineral chlorid sodium himalaya deposit rock bed form sea season food",
+                "Salt",
+            ),
+            // Fillers: a one-document index makes "salt" 100%-df - a
+            // background word the fulltext query's filter
+            // (FT_WORD_MAX_DF_FRAC) drops, and both searches below would
+            // return nothing. Three documents keep the query words at 33%.
+            ("C/Banana", "banana tree tall herbaceou plant growth", "Banana"),
+            ("C/Glacier", "glacier ice dens movem weight flow", "Glacier"),
+        ]);
+        let content = [
+            TestEntry {
+                namespace: b'C',
+                url: "Salt",
+                title: "Salt",
+                mime: 0,
+                body: SALT_HTML.as_bytes(),
+            },
+            TestEntry {
+                namespace: b'C',
+                url: "Banana",
+                title: "Banana",
+                mime: 0,
+                body: BANANA_HTML.as_bytes(),
+            },
+            TestEntry {
+                namespace: b'C',
+                url: "Glacier",
+                title: "Glacier",
+                mime: 0,
+                body: b"<html><body><h1>Glacier</h1><p>A glacier is a body of dense ice.</p></body></html>",
+            },
+        ];
         let bytes = build_archive(&["text/html"], &content, &[], 0, Some(&index));
         std::fs::write(dir.path().join("test.zim"), &bytes).unwrap();
         let library = Arc::new(ZimLibrary::scan(dir.path()).unwrap());
@@ -1712,12 +1996,23 @@ Meltwater streams out of the ice.
             ("C/Dessert_Recipes", "cherri cherri pie pie", "Dessert Recipes"),
             ("C/Pie_1", pie_terms.as_str(), "Pie 1"),
             ("C/Pie_2", pie_terms.as_str(), "Pie 2"),
+            // Fillers: on the four-document index above "pie" covers 3 of 4
+            // documents (>50%) - a background word the fulltext query's
+            // filter (FT_WORD_MAX_DF_FRAC) drops, collapsing the query to
+            // "cherry", which the tf-30 "Cherry" document would outrank
+            // "Dessert_Recipes" on. Six documents hold "pie" at exactly
+            // 50%: kept (only MORE than half is dropped), and the OR
+            // ranking below is unchanged.
+            ("C/Mango", "mango tropic tree sweet", "Mango"),
+            ("C/Peach", "peach orchard stone fruit", "Peach"),
         ]);
         let content = [
             TestEntry { namespace: b'C', url: "Cherry", title: "Cherry", mime: 0, body: CHERRY_HTML.as_bytes() },
             TestEntry { namespace: b'C', url: "Dessert_Recipes", title: "Dessert Recipes", mime: 0, body: CHERRY_HTML.as_bytes() },
             TestEntry { namespace: b'C', url: "Pie_1", title: "Pie 1", mime: 0, body: CHERRY_HTML.as_bytes() },
             TestEntry { namespace: b'C', url: "Pie_2", title: "Pie 2", mime: 0, body: CHERRY_HTML.as_bytes() },
+            TestEntry { namespace: b'C', url: "Mango", title: "Mango", mime: 0, body: b"<html><body><h1>Mango</h1><p>A mango is a tropical stone fruit.</p></body></html>" },
+            TestEntry { namespace: b'C', url: "Peach", title: "Peach", mime: 0, body: b"<html><body><h1>Peach</h1><p>A peach grows in orchards.</p></body></html>" },
         ];
         let bytes = build_archive(&["text/html"], &content, &[], 0, Some(&index));
         std::fs::write(dir.path().join("test.zim"), &bytes).unwrap();
@@ -1817,18 +2112,42 @@ Meltwater streams out of the ice.
         // A library opened from one ZIM file (no folder scan) behaves like a
         // scanned folder: the archive is addressed by its file name.
         let dir = tempfile::tempdir().unwrap();
-        let index = make_index(&[(
-            "C/Salt",
-            "salt miner primari sodium chlorid himalaya deposit rock",
-            "Salt",
-        )]);
-        let content = [TestEntry {
-            namespace: b'C',
-            url: "Salt",
-            title: "Salt",
-            mime: 0,
-            body: SALT_HTML.as_bytes(),
-        }];
+        let index = make_index(&[
+            (
+                "C/Salt",
+                "salt miner primari sodium chlorid himalaya deposit rock",
+                "Salt",
+            ),
+            // Fillers: a one-document index makes "salt" 100%-df - a
+            // background word the fulltext query's filter
+            // (FT_WORD_MAX_DF_FRAC) drops, and the search below would
+            // return nothing. Three documents keep it at 33%.
+            ("C/Banana", "banana tree tall herbaceou plant growth", "Banana"),
+            ("C/Cherry", "cherri pie fruit tree", "Cherry"),
+        ]);
+        let content = [
+            TestEntry {
+                namespace: b'C',
+                url: "Salt",
+                title: "Salt",
+                mime: 0,
+                body: SALT_HTML.as_bytes(),
+            },
+            TestEntry {
+                namespace: b'C',
+                url: "Banana",
+                title: "Banana",
+                mime: 0,
+                body: BANANA_HTML.as_bytes(),
+            },
+            TestEntry {
+                namespace: b'C',
+                url: "Cherry",
+                title: "Cherry",
+                mime: 0,
+                body: CHERRY_HTML.as_bytes(),
+            },
+        ];
         let file = dir.path().join("one.zim");
         std::fs::write(&file, build_archive(&["text/html"], &content, &[], 0, Some(&index))).unwrap();
         let library = Arc::new(ZimLibrary::single(&file).unwrap());
@@ -1848,6 +2167,15 @@ Meltwater streams out of the ice.
         assert_eq!(result.title, "Salt");
         assert!(result.content.contains("sodium chloride"));
     }
+
+    /// A filler markdown article for fixtures that would otherwise carry a
+    /// one-document index (every word 100%-df, dropped by the fulltext
+    /// query's background-vocabulary filter).
+    const BANANA_MD: &str = "\
+# Banana
+
+A banana is a tall herbaceous plant.
+";
 
     /// An article in the shape wikizim_parser emits (`text/markdown`).
     const ZINC_MD: &str = "\
@@ -1869,14 +2197,37 @@ Ancient India smelted zinc early.
     #[test]
     fn e2e_search_and_section_markdown() {
         let dir = tempfile::tempdir().unwrap();
-        let index = make_index(&[("C/Zinc", "zinc chemic element symbol smelt ancient india", "Zinc")]);
-        let content = [TestEntry {
-            namespace: b'C',
-            url: "Zinc",
-            title: "Zinc",
-            mime: 0,
-            body: ZINC_MD.as_bytes(),
-        }];
+        let index = make_index(&[
+            ("C/Zinc", "zinc chemic element symbol smelt ancient india", "Zinc"),
+            // Fillers (same reason as e2e_search_and_get_single_file_library):
+            // a one-document index makes every word 100%-df, which the
+            // fulltext query's filter (FT_WORD_MAX_DF_FRAC) drops.
+            ("C/Banana", "banana tree tall herbaceou plant growth", "Banana"),
+            ("C/Glacier", "glacier ice dens movem weight flow", "Glacier"),
+        ]);
+        let content = [
+            TestEntry {
+                namespace: b'C',
+                url: "Zinc",
+                title: "Zinc",
+                mime: 0,
+                body: ZINC_MD.as_bytes(),
+            },
+            TestEntry {
+                namespace: b'C',
+                url: "Banana",
+                title: "Banana",
+                mime: 0,
+                body: BANANA_MD.as_bytes(),
+            },
+            TestEntry {
+                namespace: b'C',
+                url: "Glacier",
+                title: "Glacier",
+                mime: 0,
+                body: GLACIER_MD.as_bytes(),
+            },
+        ];
         let bytes = build_archive(&["text/markdown"], &content, &[], 0, Some(&index));
         std::fs::write(dir.path().join("md.zim"), &bytes).unwrap();
         let library = Arc::new(ZimLibrary::scan(dir.path()).unwrap());
