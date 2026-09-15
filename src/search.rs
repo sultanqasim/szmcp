@@ -96,14 +96,17 @@ fn fold_accents(text: &str) -> String {
         .collect()
 }
 
-/// The query's non-stopword terms, stemmed the way the ZIM full-text
-/// indexes were built (accent-folded, lowercased, unprefixed Porter2
-/// stems): split on whitespace, keep alphanumeric characters only per word,
-/// lowercase, drop stopwords, stem, dedupe (preserving first-occurrence
-/// order). The query text arrives accent-folded already (see `search`);
-/// the fold in [`Stemmer::stem`] is idempotent.
-fn query_terms(query: &str, stem: &mut Stemmer) -> Vec<String> {
-    let mut terms: Vec<String> = Vec::new();
+/// The query's words as (surface form, stem) pairs for the title-index
+/// band: split on whitespace, keep alphanumeric characters only per word,
+/// lowercase, drop stopwords, one pair per distinct word in
+/// first-occurrence order. The title index stores titles as written -
+/// lowercased, accent-folded surface forms (see `fold_accents`; measured on
+/// md1m: df("beatles")=186 against df("beatl")=0) - so the band must match
+/// each word by its surface form as well as by its stem. The query text
+/// arrives accent-folded already (see `search`); the fold in
+/// [`Stemmer::stem`] is idempotent.
+fn query_words(query: &str, stem: &mut Stemmer) -> Vec<(String, String)> {
+    let mut words: Vec<(String, String)> = Vec::new();
     for word in query.split_whitespace() {
         // Punctuation never appears in index terms either, so strip it.
         let word: String = word.chars().filter(|c| c.is_alphanumeric()).collect();
@@ -114,11 +117,11 @@ fn query_terms(query: &str, stem: &mut Stemmer) -> Vec<String> {
         // The index has no spelling data, so an unknown word just stems to
         // something that matches nothing; it cannot break anything here.
         let stemmed = stem.stem(&word).to_string();
-        if !terms.contains(&stemmed) {
-            terms.push(stemmed);
+        if !words.iter().any(|(w, _)| *w == word) {
+            words.push((word, stemmed));
         }
     }
-    terms
+    words
 }
 
 /// Combine `terms` (non-empty) with `op`, left to right; Xapian flattens
@@ -199,7 +202,13 @@ impl Stemmer {
 /// English stemmer finds nothing (and vice versa).
 struct ArchiveQuery {
     stemmer: Stemmer,
+    /// Folded stems of the query's non-stopword words: the all-words branch
+    /// of the full-text query (the full-text index is stemmed) and the hit
+    /// previews' paragraph matching.
     terms: Vec<String>,
+    /// The same words as (surface form, stem) pairs: the title-index band,
+    /// whose index stores surface word forms (see [`query_words`]).
+    title_words: Vec<(String, String)>,
     xquery: Query,
 }
 
@@ -214,7 +223,16 @@ impl ArchiveQuery {
         let mut stemmer = Stemmer::new(&language).map_err(|e| {
             ToolError::Internal(format!("failed to create {language} stemmer: {}", e.msg()))
         })?;
-        let terms = query_terms(query, &mut stemmer);
+        // The words drive two different vocabularies: the title index
+        // stores surface word forms, the full-text index unprefixed stems
+        // - the stems here are deduped preserving first-occurrence order.
+        let title_words = query_words(query, &mut stemmer);
+        let mut terms: Vec<String> = Vec::new();
+        for (_, stemmed) in &title_words {
+            if !terms.contains(stemmed) {
+                terms.push(stemmed.clone());
+            }
+        }
 
         // openZIM's full-text indexes contain unprefixed, accent-folded
         // Porter2 stems (libzim indexes STEM_ALL over removeAccents'd
@@ -230,7 +248,7 @@ impl ArchiveQuery {
         let xquery = qp
             .parse_query(query)
             .map_err(|e| ToolError::InvalidArgument(format!("failed to parse query: {e}")))?;
-        Ok(Self { stemmer, terms, xquery })
+        Ok(Self { stemmer, terms, title_words, xquery })
     }
 }
 
@@ -296,23 +314,32 @@ pub fn search(library: &ZimLibrary, query: &str) -> Result<SearchResults, ToolEr
     // concurrent calls on one database object).
     //
     // The title-index band queries the archive's title index (`X/title/xapian`;
-    // documents ARE titles: the same unprefixed stems as the full-text index,
-    // so the same `terms` match directly) in two sub-bands: for multi-word
-    // queries an AND over ALL the stemmed terms first (titles containing
-    // every query word), then the OR of the terms (partial title matches).
-    // Under the OR ranking alone, a title matching one ultra-common query
-    // word can outrank titles containing every word - the AND sub-band
-    // fixes the ordering inside the band. The band ranks its hits ahead of
-    // every full-text match - a title that says the whole query is far
-    // stronger evidence than body words - and is skipped for archives
-    // without a title index and queries with no usable terms.
+    // documents ARE titles) in two sub-bands: for multi-word queries an AND
+    // over ALL the query words first (titles containing every query word),
+    // then the OR of the words (partial title matches). Every word is
+    // matched by BOTH its surface form and its stem: the title index stores
+    // titles as written - lowercased, accent-folded surface forms (measured
+    // on md1m: df("beatles")=186 against df("beatl")=0) - so querying
+    // stems alone only ever matched stem=surface coincidences (the
+    // measured top EN defect), while the stem variant still reaches
+    // inflected titles ("black holes" finds "Black hole") and the stems
+    // libzim's STEM_SOME adds for uncapitalised title words (fr.zim title
+    // index: "revolution" df 328, its stem "revolu" df 1). A 0-df variant
+    // is harmless. Under the OR ranking alone, a title matching one
+    // ultra-common query word can outrank titles containing every word -
+    // the AND sub-band fixes the ordering inside the band. The band ranks
+    // its hits ahead of every full-text match - a title that says the whole
+    // query is far stronger evidence than body words - and is skipped for
+    // archives without a title index and queries with no usable terms.
     let mut title_lists: Vec<(&Arc<Archive>, Vec<(String, String)>)> = Vec::new();
     // Full-text band: (weight, path, title from the index).
     let mut per_archive: Vec<(&Arc<Archive>, Vec<(f64, String, String)>)> = Vec::new();
     for (arc, query_state) in library.archives.iter().zip(queries.iter_mut()) {
-        // This archive's query: its stemmed terms (title band + all-words
-        // branch + paragraph matching) and its parsed query (full text).
+        // This archive's query: its stemmed terms (all-words branch +
+        // paragraph matching), its per-word surface/stem pairs (title
+        // band), and its parsed query (full text).
         let terms = &query_state.terms;
+        let title_words = &query_state.title_words;
         let xquery = &query_state.xquery;
         // Paths already reported as exact title/URL matches for THIS archive:
         // the title band must not report them again (the skip below).
@@ -325,19 +352,38 @@ pub fn search(library: &ZimLibrary, query: &str) -> Result<SearchResults, ToolEr
             let mut title_list = Vec::new();
             if !terms.is_empty() {
                 if let Some(title_db) = &h.title {
-                    // Sub-band queries, in band order: the AND over ALL the
-                    // stemmed terms (multi-word queries only - with one term
-                    // AND and OR are the same query), then the OR of the
-                    // terms. Every AND hit reappears in the OR's results (a
-                    // title with all the words also matches any subset of
-                    // them), so the OR pass skips the docids the AND pass
-                    // already reported.
-                    let and_query = if terms.len() >= 2 {
-                        Some(combine_terms(Operator::And, &terms)?)
-                    } else {
-                        None
-                    };
-                    let or_query = combine_terms(Operator::Or, &terms)?;
+                    // Sub-band queries, in band order: for multi-word
+                    // queries the AND over every word's OR(surface, stem)
+                    // subquery, then the OR over all the variants. Every
+                    // AND hit reappears in the OR's results (a title with
+                    // all the words also matches any subset of them), so
+                    // the OR pass skips the docids the AND pass already
+                    // reported.
+                    let multi = title_words.len() >= 2;
+                    let mut and_query: Option<Query> = None;
+                    let mut or_terms: Vec<&str> = Vec::new();
+                    for (surface, stemmed) in title_words {
+                        // Deduped when the stem equals the surface (a
+                        // duplicated variant would double its BM25 count).
+                        let variants: Vec<&str> = if surface == stemmed {
+                            vec![surface.as_str()]
+                        } else {
+                            vec![surface.as_str(), stemmed.as_str()]
+                        };
+                        for v in &variants {
+                            if !or_terms.contains(v) {
+                                or_terms.push(*v);
+                            }
+                        }
+                        if multi {
+                            let word_query = combine_terms(Operator::Or, &variants)?;
+                            and_query = Some(match and_query {
+                                None => word_query,
+                                Some(acc) => Query::combine(Operator::And, &acc, &word_query)?,
+                            });
+                        }
+                    }
+                    let or_query = combine_terms(Operator::Or, &or_terms)?;
                     let mut taken: std::collections::HashSet<u32> = std::collections::HashSet::new();
                     let mut enquire = Enquire::new(title_db)?;
                     enquire.set_sort_by_relevance();
@@ -805,9 +851,12 @@ Meltwater streams out of the ice.
     /// Build a single-file glass Xapian index, the way openZIM does: the
     /// document data is the article's full path inside the archive, the
     /// title sits in value slot 0, and the terms are unprefixed Porter2
-    /// stems, exactly as libzim indexes with STEM_ALL ("appl" is the stem
-    /// of "apple", "comput" of "computing"). The terms are passed in
-    /// already stemmed (the English stem shapes the existing tests use).
+    /// stems, exactly as libzim indexes the FULL-TEXT index with STEM_ALL
+    /// ("appl" is the stem of "apple", "comput" of "computing"). The terms
+    /// are passed in already stemmed (the English stem shapes the existing
+    /// tests use). Real TITLE indexes store surface word forms instead -
+    /// `title_inflection_test_server` passes surfaces there; the older
+    /// title tests pass stems, which the band's stem variants still match.
     fn make_index(docs: &[(&str, &str, &str)]) -> Vec<u8> {
         make_index_stemmed(None, docs)
     }
@@ -1265,6 +1314,78 @@ Meltwater streams out of the ice.
         assert_eq!(hits.len(), 2, "{hits:?}");
         assert_eq!(hits[0].path, "C/Quebec,_Quebec", "{hits:?}");
         assert_eq!(hits[1].path, "C/Quebec_City", "{hits:?}");
+    }
+
+    /// The title index stores titles as WRITTEN - lowercased surface word
+    /// forms (measured on md1m: df("beatles")=186 against df("beatl")=0;
+    /// on fr.zim "revolution" 328) - so the band matches every word by its
+    /// surface form AND its stem. Titles deliberately sit on URLs the
+    /// queries cannot hit exactly, so every reported hit really comes from
+    /// the title band.
+    fn title_inflection_test_server() -> (ZimMcpServer, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        // Title index: surface word forms, as libzim's indexer stores them.
+        let titles = make_index(&[
+            ("C/Physics1", "black hole", "Black hole"),
+            ("C/Physics2", "black holes", "Black holes"),
+            ("C/Movie1", "holes", "Holes"),
+            ("C/Movie2", "movi", "The Movie"),
+        ]);
+        // Full-text index: unprefixed stems, as libzim's STEM_ALL builds it.
+        let index = make_index(&[
+            ("C/Physics1", "black hole graviti spacetime", "Black hole"),
+            ("C/Physics2", "black hole graviti spacetime", "Black holes"),
+            ("C/Movie1", "hole plot movi", "Holes"),
+            ("C/Movie2", "movi film", "The Movie"),
+        ]);
+        let content = [
+            TestEntry { namespace: b'C', url: "Physics1", title: "", mime: 0, body: b"<html><body><h1>Black hole</h1><p>A black hole bends spacetime.</p></body></html>" },
+            TestEntry { namespace: b'C', url: "Physics2", title: "", mime: 0, body: b"<html><body><h1>Black holes</h1><p>Black holes bend spacetime.</p></body></html>" },
+            TestEntry { namespace: b'C', url: "Movie1", title: "", mime: 0, body: b"<html><body><h1>Holes</h1><p>The plot of Holes moves to a camp.</p></body></html>" },
+            TestEntry { namespace: b'C', url: "Movie2", title: "", mime: 0, body: b"<html><body><h1>The Movie</h1><p>The movie film runs two hours.</p></body></html>" },
+        ];
+        let bytes = build_archive_indexes(&["text/html"], &content, &[], 0, Some(&index), Some(&titles));
+        std::fs::write(dir.path().join("test.zim"), &bytes).unwrap();
+        let library = Arc::new(ZimLibrary::scan(dir.path()).unwrap());
+        assert!(library.archives[0].searchable());
+        (ZimMcpServer::new(library), dir)
+    }
+
+    #[test]
+    fn e2e_search_title_band_matches_surface_and_stemmed_word_forms() {
+        let (server, _keep) = title_inflection_test_server();
+
+        // Two words: the AND sub-band is an AND over per-word
+        // OR(surface, stem) subqueries, so BOTH black-hole articles match
+        // the all-words pass - "Black hole" through the stem variant of
+        // "holes", "Black holes" through its surface - while the
+        // partial-only "Holes" (no "black") reaches just the OR sub-band,
+        // behind them, and "The Movie" matches nothing. Querying stems
+        // alone (the old behavior) matched only "Black hole" in the AND
+        // pass: the title index has no "beatl"-shaped stems for its
+        // surface words.
+        let hits = search(&server, "black holes");
+        assert_eq!(hits.len(), 3, "{hits:?}");
+        assert_eq!(hits[0].path, "C/Physics1", "{hits:?}");
+        assert_eq!(hits[0].title, "Black hole");
+        assert_eq!(hits[1].path, "C/Physics2", "{hits:?}");
+        assert_eq!(hits[2].path, "C/Movie1", "{hits:?}");
+        // Title-band hits are title matches: lead preview, no sections.
+        assert_eq!(hits[0].preview, "A black hole bends spacetime.");
+        assert_eq!(hits[0].sections, None);
+
+        // One inflected word: OR(surface, stem) = OR(holes, hole) finds
+        // the singular-titled article via the stem and the plural-titled
+        // and movie ones via the surface - the stem alone (the old
+        // behavior) matched only "Black hole". BM25 orders them: the stem
+        // term "hole" (df 1 of 4) outweighs "holes" (df 2), and among the
+        // surface matches the one-word "Holes" title beats the longer
+        // "Black holes" one.
+        let hits = search(&server, "holes");
+        assert_eq!(hits.len(), 3, "{hits:?}");
+        assert_eq!(hits[0].path, "C/Physics1", "{hits:?}");
+        assert_eq!(hits[1].path, "C/Movie1", "{hits:?}");
+        assert_eq!(hits[2].path, "C/Physics2", "{hits:?}");
     }
 
     /// An archive where BM25 alone ranks the wrong article first: the
