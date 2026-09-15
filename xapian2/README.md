@@ -25,7 +25,7 @@ there is no `open_memview`, the default query operator is `Or`, etc.).
 | `Document` | `id()`, `data()`, `value(slot)`, `termlist_count()`, `set_data/add_term/set_value` (mutable) | `Send` only |
 | `Query` | `term(t)`, `match_all()`, `combine(op, a, b)` | `Send + Sync` |
 | `QueryParser` | `new()`, `parse_query(s)`, `set_default_op(op)`, `add_prefix`, `add_boolean_prefix`, `set_stemmer`, `set_database` | `Send` only |
-| `Enquire` | `new(&db)`, `set_query(&q)`, `set_sort_by_relevance()`, `get_mset(first, max, atleast)` | `Send` only |
+| `Enquire` | `new(&db)`, `set_query(&q)`, `set_sort_by_relevance()`, `set_weighting(scheme, params)`, `get_mset(first, max, atleast)` | `Send` only |
 | `MSet` | `size()`, `docid/weight/percent/rank(i)`, `termfreq(t)`, `document(i)`, `iter()` | `Send + Sync` |
 | `WritableDatabase` | `create(path)`, `add_document(&doc)`, `commit()` (minimal, for tests/tooling) | `Send` only |
 
@@ -87,6 +87,29 @@ for m in mset.iter() {
     // serve (m.rank, m.weight, m.percent, html)
 }
 ```
+
+## Weighting
+
+`Enquire::set_weighting(scheme, params)` switches the ranking scheme and its
+parameters on an `Enquire` (the default is BM25 with Xapian's default
+parameters, as if the call were never made). The scheme name is matched
+case-insensitively and `params` are the weight class's constructor
+parameters in Xapian's documented order; the count must match the scheme's
+arity exactly, and an unknown scheme or wrong count returns an error
+listing the valid schemes. Call it before `get_mset` - like `set_query`,
+it persists on the `Enquire` and can be replaced by calling it again.
+
+| Scheme | Weight class | Parameters (order) | Defaults |
+| --- | --- | --- | --- |
+| `bm25` | `Xapian::BM25Weight` | `(k1, k2, k3, b, min_normlen)` | `k1=1`, `k2=0`, `k3=1`, `b=0.5`, `min_normlen=0.5` (the unset default; `set_weighting("bm25", &[1.0, 0.0, 1.0, 0.5, 0.5])` reproduces it exactly) |
+| `trad` | `Xapian::TradWeight` | `(k)` | `k=1`; equivalent to `BM25Weight(k, 0, 0, 1, 0)` - full document length normalisation, no normalisation floor |
+| `bool` | `Xapian::BoolWeight` | none | every match scores weight 0 (pure boolean match set) |
+
+Here `k1` scales how strongly within-document frequency counts, `k2` a
+query-length correction factor, `k3` within-query frequency, `b` the
+document length normalisation (0 = none, 1 = full), and `min_normlen` a
+floor for the normalised document length (keeps very short documents from
+dominating). Defaults were verified against `weight.h` of Xapian 2.0.0.
 
 ## Concurrency model
 

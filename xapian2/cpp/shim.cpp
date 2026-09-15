@@ -438,6 +438,60 @@ int xapian2_enquire_set_query(Xapian::Enquire *e, const Xapian::Query *q, uint32
 // Does not throw; kept for explicitness and parity with the C++ API.
 void xapian2_enquire_set_sort_by_relevance(Xapian::Enquire *e) { e->set_sort_by_relevance(); }
 
+// Select the weighting scheme used to score matches, by scheme name and
+// constructor parameters (Xapian's documented parameter order). The name is
+// matched case-insensitively and the parameter count must match the scheme's
+// arity exactly; anything else is an error through the per-thread buffer.
+//
+// Xapian's unset default is BM25Weight() (enquire.h), i.e. the "bm25" row
+// with its default parameters.
+int xapian2_enquire_set_weighting(Xapian::Enquire *e,
+                                  const char *scheme,
+                                  const double *params,
+                                  uint32_t nparams) {
+    try {
+        std::string name(scheme);
+        for (char &c : name) {
+            if (c >= 'A' && c <= 'Z') c += 'a' - 'A';
+        }
+        if (name == "bm25") {
+            if (nparams != 5) {
+                g_error = "bm25 expects 5 parameters (k1, k2, k3, b, min_normlen), got "
+                          + std::to_string(nparams) + " (valid schemes: bm25, trad, bool)";
+                return -1;
+            }
+            e->set_weighting_scheme(
+                Xapian::BM25Weight(params[0], params[1], params[2], params[3], params[4]));
+            return 0;
+        }
+        if (name == "trad") {
+            if (nparams != 1) {
+                g_error = "trad expects 1 parameter (k), got " + std::to_string(nparams)
+                          + " (valid schemes: bm25, trad, bool)";
+                return -1;
+            }
+            e->set_weighting_scheme(Xapian::TradWeight(params[0]));
+            return 0;
+        }
+        if (name == "bool") {
+            if (nparams != 0) {
+                g_error = "bool expects no parameters, got " + std::to_string(nparams)
+                          + " (valid schemes: bm25, trad, bool)";
+                return -1;
+            }
+            e->set_weighting_scheme(Xapian::BoolWeight());
+            return 0;
+        }
+        g_error = "unknown weighting scheme '" + name + "' (valid schemes: bm25, trad, bool)";
+        return -1;
+    } catch (const Xapian::Error &e) {
+        g_error = describe(e);
+    } catch (const std::exception &e) {
+        g_error = e.what();
+    }
+    return -1;
+}
+
 Xapian::MSet *xapian2_enquire_get_mset(const Xapian::Enquire *e,
                                        uint32_t first,
                                        uint32_t maxitems,

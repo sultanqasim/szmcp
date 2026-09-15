@@ -137,6 +137,12 @@ mod ffi {
         pub fn xapian2_enquire_new(db: *mut c_void) -> *mut c_void;
         pub fn xapian2_enquire_set_query(e: *mut c_void, q: *mut c_void, query_length: u32) -> c_int;
         pub fn xapian2_enquire_set_sort_by_relevance(e: *mut c_void);
+        pub fn xapian2_enquire_set_weighting(
+            e: *mut c_void,
+            scheme: *const c_char,
+            params: *const f64,
+            nparams: u32,
+        ) -> c_int;
         pub fn xapian2_enquire_get_mset(
             e: *mut c_void,
             first: u32,
@@ -959,6 +965,52 @@ impl Enquire {
         unsafe { ffi::xapian2_enquire_set_sort_by_relevance(self.handle()) };
     }
 
+    /// Select the weighting scheme used to score matches, replacing the
+    /// default (BM25 with Xapian's default parameters - see below).
+    ///
+    /// `scheme` names a Xapian weight class (matched case-insensitively)
+    /// and `params` are its constructor parameters in Xapian's documented
+    /// order; the parameter count must match the scheme's arity exactly.
+    ///
+    /// - `"bm25"` - `BM25Weight(k1, k2, k3, b, min_normlen)`, 5 parameters.
+    ///   Xapian's defaults are `k1=1, k2=0, k3=1, b=0.5, min_normlen=0.5`
+    ///   (weight.h), and an `Enquire` with no weighting set scores exactly
+    ///   with those, so
+    ///   `set_weighting("bm25", &[1.0, 0.0, 1.0, 0.5, 0.5])` reproduces the
+    ///   default ordering and weights. k1 scales how strongly
+    ///   within-document frequency counts, k2 a query-length correction
+    ///   factor, k3 within-query frequency, b the document length
+    ///   normalisation (0 = none, 1 = full), and min_normlen a floor for
+    ///   the normalised document length (keeps very short documents from
+    ///   dominating).
+    /// - `"trad"` - `TradWeight(k)`, 1 parameter (Xapian's default
+    ///   `k=1`). Equivalent to `BM25Weight(k, 0, 0, 1, 0)`: the traditional
+    ///   probabilistic scheme, with full document length normalisation and
+    ///   no normalisation floor.
+    /// - `"bool"` - `BoolWeight()`, no parameters. Every match scores
+    ///   weight 0: a pure boolean match set (document ids still come back,
+    ///   ordered by ascending docid).
+    ///
+    /// An unknown scheme, or a parameter count that does not match the
+    /// scheme's arity, fails with the valid schemes listed in the message.
+    /// The setting persists on this `Enquire` and can be replaced by
+    /// calling this again; call it before [`Enquire::get_mset`].
+    pub fn set_weighting(&mut self, scheme: &str, params: &[f64]) -> Result<()> {
+        let scheme = cstr(scheme)?;
+        // SAFETY: `scheme` is a valid NUL-terminated string and `params` a
+        // valid f64 slice for the duration of the call; the shim reads
+        // exactly `params.len()` parameters (none when it is empty).
+        let status = unsafe {
+            ffi::xapian2_enquire_set_weighting(
+                self.handle(),
+                scheme.as_ptr(),
+                params.as_ptr(),
+                params.len() as u32,
+            )
+        };
+        Error::from_status(status)
+    }
+
     /// Run the current query.
     ///
     /// Returns at most `maxitems` matches starting at zero-based position
@@ -1189,6 +1241,120 @@ mod tests {
         assert_eq!(mset.size(), 2);
         assert_eq!(mset.termfreq("alpha"), 2);
         assert_eq!(mset.termfreq("zeta"), 0);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn set_weighting_schemes() {
+        let dir = temp_dir("weighting");
+        // Five documents contrasting "zebra" frequencies and lengths: doc1
+        // is 1 term (zebra, wdf 1), doc2 is 40 terms (zebra wdf 4), doc3 is
+        // 15 terms (zebra wdf 1), and docs 4/5 (20/8 terms) lack zebra.
+        // Average length 84/5 = 16.8; zebra's df is 3 of 5, N = 5.
+        let filler = |start: usize, n: usize| {
+            (start..start + n)
+                .map(|i| format!("f{i}"))
+                .collect::<Vec<_>>()
+                .join(" ")
+        };
+        let docs = [
+            "zebra".to_string(),
+            format!("zebra zebra zebra zebra {}", filler(0, 36)),
+            format!("zebra {}", filler(36, 14)),
+            filler(50, 20),
+            filler(70, 8),
+        ];
+        let docs: Vec<&str> = docs.iter().map(String::as_str).collect();
+        let db = build_db(&dir, &docs);
+
+        let mut enquire = Enquire::new(&db).unwrap();
+        let q = Query::term("zebra").unwrap();
+        enquire.set_query(&q).unwrap();
+
+        // The unset default is BM25 with Xapian's default parameters
+        // (enquire.h). Hand-computed from bm25weight.cc (weight =
+        // termweight * wdf / (k1*(normlen*b + 1-b) + wdf), normlen =
+        // max(len/16.8, min_normlen), termweight = ln(1.3571)*2 ~= 0.6108
+        // for this fixture: tw_raw = (5-3+0.5)/(3+0.5) < 2, so tw/2+1): the
+        // long wdf-4 doc2 wins over the short docs, whose normlen is
+        // floored at 0.5.
+        let default_mset = enquire.get_mset(0, 10, 0).unwrap();
+        assert_eq!(default_mset.size(), 3);
+        assert_eq!(
+            (0..default_mset.size()).map(|i| default_mset.docid(i)).collect::<Vec<_>>(),
+            [2, 1, 3]
+        );
+
+        // (a) "bm25" with the documented defaults reproduces the unset
+        // default exactly - same ordering, same weights.
+        enquire.set_weighting("bm25", &[1.0, 0.0, 1.0, 0.5, 0.5]).unwrap();
+        let bm25 = enquire.get_mset(0, 10, 0).unwrap();
+        for i in 0..3 {
+            assert_eq!(bm25.docid(i), default_mset.docid(i));
+            assert!((bm25.weight(i) - default_mset.weight(i)).abs() < 1e-12);
+        }
+        // Anchor values (hand-computed, tolerance for float formatting).
+        assert!((bm25.weight(0) - 0.4293).abs() < 1e-3); // doc2: 0.6108*4/(1.69+4)
+        assert!((bm25.weight(1) - 0.3490).abs() < 1e-3); // doc1: 0.6108/(0.75+1)
+        assert!((bm25.weight(2) - 0.3138).abs() < 1e-3); // doc3: 0.6108/(0.9464+1)
+
+        // (b) "bool": the same match set, every weight 0, docids ascending.
+        enquire.set_weighting("bool", &[]).unwrap();
+        let boolean = enquire.get_mset(0, 10, 0).unwrap();
+        assert_eq!(boolean.size(), 3);
+        assert_eq!(
+            (0..boolean.size()).map(|i| boolean.docid(i)).collect::<Vec<_>>(),
+            [1, 2, 3]
+        );
+        assert!(boolean.iter().all(|m| m.weight == 0.0));
+
+        // (c) "trad" (k=1: full length normalisation, no floor): the 1-term
+        // doc1 wins and the long doc2 drops - a different ordering from
+        // bm25 over the same match set.
+        enquire.set_weighting("trad", &[1.0]).unwrap();
+        let trad = enquire.get_mset(0, 10, 0).unwrap();
+        assert_eq!(trad.size(), 3);
+        assert_eq!(
+            (0..trad.size()).map(|i| trad.docid(i)).collect::<Vec<_>>(),
+            [1, 2, 3]
+        );
+        assert!(trad.weight(0) > trad.weight(1) && trad.weight(1) > trad.weight(2));
+        // Anchor: doc1 = termweight/(1/16.8 + 1) ~= 0.5765, where bm25 gave
+        // ~0.3490 (and doc1's trad weight beats doc2's, unlike bm25).
+        assert!((trad.weight(0) - 0.5765).abs() < 1e-3);
+        assert!(trad.weight(0) > bm25.weight(1));
+
+        // Scheme matching is case-insensitive.
+        enquire.set_weighting("BM25", &[1.0, 0.0, 1.0, 0.5, 0.5]).unwrap();
+        let upper = enquire.get_mset(0, 10, 0).unwrap();
+        for i in 0..3 {
+            assert_eq!(upper.docid(i), bm25.docid(i));
+            assert!((upper.weight(i) - bm25.weight(i)).abs() < 1e-12);
+        }
+
+        // (d) An unknown scheme and wrong parameter counts fail, listing
+        // the valid schemes (the failed calls leave the enquire usable).
+        let err = enquire.set_weighting("nope", &[]).unwrap_err();
+        assert!(err.msg().contains("nope"));
+        assert!(err.msg().contains("valid schemes"));
+        for (scheme, params) in [
+            ("bm25", &[][..]),
+            ("bm25", &[1.0, 0.0, 1.0, 0.5][..]),
+            ("bm25", &[1.0, 0.0, 1.0, 0.5, 0.5, 0.5][..]),
+            ("trad", &[][..]),
+            ("trad", &[1.0, 0.5][..]),
+            ("bool", &[0.0][..]),
+        ] {
+            let err = enquire.set_weighting(scheme, params).unwrap_err();
+            assert!(err.msg().contains("valid schemes"));
+        }
+        enquire.set_weighting("bm25", &[1.0, 0.0, 1.0, 0.5, 0.5]).unwrap();
+        let after = enquire.get_mset(0, 10, 0).unwrap();
+        assert_eq!(
+            (0..after.size()).map(|i| after.docid(i)).collect::<Vec<_>>(),
+            [2, 1, 3]
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }
