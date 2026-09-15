@@ -33,17 +33,29 @@ const PARA_MATCH_CHARS: usize = 2000;
 /// from it - the title tier keeps every word, and hit previews score every
 /// query term).
 ///
-/// A word appearing in more than half the archive's documents is background
-/// vocabulary, not a query discriminator - English "the" (59% of the md1m
-/// fulltext index), "of" (63%), "and" (56%); French "de" (79% of fr.zim),
-/// "la" (74%), "un" (71%). It cannot separate the wanted articles from the
+/// A word appearing in more than 10% of the archive's documents is
+/// background vocabulary, not a query discriminator - English "the" (59% of
+/// the md1m fulltext index), "of" (63%), "and" (56%); French "de" (79% of
+/// fr.zim), "la" (74%), "un" (71%) - and so is everything mid-frequency
+/// (EN "work" 25%, FR "faire" 44%): a BM25 OR cannot rank by such words
+/// anyway. The measured threshold sweep (E4 in the profiling report) was
+/// quality-neutral-to-positive on both benchmark archives and cut FR
+/// latency by a third at the limit. It cannot separate the wanted articles
+/// from the
 /// rest, and BM25 - whose IDF already down-weights it - still floods the
 /// query with its huge postlist. This is the language-agnostic replacement
 /// for a stopword list: no hand-picked list works across languages, while
-/// the >50% document-frequency rule is computed from the archive itself and
-/// drops exactly the true background words of whatever language(s) the
-/// archive is written in.
-const FT_WORD_MAX_DF_FRAC: f64 = 0.5;
+/// the >10% document-frequency rule is computed from the archive itself and
+/// drops exactly the background vocabulary of whatever language(s) the
+/// archive is written in - a word occurring in more than a tenth of the
+/// documents is background vocabulary in any language (measured on the
+/// benchmarks: EN the/of/and at 59/63/56% of md1m, FR de/la/un/du at
+/// 71-79% of fr.zim, but also mid-frequency words like EN "work" 25% or FR
+/// "faire" 44% that contribute no discrimination to a BM25 OR; the measured
+/// threshold sweep was quality-neutral-to-positive on both archives and cut
+/// FR latency by a third at the limit). The title tier keeps every word -
+/// the filter is fulltext-only (see [`fulltext_query`]).
+const FT_WORD_MAX_DF_FRAC: f64 = 0.1;
 
 /// One search result.
 #[derive(Serialize, JsonSchema, Debug)]
@@ -290,9 +302,11 @@ impl ArchiveQuery {
 /// `STEM_ALL`, default op OR).
 ///
 /// A word whose document frequency in THIS archive's fulltext index is more
-/// than [`FT_WORD_MAX_DF_FRAC`] of the archive's document count is dropped:
-/// a word matching half the archive is background vocabulary ("the", French
-/// "de"), not a query discriminator. The dfs come off the archive's own
+/// than [`FT_WORD_MAX_DF_FRAC`] (10%) of the archive's document count is
+/// dropped: a word occurring in more than a tenth of the documents is
+/// background vocabulary ("the", French "de" - but also mid-frequency words
+/// like EN "work" 25% or FR "faire" 44%), not a query discriminator. The
+/// dfs come off the archive's own
 /// fulltext handle (`Database::doc_count` + `Database::termfreq` on the
 /// STEMS in `stems` - the index's terms are folded Porter2 stems), so the
 /// kept set differs per archive: the query is per archive in a second way
@@ -307,7 +321,7 @@ impl ArchiveQuery {
 /// What is lost: the raw query's boolean syntax. The kept words are
 /// lowercased query words, so AND/OR/NOT/parentheses reach the parser as
 /// ordinary words - and the ultra-common operator words are usually dropped
-/// by the 50% rule anyway. (Uppercase operators had already lost their case
+/// by the 10% rule anyway. (Uppercase operators had already lost their case
 /// to the accent fold - Xapian's operator keywords are case-sensitive, so
 /// "AND" has been an ordinary word on this tier since c8fb6d4; the filter
 /// only adds the drop.) Quotes were already stripped (see `search`).
@@ -321,8 +335,8 @@ fn fulltext_query(
     let kept: Vec<&str> = words
         .iter()
         .zip(stems)
-        // Not MORE than half the archive: kept. Exactly half can still
-        // discriminate, barely.
+        // Not MORE than a tenth of the archive: kept. Exactly 10% can
+        // still discriminate.
         .filter(|(_, stem)| {
             fulltext.termfreq(stem) as f64 <= FT_WORD_MAX_DF_FRAC * doc_count as f64
         })
@@ -437,7 +451,7 @@ pub fn search(library: &ZimLibrary, query: &str) -> Result<SearchResults, ToolEr
     // without a title index and queries with no usable words.
     //
     // Tier 3 - the full-text tier is the parsed query over the KEPT words:
-    // plain BM25 OR, after words matching more than half the archive's
+    // plain BM25 OR, after words matching more than 10% of the archive's
     // documents were dropped as background vocabulary (`FT_WORD_MAX_DF_FRAC`,
     // `fulltext_query` - the language-agnostic replacement for a stopword
     // list). BM25's IDF still down-weights the merely common words, and no
@@ -978,12 +992,63 @@ Meltwater streams out of the ice.
         std::fs::read(&single).unwrap()
     }
 
+    /// `count` filler index documents with unique terms no query uses
+    /// (three numbered tokens each). The fixtures' real documents sit in
+    /// indexes too small for the fulltext tier's background-vocabulary
+    /// filter ([`FT_WORD_MAX_DF_FRAC`]): at 0.1, a query word must occur in
+    /// at most 1 of 10 documents (2 of 20, 3 of 30 ...) or the parsed
+    /// fulltext query loses it. The fillers live in the INDEX only - their
+    /// terms never match a query, so their paths are never resolved and no
+    /// directory entries are needed for them.
+    fn filler_docs(count: usize) -> Vec<(String, String, String)> {
+        (0..count)
+            .map(|i| {
+                (
+                    format!("C/Filler{i}"),
+                    format!("filler{i}a filler{i}b filler{i}c"),
+                    format!("Filler {i}"),
+                )
+            })
+            .collect()
+    }
+
+    /// [`make_index`] over `docs` plus `fillers` numbered filler documents
+    /// (see [`filler_docs`]).
+    fn make_index_padded(docs: &[(&str, &str, &str)], fillers: usize) -> Vec<u8> {
+        make_index_stemmed_padded(None, docs, fillers)
+    }
+
+    /// [`make_index_stemmed`] over `docs` plus `fillers` numbered filler
+    /// documents (see [`filler_docs`]).
+    fn make_index_stemmed_padded(
+        language: Option<&str>,
+        docs: &[(&str, &str, &str)],
+        fillers: usize,
+    ) -> Vec<u8> {
+        let mut padded: Vec<(String, String, String)> = docs
+            .iter()
+            .map(|(p, t, ti)| (p.to_string(), t.to_string(), ti.to_string()))
+            .collect();
+        padded.extend(filler_docs(fillers));
+        let refs: Vec<(&str, &str, &str)> = padded
+            .iter()
+            .map(|(p, t, ti)| (p.as_str(), t.as_str(), ti.as_str()))
+            .collect();
+        make_index_stemmed(language, &refs)
+    }
+
     pub(crate) fn test_server() -> (ZimMcpServer, tempfile::TempDir) {
         let dir = tempfile::tempdir().unwrap();
-        let index = make_index(&[
-            ("C/Apple", "appl histori 10 000 year domest wild kazakhstan comput devic nam", "Apple"),
-            ("C/Banana", "banana tree tall herbaceou plant growth", "Banana"),
-        ]);
+        // Eight pad fillers: with FT_WORD_MAX_DF_FRAC at 0.1, a query word
+        // must sit in at most 1 of 10 documents to be kept ("appl", "comput",
+        // "banana", "kazakhstan" are each in exactly one).
+        let index = make_index_padded(
+            &[
+                ("C/Apple", "appl histori 10 000 year domest wild kazakhstan comput devic nam", "Apple"),
+                ("C/Banana", "banana tree tall herbaceou plant growth", "Banana"),
+            ],
+            8,
+        );
         let content = [
             TestEntry { namespace: b'C', url: "Apple", title: "Apple", mime: 0, body: APPLE_HTML.as_bytes() },
             TestEntry { namespace: b'C', url: "Banana", title: "Banana", mime: 0, body: BANANA_HTML.as_bytes() },
@@ -1068,7 +1133,10 @@ Meltwater streams out of the ice.
     #[test]
     fn e2e_search_stems_queries_with_the_archive_language() {
         let dir = tempfile::tempdir().unwrap();
-        let index = make_index_stemmed(
+        // Seven pad fillers: the query words (elect/paysag/scrutin/ecol
+        // stems) sit in one document each, and FT_WORD_MAX_DF_FRAC 0.1
+        // needs ten documents for that to stay at the 10% boundary.
+        let index = make_index_stemmed_padded(
             Some("fra"),
             &[
                 (
@@ -1088,6 +1156,7 @@ Meltwater streams out of the ice.
                     "École",
                 ),
             ],
+            7,
         );
         let election_html: &'static [u8] = "<html><body><h1>Élection</h1>\
             <p>Une élection est un scrutin. Les élections présidentielles \
@@ -1150,7 +1219,11 @@ Meltwater streams out of the ice.
     #[test]
     fn e2e_search_fulltext_query_folds_accents() {
         let dir = tempfile::tempdir().unwrap();
-        let index = make_index_stemmed(
+        // Seven pad fillers (see `filler_docs`): the query words ("revolu",
+        // "franc" stems) sit in one document each; ten documents keep them
+        // at the 10% boundary instead of the one-document index's 100%,
+        // which the background-vocabulary filter would drop.
+        let index = make_index_stemmed_padded(
             Some("fra"),
             &[
                 (
@@ -1159,11 +1232,6 @@ Meltwater streams out of the ice.
                      renversée la république proclamée",
                     "Révolution",
                 ),
-                // Fillers: a one-document index makes every term 100%-df,
-                // which the fulltext query's background-vocabulary filter
-                // (FT_WORD_MAX_DF_FRAC) drops - this query would match
-                // nothing. Three documents keep the query words at 33% and
-                // the folded-parse proof below unchanged.
                 (
                     "C/Géographie",
                     "la géographie étudie les paysages et les reliefs de la terre",
@@ -1175,6 +1243,7 @@ Meltwater streams out of the ice.
                     "École",
                 ),
             ],
+            7,
         );
         let html: &'static [u8] = "<html><body><h1>Révolution</h1>\
             <p>La Révolution française éclate en 1789. La monarchie est \
@@ -1210,17 +1279,18 @@ Meltwater streams out of the ice.
     }
 
     /// The fulltext tier's background-vocabulary filter ([`fulltext_query`],
-    /// [`FT_WORD_MAX_DF_FRAC`]), white-box: a word in MORE than half the
-    /// archive's documents is dropped from the parsed fulltext query, a word
-    /// in at most half is kept, and a query of ONLY background words yields
-    /// `None` (the caller skips the band; exact/title still serve results).
-    /// Fixture via the raw `WritableDatabase` (the same shape `make_index`
-    /// builds): 10 documents, "commonword" in 6 (60%), "halfword" in 5
-    /// (exactly 50%), "rarea"/"rareb" in one each, "middling" in 2. The
-    /// terms are the STEMS - what the filter looks up (the index's terms are
-    /// folded Porter2 stems) and what the STEM_ALL parser produces.
+    /// [`FT_WORD_MAX_DF_FRAC`]), white-box: a word in MORE than a tenth of
+    /// the archive's documents is dropped from the parsed fulltext query, a
+    /// word in at most a tenth is kept (the boundary is "not MORE than"), and
+    /// a query of ONLY background words yields `None` (the caller skips the
+    /// band; exact/title still serve results). Fixture via the raw
+    /// `WritableDatabase` (the same shape `make_index` builds): 10 documents,
+    /// "commonword" in 6 (60%), "halfword" in 5 (50%), "middling" in 2 (20%),
+    /// "rarea"/"rareb" in one each (exactly 10%). The terms are the STEMS -
+    /// what the filter looks up (the index's terms are folded Porter2 stems)
+    /// and what the STEM_ALL parser produces.
     #[test]
-    fn fulltext_query_drops_words_over_half_the_archive() {
+    fn fulltext_query_drops_words_over_a_tenth_of_the_archive() {
         let mut stemmer = Stemmer::new(&resolve_stem_language("en")).unwrap();
         let s_common = stemmer.stem_folded("commonword").to_string();
         let s_half = stemmer.stem_folded("halfword").to_string();
@@ -1272,24 +1342,28 @@ Meltwater streams out of the ice.
         let words = |ws: &[&str]| ws.iter().map(|w| w.to_string()).collect::<Vec<String>>();
         let query = |ws: &[&str], stems: &[String]| fulltext_query(&words(ws), stems, "en", &db);
 
-        // 6 of 10 documents (60% > 50%): "commonword" is dropped, "rarea"
-        // (10%) kept - the parsed query matches ONLY the rarea document
-        // (the unfiltered OR would match 7).
+        // 6 of 10 documents (60% > 10%): "commonword" is dropped, "rarea"
+        // (10%, at the boundary) kept - the parsed query matches ONLY the
+        // rarea document (the unfiltered OR would match 7).
         let q = query(&["commonword", "rarea"], &[s_common.clone(), s_rarea.clone()])
             .unwrap()
             .unwrap();
         assert_eq!(matches(&q), vec!["C/D6"]);
 
-        // 5 of 10 is exactly half, not MORE than half: kept - the parsed
-        // query matches its 5 documents.
-        let q = query(&["halfword"], &[s_half.clone()]).unwrap().unwrap();
-        assert_eq!(matches(&q).len(), 5);
+        // 5 of 10 (50% > 10%): dropped - under the old 50% threshold this
+        // was the kept boundary case.
+        let q = query(&["halfword"], &[s_half.clone()]).unwrap();
+        assert!(q.is_none());
 
-        // 2 of 10 (20%): kept, next to the dropped common word.
-        let q = query(&["commonword", "middling"], &[s_common.clone(), s_middling.clone()])
-            .unwrap()
-            .unwrap();
-        assert_eq!(matches(&q), vec!["C/D8", "C/D9"]);
+        // 2 of 10 (20%, just over the boundary): dropped too, while both
+        // 10% words stay - the parsed OR matches only their documents.
+        let q = query(
+            &["middling", "rarea", "rareb"],
+            &[s_middling.clone(), s_rarea.clone(), s_rareb.clone()],
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(matches(&q), vec!["C/D6", "C/D7"]);
 
         // Both rare words kept: the OR matches both.
         let q = query(&["rarea", "rareb"], &[s_rarea.clone(), s_rareb.clone()])
@@ -1405,10 +1479,16 @@ Meltwater streams out of the ice.
     #[test]
     fn e2e_search_title_falls_back_to_index_title() {
         let dir = tempfile::tempdir().unwrap();
-        let index = make_index(&[
-            ("C/Nitrogen", "nitrogen gas inert", "Nitrogen"),
-            ("C/Banana", "banana tree tall herbaceou plant growth", "Banana"),
-        ]);
+        // Eight pad fillers: "nitrogen" and "gas" are each in one document,
+        // and FT_WORD_MAX_DF_FRAC 0.1 needs ten documents for that to stay
+        // kept (see `filler_docs`).
+        let index = make_index_padded(
+            &[
+                ("C/Nitrogen", "nitrogen gas inert", "Nitrogen"),
+                ("C/Banana", "banana tree tall herbaceou plant growth", "Banana"),
+            ],
+            8,
+        );
         let content = [
             // Empty directory-entry title, as in modern openZIM archives.
             TestEntry { namespace: b'C', url: "Nitrogen", title: "", mime: 0, body: NITROGEN_HTML.as_bytes() },
@@ -1436,18 +1516,20 @@ Meltwater streams out of the ice.
     /// indexes).
     fn title_index_test_server() -> (ZimMcpServer, tempfile::TempDir) {
         let dir = tempfile::tempdir().unwrap();
-        let index = make_index(&[
-            ("C/Nitrogen_Gas_Effects", "nitrogen gas surround effect unavoid", "Nitrogen Gas Effects"),
-            ("C/Weather", "weather forecast describ effect air pressur gas law explan atmospher", "Weather"),
-            // Fillers: on the two-document index above, "effect" and "gas"
-            // (shared by both documents) are 100%-df background words, which
-            // the fulltext query's filter (FT_WORD_MAX_DF_FRAC) drops - and
-            // the "Weather" fulltext hit below would vanish. Four documents
-            // hold the shared words at exactly 50%: kept (the rule drops
-            // only MORE than half the archive).
-            ("C/Banana", "banana tree tall herbaceou plant growth", "Banana"),
-            ("C/Glacier", "glacier ice dens movem weight flow", "Glacier"),
-        ]);
+        // Sixteen pad fillers: "effect" sits in two documents ("Nitrogen
+        // Gas Effects" and "Weather"), and FT_WORD_MAX_DF_FRAC 0.1 needs
+        // twenty documents for 2-of-N to stay at the kept 10% boundary
+        // (see `filler_docs`) - the "Weather" fulltext hit below would
+        // vanish otherwise.
+        let index = make_index_padded(
+            &[
+                ("C/Nitrogen_Gas_Effects", "nitrogen gas surround effect unavoid", "Nitrogen Gas Effects"),
+                ("C/Weather", "weather forecast describ effect air pressur gas law explan atmospher", "Weather"),
+                ("C/Banana", "banana tree tall herbaceou plant growth", "Banana"),
+                ("C/Glacier", "glacier ice dens movem weight flow", "Glacier"),
+            ],
+            16,
+        );
         let titles = make_index(&[
             ("C/Nitrogen_Gas_Effects", "effects of nitrogen gas", "Effects of Nitrogen Gas"),
             ("C/Weather", "weather", "Weather"),
@@ -1524,16 +1606,24 @@ Meltwater streams out of the ice.
             ("C/Mexico_City", "mexico city", "Mexico City"),
             ("C/Weather", "weather", "Weather"),
         ]);
-        let index = make_index(&[
-            ("C/New_York_City", "new york citi largest unit state", "New York City"),
-            ("C/Quebec_City", "quebec citi capit provinc", "Quebec City"),
-            // "kansa", not "kansas": the index terms are the STEMS the
-            // query parser produces (Porter2 strips the s), as libzim
-            // indexes them.
-            ("C/Kansas_City", "kansa citi straddl state", "Kansas City"),
-            ("C/Mexico_City", "mexico citi capit", "Mexico City"),
-            ("C/Weather", "weather forecast effect atmospher", "Weather"),
-        ]);
+        // Thirty-five pad fillers: "citi" (the stem of every city title's
+        // body text) sits in four documents, and FT_WORD_MAX_DF_FRAC 0.1
+        // needs forty documents for 4-of-N to stay at the kept 10% boundary
+        // (see `filler_docs`) - the partial-title fulltext matches below
+        // would lose every city otherwise.
+        let index = make_index_padded(
+            &[
+                ("C/New_York_City", "new york citi largest unit state", "New York City"),
+                ("C/Quebec_City", "quebec citi capit provinc", "Quebec City"),
+                // "kansa", not "kansas": the index terms are the STEMS the
+                // query parser produces (Porter2 strips the s), as libzim
+                // indexes them.
+                ("C/Kansas_City", "kansa citi straddl state", "Kansas City"),
+                ("C/Mexico_City", "mexico citi capit", "Mexico City"),
+                ("C/Weather", "weather forecast effect atmospher", "Weather"),
+            ],
+            35,
+        );
         let content = [
             // Empty directory-entry titles, as in modern openZIM archives:
             // the titles live in the indexes (value slot 0) only.
@@ -1603,19 +1693,22 @@ Meltwater streams out of the ice.
             ("C/Movie2", "movi", "The Movie"),
         ]);
         // Full-text index: unprefixed stems, as libzim's STEM_ALL builds it.
-        let index = make_index(&[
-            ("C/Physics1", "black hole graviti spacetime", "Black hole"),
-            ("C/Physics2", "black hole graviti spacetime", "Black holes"),
-            ("C/Movie1", "hole plot movi", "Holes"),
-            ("C/Movie2", "movi film", "The Movie"),
-            // Fillers: on the four-document index above "hole" (the stem of
-            // both "hole" and "holes") covers 3 of 4 documents (>50%) - a
-            // background word the fulltext query's filter
-            // (FT_WORD_MAX_DF_FRAC) drops, and the body matches below would
-            // lose Movie1. Six documents hold it at exactly 50%: kept.
-            ("C/Banana", "banana tree tall herbaceou plant growth", "Banana"),
-            ("C/Glacier", "glacier ice dens movem weight flow", "Glacier"),
-        ]);
+        // Twenty-four pad fillers: "hole" (the stem of both "hole" and
+        // "holes") covers 3 of the 4 real documents, and FT_WORD_MAX_DF_FRAC
+        // 0.1 needs thirty documents for 3-of-N to stay at the kept 10%
+        // boundary (see `filler_docs`) - the body matches below would lose
+        // Movie1 and Physics1 otherwise.
+        let index = make_index_padded(
+            &[
+                ("C/Physics1", "black hole graviti spacetime", "Black hole"),
+                ("C/Physics2", "black hole graviti spacetime", "Black holes"),
+                ("C/Movie1", "hole plot movi", "Holes"),
+                ("C/Movie2", "movi film", "The Movie"),
+                ("C/Banana", "banana tree tall herbaceou plant growth", "Banana"),
+                ("C/Glacier", "glacier ice dens movem weight flow", "Glacier"),
+            ],
+            24,
+        );
         let content = [
             TestEntry { namespace: b'C', url: "Physics1", title: "", mime: 0, body: b"<html><body><h1>Black hole</h1><p>A black hole bends spacetime.</p></body></html>" },
             TestEntry { namespace: b'C', url: "Physics2", title: "", mime: 0, body: b"<html><body><h1>Black holes</h1><p>Black holes bend spacetime.</p></body></html>" },
@@ -1734,17 +1827,19 @@ Meltwater streams out of the ice.
         let dir = tempfile::tempdir().unwrap();
         // Index terms are the stems the query parser produces ("atmosphere"
         // -> "atmospher"), unprefixed, as libzim indexes with STEM_ALL.
-        let index = make_index(&[
-            ("C/Nitrogen", "nitrogen colorless odorless gas", "Nitrogen"),
-            ("C/Atmosphere", "nitrogen nitrogen nitrogen nitrogen nitrogen nitrogen nitrogen naca naca atmospher", "Atmosphere"),
-            ("C/Aeronautics", "aeronautics naca aviation wind tunnel flight", "Aeronautics"),
-            // Filler: on the three-document index above, "nitrogen" and
-            // "naca" each cover 2 of 3 documents (>50%) - background words
-            // the fulltext query's filter (FT_WORD_MAX_DF_FRAC) drops, and
-            // the BM25 runner-up assertions below need both words matched.
-            // Four documents hold both at exactly 50%: kept.
-            ("C/Weather", "weather forecast rain snow climat", "Weather"),
-        ]);
+        // Sixteen pad fillers: "nitrogen" and "naca" each cover 2 of the 3
+        // real documents, and FT_WORD_MAX_DF_FRAC 0.1 needs twenty documents
+        // for 2-of-N to stay at the kept 10% boundary (see `filler_docs`) -
+        // the BM25 runner-up assertions below need both words matched.
+        let index = make_index_padded(
+            &[
+                ("C/Nitrogen", "nitrogen colorless odorless gas", "Nitrogen"),
+                ("C/Atmosphere", "nitrogen nitrogen nitrogen nitrogen nitrogen nitrogen nitrogen naca naca atmospher", "Atmosphere"),
+                ("C/Aeronautics", "aeronautics naca aviation wind tunnel flight", "Aeronautics"),
+                ("C/Weather", "weather forecast rain snow climat", "Weather"),
+            ],
+            16,
+        );
         let content = [
             TestEntry { namespace: b'C', url: "Nitrogen", title: "Nitrogen", mime: 0, body: NITROGEN_HTML.as_bytes() },
             TestEntry { namespace: b'C', url: "Atmosphere", title: "Atmosphere", mime: 0, body: ATMOSPHERE_HTML.as_bytes() },
@@ -1820,9 +1915,16 @@ Meltwater streams out of the ice.
     /// title tier (redirect document), and full text (the target article).
     fn redirect_dedupe_test_server() -> (ZimMcpServer, tempfile::TempDir) {
         let dir = tempfile::tempdir().unwrap();
-        let index = make_index(&[
-            ("C/Aeronautics", "aeronautics naca aviation flight", "Aeronautics"),
-        ]);
+        // Nine pad fillers: "aeronautics" and "naca" are each in the one
+        // real document, and FT_WORD_MAX_DF_FRAC 0.1 needs ten documents
+        // for that to stay kept (see `filler_docs`) - the fulltext leg of
+        // the cross-tier dedupe below would vanish otherwise.
+        let index = make_index_padded(
+            &[
+                ("C/Aeronautics", "aeronautics naca aviation flight", "Aeronautics"),
+            ],
+            9,
+        );
         let titles = make_index(&[
             ("C/Aeronautics", "aeronautics", "Aeronautics"),
             // The redirect's own title-index document.
@@ -1931,20 +2033,23 @@ Meltwater streams out of the ice.
     fn intro_test_server() -> (ZimMcpServer, tempfile::TempDir) {
         let dir = tempfile::tempdir().unwrap();
         // Index terms are the stems the query parser produces ("beds" ->
-        // "bed"), unprefixed, as libzim indexes with STEM_ALL.
-        let index = make_index(&[
-            (
-                "C/Salt",
-                "salt mineral chlorid sodium himalaya deposit rock bed form sea season food",
-                "Salt",
-            ),
-            // Fillers: a one-document index makes "salt" 100%-df - a
-            // background word the fulltext query's filter
-            // (FT_WORD_MAX_DF_FRAC) drops, and both searches below would
-            // return nothing. Three documents keep the query words at 33%.
-            ("C/Banana", "banana tree tall herbaceou plant growth", "Banana"),
-            ("C/Glacier", "glacier ice dens movem weight flow", "Glacier"),
-        ]);
+        // "bed"), unprefixed, as libzim indexes with STEM_ALL. Seven pad
+        // fillers: the query words ("salt", "bed", "himalaya") are each in
+        // one document, and FT_WORD_MAX_DF_FRAC 0.1 needs ten documents for
+        // that to stay kept (see `filler_docs`) - both searches below
+        // would return nothing otherwise.
+        let index = make_index_padded(
+            &[
+                (
+                    "C/Salt",
+                    "salt mineral chlorid sodium himalaya deposit rock bed form sea season food",
+                    "Salt",
+                ),
+                ("C/Banana", "banana tree tall herbaceou plant growth", "Banana"),
+                ("C/Glacier", "glacier ice dens movem weight flow", "Glacier"),
+            ],
+            7,
+        );
         let content = [
             TestEntry {
                 namespace: b'C',
@@ -2020,10 +2125,16 @@ Meltwater streams out of the ice.
         // sentences. Covered for an HTML article (match in the intro's
         // second paragraph) and a Markdown one (match in a body section).
         let dir = tempfile::tempdir().unwrap();
-        let index = make_index(&[
-            ("C/Volcano", "volcano crust molten rock erupt reshape land ash cloud aircraft farmer", "Volcano"),
-            ("C/Glacier", "glacier ice movement weight flow river meltwater stream", "Glacier"),
-        ]);
+        // Eight pad fillers: "aircraft" and "river" are each in one
+        // document, and FT_WORD_MAX_DF_FRAC 0.1 needs ten documents for
+        // that to stay kept (see `filler_docs`).
+        let index = make_index_padded(
+            &[
+                ("C/Volcano", "volcano crust molten rock erupt reshape land ash cloud aircraft farmer", "Volcano"),
+                ("C/Glacier", "glacier ice movement weight flow river meltwater stream", "Glacier"),
+            ],
+            8,
+        );
         let content = [
             TestEntry { namespace: b'C', url: "Volcano", title: "Volcano", mime: 0, body: VOLCANO_HTML.as_bytes() },
             TestEntry { namespace: b'C', url: "Glacier", title: "Glacier", mime: 1, body: GLACIER_MD.as_bytes() },
@@ -2075,21 +2186,23 @@ Meltwater streams out of the ice.
         let dir = tempfile::tempdir().unwrap();
         let cherry_terms = format!("{}{}", "cherri ".repeat(30), "filler ".repeat(400));
         let pie_terms = format!("{}{}", "pie ".repeat(30), "filler ".repeat(400));
-        let index = make_index(&[
-            ("C/Cherry", cherry_terms.as_str(), "Cherry"),
-            ("C/Dessert_Recipes", "cherri cherri pie pie", "Dessert Recipes"),
-            ("C/Pie_1", pie_terms.as_str(), "Pie 1"),
-            ("C/Pie_2", pie_terms.as_str(), "Pie 2"),
-            // Fillers: on the four-document index above "pie" covers 3 of 4
-            // documents (>50%) - a background word the fulltext query's
-            // filter (FT_WORD_MAX_DF_FRAC) drops, collapsing the query to
-            // "cherry", which the tf-30 "Cherry" document would outrank
-            // "Dessert_Recipes" on. Six documents hold "pie" at exactly
-            // 50%: kept (only MORE than half is dropped), and the OR
-            // ranking below is unchanged.
-            ("C/Mango", "mango tropic tree sweet", "Mango"),
-            ("C/Peach", "peach orchard stone fruit", "Peach"),
-        ]);
+        // Twenty-four pad fillers: "pie" covers 3 of the 4 real documents
+        // and "cherri" 2, and FT_WORD_MAX_DF_FRAC 0.1 needs thirty documents
+        // for 3-of-N to stay at the kept 10% boundary (see `filler_docs`) -
+        // "pie" would be dropped and the tf-30 "Cherry" document would
+        // outrank "Dessert_Recipes" otherwise. (The repeated "filler" term
+        // is not a query word, so its df is irrelevant to the filter.)
+        let index = make_index_padded(
+            &[
+                ("C/Cherry", cherry_terms.as_str(), "Cherry"),
+                ("C/Dessert_Recipes", "cherri cherri pie pie", "Dessert Recipes"),
+                ("C/Pie_1", pie_terms.as_str(), "Pie 1"),
+                ("C/Pie_2", pie_terms.as_str(), "Pie 2"),
+                ("C/Mango", "mango tropic tree sweet", "Mango"),
+                ("C/Peach", "peach orchard stone fruit", "Peach"),
+            ],
+            24,
+        );
         let content = [
             TestEntry { namespace: b'C', url: "Cherry", title: "Cherry", mime: 0, body: CHERRY_HTML.as_bytes() },
             TestEntry { namespace: b'C', url: "Dessert_Recipes", title: "Dessert Recipes", mime: 0, body: CHERRY_HTML.as_bytes() },
@@ -2147,15 +2260,23 @@ Meltwater streams out of the ice.
         let dir = tempfile::tempdir().unwrap();
         // Two archives; both carry an "Apple" article (same article, as in an
         // HTML and a Markdown edition of the same ZIM), plus one exclusive
-        // article each.
-        let index_a = make_index(&[
-            ("C/Apple", "appl histori 10 000 year domest wild kazakhstan comput devic nam", "Apple"),
-            ("C/Banana", "banana tree tall herbaceou plant growth", "Banana"),
-        ]);
-        let index_b = make_index(&[
-            ("C/Apple", "appl comput devic nam", "Apple"),
-            ("C/Cherry", "cherri pie fruit tree", "Cherry"),
-        ]);
+        // article each. Eight pad fillers per archive: the query words are
+        // each in one document, and FT_WORD_MAX_DF_FRAC 0.1 needs ten
+        // documents for that to stay kept (see `filler_docs`).
+        let index_a = make_index_padded(
+            &[
+                ("C/Apple", "appl histori 10 000 year domest wild kazakhstan comput devic nam", "Apple"),
+                ("C/Banana", "banana tree tall herbaceou plant growth", "Banana"),
+            ],
+            8,
+        );
+        let index_b = make_index_padded(
+            &[
+                ("C/Apple", "appl comput devic nam", "Apple"),
+                ("C/Cherry", "cherri pie fruit tree", "Cherry"),
+            ],
+            8,
+        );
         let content_a = [
             TestEntry { namespace: b'C', url: "Apple", title: "Apple", mime: 0, body: APPLE_HTML.as_bytes() },
             TestEntry { namespace: b'C', url: "Banana", title: "Banana", mime: 0, body: BANANA_HTML.as_bytes() },
@@ -2196,19 +2317,21 @@ Meltwater streams out of the ice.
         // A library opened from one ZIM file (no folder scan) behaves like a
         // scanned folder: the archive is addressed by its file name.
         let dir = tempfile::tempdir().unwrap();
-        let index = make_index(&[
-            (
-                "C/Salt",
-                "salt miner primari sodium chlorid himalaya deposit rock",
-                "Salt",
-            ),
-            // Fillers: a one-document index makes "salt" 100%-df - a
-            // background word the fulltext query's filter
-            // (FT_WORD_MAX_DF_FRAC) drops, and the search below would
-            // return nothing. Three documents keep it at 33%.
-            ("C/Banana", "banana tree tall herbaceou plant growth", "Banana"),
-            ("C/Cherry", "cherri pie fruit tree", "Cherry"),
-        ]);
+        // Seven pad fillers: "salt" is in one document, and
+        // FT_WORD_MAX_DF_FRAC 0.1 needs ten documents for that to stay kept
+        // (see `filler_docs`) - the fulltext hit below would vanish.
+        let index = make_index_padded(
+            &[
+                (
+                    "C/Salt",
+                    "salt miner primari sodium chlorid himalaya deposit rock",
+                    "Salt",
+                ),
+                ("C/Banana", "banana tree tall herbaceou plant growth", "Banana"),
+                ("C/Cherry", "cherri pie fruit tree", "Cherry"),
+            ],
+            7,
+        );
         let content = [
             TestEntry {
                 namespace: b'C',
@@ -2252,9 +2375,8 @@ Meltwater streams out of the ice.
         assert!(result.content.contains("sodium chloride"));
     }
 
-    /// A filler markdown article for fixtures that would otherwise carry a
-    /// one-document index (every word 100%-df, dropped by the fulltext
-    /// query's background-vocabulary filter).
+    /// A filler markdown article (see `filler_docs` for why small fixtures
+    /// carry filler documents at all).
     const BANANA_MD: &str = "\
 # Banana
 
@@ -2281,14 +2403,18 @@ Ancient India smelted zinc early.
     #[test]
     fn e2e_search_and_section_markdown() {
         let dir = tempfile::tempdir().unwrap();
-        let index = make_index(&[
-            ("C/Zinc", "zinc chemic element symbol smelt ancient india", "Zinc"),
-            // Fillers (same reason as e2e_search_and_get_single_file_library):
-            // a one-document index makes every word 100%-df, which the
-            // fulltext query's filter (FT_WORD_MAX_DF_FRAC) drops.
-            ("C/Banana", "banana tree tall herbaceou plant growth", "Banana"),
-            ("C/Glacier", "glacier ice dens movem weight flow", "Glacier"),
-        ]);
+        // Seven pad fillers (same reason as e2e_search_and_get_single_
+        // file_library): the query words ("zinc", "smelt") are each in one
+        // document, and FT_WORD_MAX_DF_FRAC 0.1 needs ten documents for
+        // that to stay kept (see `filler_docs`).
+        let index = make_index_padded(
+            &[
+                ("C/Zinc", "zinc chemic element symbol smelt ancient india", "Zinc"),
+                ("C/Banana", "banana tree tall herbaceou plant growth", "Banana"),
+                ("C/Glacier", "glacier ice dens movem weight flow", "Glacier"),
+            ],
+            7,
+        );
         let content = [
             TestEntry {
                 namespace: b'C',
