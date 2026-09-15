@@ -77,6 +77,8 @@ mod ffi {
         // Database
         pub fn xapian2_db_open(path: *const c_char, flags: c_int) -> *mut c_void;
         pub fn xapian2_db_open_fd(fd: c_int, flags: c_int) -> *mut c_void;
+        pub fn xapian2_db_doccount(db: *mut c_void) -> u32;
+        pub fn xapian2_db_termfreq(db: *mut c_void, term: *const c_char, len: u32) -> u32;
         pub fn xapian2_db_get_document(db: *mut c_void, did: u32) -> *mut c_void;
         pub fn xapian2_db_compact(db: *mut c_void, output: *const c_char) -> c_int;
         pub fn xapian2_db_compact_single_file(db: *mut c_void, output: *const c_char) -> c_int;
@@ -149,6 +151,7 @@ mod ffi {
         pub fn xapian2_mset_weight(m: *mut c_void, i: u32) -> f64;
         pub fn xapian2_mset_percent(m: *mut c_void, i: u32) -> i32;
         pub fn xapian2_mset_rank(m: *mut c_void, i: u32) -> u32;
+        pub fn xapian2_mset_termfreq(m: *mut c_void, term: *const c_char, len: u32) -> u32;
         pub fn xapian2_mset_convert_to_percent(m: *mut c_void, weight: f64) -> i32;
         pub fn xapian2_mset_get_document(m: *mut c_void, i: u32) -> *mut c_void;
         pub fn xapian2_mset_free(m: *mut c_void);
@@ -415,12 +418,29 @@ impl Database {
         Error::from_ptr(ptr, "failed to open embedded database").map(|ptr| Self { ptr })
     }
 
+    /// The number of documents in the database.
+    pub fn doc_count(&self) -> u32 {
+        // SAFETY: the handle is valid for the lifetime of `self`.
+        unsafe { ffi::xapian2_db_doccount(self.handle()) }
+    }
+
+    /// The number of documents in the database that index `term`
+    /// (`get_termfreq`, the term's document frequency); 0 for a term absent
+    /// from the index.
+    pub fn termfreq(&self, term: &str) -> u32 {
+        let bytes = term.as_bytes();
+        // SAFETY: `bytes` is a valid byte slice; the shim copies it.
+        unsafe {
+            ffi::xapian2_db_termfreq(self.handle(), bytes.as_ptr() as *const _, bytes.len() as u32)
+        }
+    }
+
     /// Fetch the document with the given id.
     ///
     /// Fails with `InvalidArgumentError` for id 0 and
     /// `DocNotFoundError` for unknown ids.
     pub fn get_document(&self, id: u32) -> Result<Document> {
-        // SAFETY: the handle is valid for the lifetime of `self`.
+        // SAFETY: see doc_count.
         let ptr = unsafe { ffi::xapian2_db_get_document(self.handle(), id) };
         Error::from_ptr(ptr, "failed to fetch document").map(|ptr| Document { ptr })
     }
@@ -428,7 +448,7 @@ impl Database {
     /// Produce a compacted glass *directory* at `output`.
     pub fn compact_to(&self, output: impl AsRef<Path>) -> Result<()> {
         let c_out = cstr(&output.as_ref().to_string_lossy())?;
-        // SAFETY: the handle is valid for the lifetime of `self`.
+        // SAFETY: see doc_count.
         let status = unsafe { ffi::xapian2_db_compact(self.handle(), c_out.as_ptr()) };
         Error::from_status(status)
     }
@@ -440,7 +460,7 @@ impl Database {
     /// `fulltext/xapian` item, and what [`Database::open_at`] can open.
     pub fn compact_single_file(&self, output: impl AsRef<Path>) -> Result<()> {
         let c_out = cstr(&output.as_ref().to_string_lossy())?;
-        // SAFETY: the handle is valid for the lifetime of `self`.
+        // SAFETY: see doc_count.
         let status = unsafe { ffi::xapian2_db_compact_single_file(self.handle(), c_out.as_ptr()) };
         Error::from_status(status)
     }
@@ -1023,6 +1043,16 @@ impl MSet {
         unsafe { ffi::xapian2_mset_rank(self.handle(), i) }
     }
 
+    /// The number of documents in which `term` occurs (as seen by this
+    /// match set).
+    pub fn termfreq(&self, term: &str) -> u32 {
+        let bytes = term.as_bytes();
+        // SAFETY: `bytes` is a valid byte slice; the shim copies it.
+        unsafe {
+            ffi::xapian2_mset_termfreq(self.handle(), bytes.as_ptr() as *const _, bytes.len() as u32)
+        }
+    }
+
     /// Convert an absolute weight to a 0-100 percentage, accounting for
     /// weighted query terms.
     pub fn convert_to_percent(&self, weight: f64) -> i32 {
@@ -1096,4 +1126,70 @@ impl ExactSizeIterator for MSetIter<'_> {}
 
 fn cstr(s: &str) -> Result<CString> {
     CString::new(s).map_err(|_| Error::new("input string contains an interior NUL byte"))
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A fresh scratch directory for a test database (std-only: the crate
+    /// has no dev-dependencies; pid-scoped like tests/search.rs).
+    fn temp_dir(name: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("xapian2-unit-{}-{name}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// Build a glass database indexing one document per `terms` string: the
+    /// whitespace-separated words are added as terms with wdf 1 each (a
+    /// repeated word gives it a higher within-document frequency), and the
+    /// data blob is the document's `doc N` position. Mirrors how the ZIM
+    /// indexes are built (unprefixed terms, no positions).
+    fn build_db(dir: &std::path::Path, docs: &[&str]) -> Database {
+        let db_dir = dir.join("db");
+        {
+            let mut wdb = WritableDatabase::create(&db_dir).unwrap();
+            for (i, terms) in docs.iter().enumerate() {
+                let mut doc = Document::new().unwrap();
+                doc.set_data(format!("doc {}", i + 1)).unwrap();
+                for t in terms.split_whitespace() {
+                    doc.add_term(t, 1).unwrap();
+                }
+                wdb.add_document(&doc).unwrap();
+            }
+            wdb.commit().unwrap();
+        }
+        Database::open(&db_dir).unwrap()
+    }
+
+    #[test]
+    fn term_frequency_bindings() {
+        let dir = temp_dir("termfreq");
+        let db = build_db(&dir, &["alpha", "beta", "alpha beta beta beta"]);
+
+        // Database::doc_count (Xapian's get_doccount).
+        assert_eq!(db.doc_count(), 3);
+        // Database::termfreq: the term's document frequency; 0 for a term
+        // absent from the index (beta occurs in two documents, though with
+        // wdf 3 in the third).
+        assert_eq!(db.termfreq("alpha"), 2);
+        assert_eq!(db.termfreq("beta"), 2);
+        assert_eq!(db.termfreq("zeta"), 0);
+
+        // MSet::termfreq reads the same figure off a match set.
+        let mut enquire = Enquire::new(&db).unwrap();
+        let q = Query::term("alpha").unwrap();
+        enquire.set_query(&q).unwrap();
+        let mset = enquire.get_mset(0, 10, 0).unwrap();
+        assert_eq!(mset.size(), 2);
+        assert_eq!(mset.termfreq("alpha"), 2);
+        assert_eq!(mset.termfreq("zeta"), 0);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
