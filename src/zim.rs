@@ -12,7 +12,7 @@ use memmap2::Mmap;
 use std::fs::File;
 use std::io::{self, ErrorKind};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use xapian2::Database as XapianDatabase;
 
@@ -579,6 +579,13 @@ impl Zim {
         Ok(None)
     }
 
+    /// Directory names under which a ZIM may store its `Language` metadata:
+    /// the current openZIM layout first (namespace is a dirent byte, urls
+    /// carry no prefix), then the historical variant (the url includes the
+    /// namespace). Probed like the search indexes above.
+    const LANGUAGE_METADATA_NAMES: &[(u8, &str)] =
+        &[(b'M', "Language"), (b'M', "M/Language")];
+
     /// The directory index of the full-text Xapian index entry, if the
     /// archive carries one.
     fn fulltext_index_entry(&self) -> io::Result<Option<u32>> {
@@ -589,6 +596,27 @@ impl Zim {
     /// carries one.
     fn title_index_entry(&self) -> io::Result<Option<u32>> {
         self.index_entry(Self::TITLE_INDEX_NAMES)
+    }
+
+    /// The archive's `Language` metadata (its first code, lowercased):
+    /// libzim stems the embedded search index with the stemmer chosen from
+    /// this metadata, so the query side must use the same language.
+    /// Separators split multi-code values ("eng, fre"); whitespace and case
+    /// are normalized away. `None` when the archive carries no Language
+    /// metadata. A tiny directory probe plus one small blob read.
+    fn language_metadata(&self) -> io::Result<Option<String>> {
+        for (ns, url) in Self::LANGUAGE_METADATA_NAMES {
+            let Some(idx) = self.find_entry(*ns, url)? else { continue };
+            let entry = self.get_entry(idx)?;
+            let Target::Cluster(cluster, blob) = entry.target else { continue };
+            let bytes = self.read_blob(cluster, blob)?;
+            let value = String::from_utf8_lossy(&bytes);
+            return Ok(value
+                .split(|c: char| c.is_whitespace() || c == ',' || c == ';')
+                .find(|code| !code.is_empty())
+                .map(str::to_lowercase));
+        }
+        Ok(None)
     }
 
     /// Open the Xapian database stored as the content of directory entry
@@ -682,6 +710,9 @@ pub struct Archive {
     /// Archive name relative to the ZIM directory (e.g. "wikipedia.zim").
     pub name: String,
     pub zim: Zim,
+    /// The archive's Language metadata, read once on first use (it decides
+    /// the stemmer of every search against this archive).
+    language: OnceLock<Option<String>>,
     /// Idle Xapian handle sets. Handles are moved in and out of the pool,
     /// never shared: `XapianDatabase` is `Send` (not `Sync`) because Xapian
     /// does not support concurrent calls on one database object.
@@ -690,7 +721,29 @@ pub struct Archive {
 
 impl Archive {
     pub fn new(name: String, zim: Zim) -> Self {
-        Self { name, zim, xapian_pool: Mutex::new(Vec::new()) }
+        Self { name, zim, language: OnceLock::new(), xapian_pool: Mutex::new(Vec::new()) }
+    }
+
+    /// The archive's Language metadata (first code, lowercased - see
+    /// [`Zim::language_metadata`]), read once and cached. `None` when the
+    /// archive carries no Language metadata; callers default to English
+    /// stemming, which matches the indexes of those archives.
+    pub fn language(&self) -> Option<String> {
+        self.language
+            .get_or_init(|| match self.zim.language_metadata() {
+                Ok(language) => {
+                    tracing::info!("{} Language metadata: {language:?}", self.name);
+                    language
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        "reading the Language metadata of {} failed ({e}); queries assume english stems",
+                        self.name
+                    );
+                    None
+                }
+            })
+            .clone()
     }
 
     pub fn article_count(&self) -> u32 {
@@ -970,6 +1023,15 @@ pub(crate) mod testutil {
         pub url: &'static str,
         pub title: &'static str,
         pub target_content: usize,
+    }
+
+    /// An `M/Language` metadata entry carrying `code` (the dirent layout a
+    /// real archive uses, namespace as the dirent byte): libzim stems the
+    /// archive's embedded search index with `code`'s stemmer, so tests that
+    /// hand-build an index can pair it with this entry to simulate any
+    /// language. Append it to `content`; it is not an article.
+    pub fn language_metadata_entry(code: &'static str) -> TestEntry {
+        TestEntry { namespace: b'M', url: "Language", title: "", mime: 0, body: code.as_bytes() }
     }
 
     fn push_zstring(buf: &mut Vec<u8>, s: &str) {
@@ -1304,6 +1366,29 @@ pub(crate) mod testutil {
     fn fulltext_index_absent_reports_none() {
         let (a, _f) = sample_archive();
         assert!(a.zim.open_fulltext_xapian().unwrap().is_none());
+    }
+
+    #[test]
+    fn language_metadata_first_code_lowercased_or_none() {
+        // With metadata: the first code, trimmed and lowercased (multi-code
+        // values occur; separators split them).
+        let content = [
+            TestEntry {
+                namespace: b'C',
+                url: "Apple",
+                title: "Apple",
+                mime: 0,
+                body: b"<html><body><h1>Apple</h1><p>An apple a day.</p></body></html>",
+            },
+            language_metadata_entry("FRA, eng"),
+        ];
+        let (z, _f) = open_bytes(&build_archive(&["text/html"], &content, &[], 0, None));
+        let a = Archive::new("fr.zim".to_string(), z);
+        assert_eq!(a.language().as_deref(), Some("fra"));
+        // Without metadata (the sample archive carries none): None - search
+        // defaults such archives to English stemming.
+        let (a, _f) = sample_archive();
+        assert_eq!(a.language(), None);
     }
 
     #[test]

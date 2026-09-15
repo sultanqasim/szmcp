@@ -9,7 +9,9 @@ use crate::zim::{Archive, ZimLibrary};
 use schemars::JsonSchema;
 use serde::Serialize;
 use std::sync::Arc;
-use xapian2::{Database, Enquire, Operator, Query, QueryParser, Stem, StemStrategy};
+use xapian2::{
+    resolve_stem_language, Database, Enquire, Operator, Query, QueryParser, Stem, StemStrategy,
+};
 
 /// Number of results `zim_search` returns in total (across all archives).
 const SEARCH_LIMIT: u32 = 20;
@@ -136,8 +138,9 @@ fn all_words_branch(
 
 /// A stemmer that remembers the stem of every word it has seen. Natural
 /// text repeats its words heavily, and every uncached stem crosses the
-/// Xapian FFI; one instance serves a whole search (the query terms and all
-/// hits' paragraph matchers), so repeats dominate after the first hit.
+/// Xapian FFI; one instance serves one archive's whole search (its query
+/// terms and all its hits' paragraph matchers), so repeats dominate after
+/// the first hit.
 struct Stemmer {
     stem: Stem,
     cache: std::collections::HashMap<String, String>,
@@ -163,6 +166,47 @@ impl Stemmer {
     }
 }
 
+/// One archive's view of a query (see [`search`]): the archive's stemmer,
+/// the query's terms stemmed with it, and the query parsed with the same
+/// stemmer. All three depend on the archive's language - libzim builds
+/// each archive's embedded index with the stemmer chosen from the
+/// archive's `Language` metadata, so querying a French archive with an
+/// English stemmer finds nothing (and vice versa).
+struct ArchiveQuery {
+    stemmer: Stemmer,
+    terms: Vec<String>,
+    xquery: Query,
+}
+
+impl ArchiveQuery {
+    fn build(arc: &Archive, query: &str) -> Result<Self, ToolError> {
+        // The archive's own stemmer language: its Language metadata, with
+        // the metadata code mapped to a language Xapian accepts (ISO-639-3
+        // "fra" -> "fr"; unknown -> no stemming). Archives without the
+        // metadata keep English stems - that is what their indexes use.
+        let language = arc.language().unwrap_or_else(|| "eng".to_string());
+        let language = resolve_stem_language(&language);
+        let mut stemmer = Stemmer::new(&language).map_err(|e| {
+            ToolError::Internal(format!("failed to create {language} stemmer: {}", e.msg()))
+        })?;
+        let terms = query_terms(query, &mut stemmer);
+
+        // openZIM's full-text indexes contain unprefixed Porter2 stems
+        // (libzim indexes with STEM_ALL), so queries must be stemmed the
+        // same way - Xapian's default strategy would turn lowercase terms
+        // into "Z"-prefixed stem terms that never match. Default
+        // combining op is OR.
+        let mut qp = QueryParser::new()?;
+        qp.set_stemmer(&language)?;
+        qp.set_stemming_strategy(StemStrategy::All)?;
+        qp.set_default_op(Operator::Or)?;
+        let xquery = qp
+            .parse_query(query)
+            .map_err(|e| ToolError::InvalidArgument(format!("failed to parse query: {e}")))?;
+        Ok(Self { stemmer, terms, xquery })
+    }
+}
+
 /// Search all articles in all ZIM files of the library - the pipeline behind
 /// the `zim_search` tool: ranked hits, best first.
 pub fn search(library: &ZimLibrary, query: &str) -> Result<SearchResults, ToolError> {
@@ -170,29 +214,9 @@ pub fn search(library: &ZimLibrary, query: &str) -> Result<SearchResults, ToolEr
         return Err(ToolError::InvalidArgument("query must not be empty".into()));
     }
 
-    let mut qp = QueryParser::new()?;
-    // openZIM's full-text indexes contain unprefixed Porter2/English stems
-    // (libzim indexes with STEM_ALL), so queries must be stemmed the same
-    // way - Xapian's default strategy would turn lowercase terms into
-    // "Z"-prefixed stem terms that never match. Default combining op is OR.
-    qp.set_stemmer("english")?;
-    qp.set_stemming_strategy(StemStrategy::All)?;
-    qp.set_default_op(Operator::Or)?;
-    let xquery = qp
-        .parse_query(query)
-        .map_err(|e| ToolError::InvalidArgument(format!("failed to parse query: {e}")))?;
-
-    // The query's terms drive three things: the all-words branch of the
-    // full-text query (built per archive below, from that archive's term
-    // statistics - see `all_words_branch`), the title-index band, and the
-    // paragraph matching when the hits are built - one stemmer serves all
-    // three. The parsed OR side of the full-text query is final here.
-    let mut stemmer = Stemmer::new("english")?;
-    let terms = query_terms(query, &mut stemmer);
-
-    /// Which band produced a hit. Exact and title-index hits are title
-    /// matches: their preview is the lead paragraph and `sections` is
-    /// omitted.
+    // Which band produced a hit. Exact and title-index hits are title
+    // matches: their preview is the lead paragraph and `sections` is
+    // omitted.
     #[derive(Clone, Copy, PartialEq)]
     enum HitKind {
         /// Exact title/URL probe hit (the ZIM directory itself).
@@ -202,6 +226,21 @@ pub fn search(library: &ZimLibrary, query: &str) -> Result<SearchResults, ToolEr
         /// Hit from the archive's full-text index.
         Fulltext,
     }
+
+    // One query view per archive, in `library.archives` order: libzim
+    // stems each archive's embedded index with the stemmer chosen from
+    // that archive's Language metadata, so the parsed query, the stemmed
+    // terms, and the stemmer used for hit previews are per archive (one
+    // English stemmer used to find nothing on a Language=fra archive).
+    // The terms drive the all-words branch of the full-text query (built
+    // per archive from that archive's term statistics - see
+    // `all_words_branch`), the title-index band, and the paragraph
+    // matching when the hits are built.
+    let mut queries: Vec<ArchiveQuery> = library
+        .archives
+        .iter()
+        .map(|arc| ArchiveQuery::build(arc, query))
+        .collect::<Result<_, ToolError>>()?;
 
     // Exact title/URL matches, found in the ZIM directory itself: redirects
     // are not in the search indexes, and a query that names an article
@@ -236,7 +275,11 @@ pub fn search(library: &ZimLibrary, query: &str) -> Result<SearchResults, ToolEr
     let mut title_lists: Vec<(&Arc<Archive>, Vec<(String, String)>)> = Vec::new();
     // Full-text band: (weight, path, title from the index).
     let mut per_archive: Vec<(&Arc<Archive>, Vec<(f64, String, String)>)> = Vec::new();
-    for arc in &library.archives {
+    for (arc, query_state) in library.archives.iter().zip(queries.iter_mut()) {
+        // This archive's query: its stemmed terms (title band + all-words
+        // branch + paragraph matching) and its parsed query (full text).
+        let terms = &query_state.terms;
+        let xquery = &query_state.xquery;
         // Paths already reported as exact title/URL matches for THIS archive:
         // the title band must not report them again (the skip below).
         let exact_paths: std::collections::HashSet<&str> = merged
@@ -423,7 +466,21 @@ pub fn search(library: &ZimLibrary, query: &str) -> Result<SearchResults, ToolEr
         // Markdown editions carry plain Markdown, not HTML: pick the matching
         // splitter so the paragraphs and section names are free of markup.
         let is_markdown = mime.as_deref().is_some_and(|m| m.contains("markdown"));
-        let (preview, sections) = hit_preview(&article, &terms, title_match, &mut stemmer, is_markdown);
+        // Paragraph matching uses the hit's archive stemmer and terms (the
+        // archive is always from the library, so the lookup cannot fail).
+        let qi = library
+            .archives
+            .iter()
+            .position(|a| Arc::ptr_eq(a, arc))
+            .expect("hit archive is from the library");
+        let query_state = &mut queries[qi];
+        let (preview, sections) = hit_preview(
+            &article,
+            &query_state.terms,
+            title_match,
+            &mut query_state.stemmer,
+            is_markdown,
+        );
         hits.push(SearchHit {
             zim: arc.name.clone(),
             path: path.clone(),
@@ -593,7 +650,9 @@ pub(crate) mod tests {
         ZimGetParams, ZimGetSectionParams, ZimGetSectionTool, ZimGetTool, ZimMcpServer,
         ZimSearchParams, ZimSearchTool,
     };
-    use crate::zim::testutil::{build_archive, build_archive_indexes, TestEntry, TestRedirect};
+    use crate::zim::testutil::{
+        build_archive, build_archive_indexes, language_metadata_entry, TestEntry, TestRedirect,
+    };
     use rmcp::handler::server::router::tool::AsyncTool;
     use std::future::Future;
     use xapian2::{Database, Document, Enquire, WritableDatabase};
@@ -713,8 +772,21 @@ Meltwater streams out of the ice.
     /// document data is the article's full path inside the archive, the
     /// title sits in value slot 0, and the terms are unprefixed Porter2
     /// stems, exactly as libzim indexes with STEM_ALL ("appl" is the stem
-    /// of "apple", "comput" of "computing").
+    /// of "apple", "comput" of "computing"). The terms are passed in
+    /// already stemmed (the English stem shapes the existing tests use).
     fn make_index(docs: &[(&str, &str, &str)]) -> Vec<u8> {
+        make_index_stemmed(None, docs)
+    }
+
+    /// [`make_index`], parameterized by the index language: `Some(code)`
+    /// stems the given SURFACE words with that language's stemmer (resolved
+    /// exactly like the query side resolves an archive's Language metadata),
+    /// the way libzim stems an archive's content with its Language
+    /// metadata. `None` adds the terms verbatim.
+    fn make_index_stemmed(language: Option<&str>, docs: &[(&str, &str, &str)]) -> Vec<u8> {
+        let mut stem = language.map(|code| {
+            Stem::new(&resolve_stem_language(code)).expect("resolved language must be stemmable")
+        });
         let dir = tempfile::tempdir().unwrap();
         let db_dir = dir.path().join("db");
         {
@@ -726,7 +798,11 @@ Meltwater streams out of the ice.
                     doc.set_value(0, *title).unwrap();
                 }
                 for t in terms.split_whitespace() {
-                    doc.add_term(t, 1).unwrap();
+                    let term = match &mut stem {
+                        Some(stem) => stem.apply(&t.to_lowercase()).unwrap(),
+                        None => t.to_string(),
+                    };
+                    doc.add_term(&term, 1).unwrap();
                 }
                 wdb.add_document(&doc).unwrap();
             }
@@ -753,6 +829,106 @@ Meltwater streams out of the ice.
         let library = Arc::new(ZimLibrary::scan(dir.path()).unwrap());
         assert!(library.archives[0].searchable());
         (ZimMcpServer::new(library), dir)
+    }
+
+    #[test]
+    fn stem_language_resolution() {
+        // Xapian rejects ISO-639-3 codes (Stem::new("fra") throws
+        // "Language code fra unknown") and only knows English names plus
+        // two-letter ISO-639-1 codes: the fallback maps a 639-3 metadata
+        // code to its two-letter prefix ("fra" -> French stemming).
+        assert_eq!(resolve_stem_language("fra"), "fr");
+        assert_eq!(resolve_stem_language("eng"), "en");
+        // Full names and 639-1 codes pass through unchanged.
+        assert_eq!(resolve_stem_language("french"), "french");
+        assert_eq!(resolve_stem_language("fr"), "fr");
+        assert_eq!(resolve_stem_language("en"), "en");
+        // Languages Xapian cannot stem (Chinese) and garbage fall back to
+        // no stemming - never an error, never a made-up stemmer.
+        assert_eq!(resolve_stem_language("zho"), "none");
+        assert_eq!(resolve_stem_language("zh"), "none");
+        assert_eq!(resolve_stem_language(""), "none");
+    }
+
+    #[test]
+    fn resolved_stemmer_stems_like_the_index_language() {
+        // The "fra" fallback really stems FRENCH: inflected forms share a
+        // stem, and it stems deeper than the English stemmer (which only
+        // strips the plural "s" of "élections").
+        let mut fr = Stemmer::new(&resolve_stem_language("fra")).unwrap();
+        let plural = fr.stem("élections").to_string();
+        assert_eq!(plural, fr.stem("élection"));
+        assert_ne!(
+            fr.stem("élections"),
+            Stemmer::new(&resolve_stem_language("eng")).unwrap().stem("élections")
+        );
+        // "zho" resolves to no stemming: words come back unchanged (a
+        // Chinese index and Chinese queries then agree word for word).
+        let mut zh = Stemmer::new(&resolve_stem_language("zho")).unwrap();
+        assert_eq!(zh.stem("的"), "的");
+        assert_eq!(zh.stem("Élections"), "élections");
+    }
+
+    /// A Language=fra archive whose index was built with French stems
+    /// (make_index_stemmed mirrors libzim's indexer): the inflected query
+    /// form "élections" matches only after FRENCH stemming ("élect") - the
+    /// English stemmer leaves "élection" whole, which is why French
+    /// inflected forms used to miss on this archive.
+    #[test]
+    fn e2e_search_stems_queries_with_the_archive_language() {
+        let dir = tempfile::tempdir().unwrap();
+        let index = make_index_stemmed(
+            Some("fra"),
+            &[
+                (
+                    "C/Élection",
+                    "une élection est un scrutin les élections présidentielles ont lieu \
+                     tous les cinq ans",
+                    "Élection",
+                ),
+                (
+                    "C/Géographie",
+                    "la géographie étudie les paysages et les reliefs de la terre",
+                    "Géographie",
+                ),
+            ],
+        );
+        let election_html: &'static [u8] = "<html><body><h1>Élection</h1>\
+            <p>Une élection est un scrutin. Les élections présidentielles \
+            ont lieu tous les cinq ans.</p></body></html>".as_bytes();
+        let geo_html: &'static [u8] = "<html><body><h1>Géographie</h1>\
+            <p>La géographie étudie les paysages.</p></body></html>".as_bytes();
+        let content = [
+            TestEntry { namespace: b'C', url: "Élection", title: "Élection", mime: 0, body: election_html },
+            TestEntry { namespace: b'C', url: "Géographie", title: "Géographie", mime: 0, body: geo_html },
+            language_metadata_entry("fra"),
+        ];
+        let bytes = build_archive(&["text/html"], &content, &[], 0, Some(&index));
+        std::fs::write(dir.path().join("fr.zim"), &bytes).unwrap();
+        let library = Arc::new(ZimLibrary::scan(dir.path()).unwrap());
+        assert_eq!(library.archives[0].language().as_deref(), Some("fra"));
+        let server = ZimMcpServer::new(library);
+
+        // The inflected plural form hits - only French stemming gets there.
+        let hits = search(&server, "élections");
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].path, "C/Élection");
+        assert!(!hits[0].preview.is_empty());
+        // The singular form shares the French stem ("élect").
+        let hits = search(&server, "élection");
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].path, "C/Élection");
+        // The other article matches its own (accented) words...
+        let hits = search(&server, "paysages");
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].path, "C/Géographie");
+        // ...and not the election words (no cross-language stem collisions).
+        let hits = search(&server, "scrutin");
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].path, "C/Élection");
+        // Nothing matches a term absent from the index.
+        let hits = search(&server, "zzzzz");
+        assert!(hits.is_empty());
     }
 
     #[test]

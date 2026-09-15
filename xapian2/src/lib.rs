@@ -669,6 +669,34 @@ impl Drop for Stem {
 // (scratch buffer); moving it between threads is safe.
 unsafe impl Send for Stem {}
 
+/// Resolve a language code from a ZIM's `Language` metadata (an ISO-639-3
+/// code like `fra`, sometimes a full English name) to a language string
+/// Xapian's stemmers accept. Xapian only knows English names and two-letter
+/// ISO-639-1 codes (`Stem::new("fra")` fails with "Language code fra
+/// unknown"), so an unrecognized code is retried as its first two letters -
+/// which is also how libzim stems an `fra` archive with the *French*
+/// stemmer - and a still unknown one falls back to `none` (no stemming):
+/// the right behavior for languages Xapian cannot stem at all (e.g.
+/// Chinese). No language dictionary: acceptance is decided by Xapian
+/// itself, so new stemmers keep working transparently (an empty code
+/// resolves to `none` too). The returned string works for both
+/// [`Stem::new`] and [`QueryParser::set_stemmer`], so query and index
+/// stemming can never drift apart.
+pub fn resolve_stem_language(code: &str) -> String {
+    let code = code.trim().to_lowercase();
+    if code.is_empty() {
+        return "none".to_string();
+    }
+    if Stem::new(&code).is_ok() {
+        return code;
+    }
+    let two: String = code.chars().take(2).collect();
+    if two.chars().count() == 2 && Stem::new(&two).is_ok() {
+        return two;
+    }
+    "none".to_string()
+}
+
 // ---------------------------------------------------------------------------
 // WritableDatabase (minimal: build/test databases)
 // ---------------------------------------------------------------------------
