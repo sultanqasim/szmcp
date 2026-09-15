@@ -93,22 +93,29 @@ fn fold_accents(text: &str) -> String {
         .collect()
 }
 
-/// The query's words for the title tier: split on whitespace, keep
-/// alphanumeric characters only per word, lowercase, one entry per distinct
-/// word in first-occurrence order. The title index stores titles as written
-/// - lowercased, accent-folded surface forms (measured on md1m:
-/// df("beatles")=186 against df("beatl")=0) - so the tier must match the
-/// words exactly as they appear. The query text arrives accent-folded
+/// The query's words for the title tier: split on runs of non-alphanumeric
+/// characters (whitespace AND intra-word punctuation), lowercase, one entry
+/// per distinct word in first-occurrence order. The title index stores
+/// titles as written - lowercased, accent-folded surface forms (measured on
+/// md1m: df("beatles")=186 against df("beatl")=0) - so the tier must match
+/// the words exactly as they appear. The query text arrives accent-folded
 /// already (see `search`).
+///
+/// The split must include punctuation, not just whitespace: index terms are
+/// split the same way (libzim's indexer breaks text on non-alphanumeric
+/// characters), so a title "Notre-Dame de Paris" is carried as the terms
+/// `notre` (df 164) and `dame` (df 191) on fr.zim's title index, never as a
+/// fused `notredame`. Stripping punctuation instead of splitting fused
+/// "notre-dame" into "notredame" - a term with df 0 - and the title tier's
+/// AND silently matched nothing for any query with a punctuation-delimited
+/// word.
 fn title_words(query: &str) -> Vec<String> {
     let mut words: Vec<String> = Vec::new();
-    for word in query.split_whitespace() {
-        // Punctuation never appears in index terms either, so strip it.
-        let word: String = word.chars().filter(|c| c.is_alphanumeric()).collect();
-        let word = word.to_lowercase();
+    for word in query.split(|c: char| !c.is_alphanumeric()) {
         if word.is_empty() {
             continue;
         }
+        let word = word.to_lowercase();
         if !words.contains(&word) {
             words.push(word);
         }
@@ -238,11 +245,24 @@ impl ArchiveQuery {
         }
         // The fulltext tier's filterable words: the folded query's tokens
         // as written, each paired with the stem of its alphanumeric-only
-        // form - what the archive's index carries, so what the df filter
-        // (see `fulltext_query`) looks up. A punctuation-only token ("-",
-        // "!" ... after the fold) has no alphanumeric form; its empty stem
-        // matches nothing, df 0, and the token is kept - the parser sees
-        // it, as it did before the filter existed.
+        // form - the df filter's lookup key (see `fulltext_query`). The
+        // bare form is deliberately FUSED (non-alphanumeric characters
+        // stripped, not split): it is not meant to be a term of the index
+        // but a conservative key. A fused hyphenated compound like
+        // "notre-dame" -> "notredame" is a word no document text contains
+        // (the indexer splits on non-alphanumeric characters, exactly like
+        // `title_words`), so its df measures 0 and the filter always keeps
+        // the token - hyphenated compounds are discriminative, and the
+        // QueryParser splits the token as written anyway. The pathological
+        // shape is a fused form colliding with a common standalone word
+        // ("u.s." -> "us", the df of the ordinary word "us"): such a token
+        // can be dropped from the FULLTEXT query though its parts are rare
+        // - accepted, as the loss is one OR term (the title tier still
+        // carries every split word, and BM25 ranks whatever remains). A
+        // punctuation-only token ("-", "!" ... after the fold) has no
+        // alphanumeric form; its empty stem matches nothing, df 0, and the
+        // token is kept - the parser sees it, as it did before the filter
+        // existed.
         let mut ft_words: Vec<String> = Vec::new();
         let mut ft_stems: Vec<String> = Vec::new();
         for token in query.split_whitespace() {
@@ -1639,6 +1659,70 @@ Meltwater streams out of the ice.
         assert_eq!(hits[0].path, "C/Movie1", "{hits:?}");
         assert_eq!(hits[1].path, "C/Physics2", "{hits:?}");
         assert_eq!(hits[2].path, "C/Physics1", "{hits:?}");
+    }
+
+    /// An archive whose title index carries a punctuation-delimited title
+    /// exactly the way libzim's indexer stores titles: "Cathédrale
+    /// Notre-Dame de Paris" is indexed as the folded surface words
+    /// cathedrale, notre, dame, de, paris - the indexer splits on
+    /// non-alphanumeric characters, so no fused "notredame" term exists
+    /// (measured on fr.zim's title index: notre df=164, dame df=191,
+    /// notredame absent). The article's full-text document matches none of
+    /// the query's words, so the title band is the ONLY tier that can
+    /// retrieve it.
+    fn hyphen_title_test_server() -> (ZimMcpServer, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        let titles = make_index(&[
+            (
+                "C/Notre_Dame_De_Paris",
+                "cathedrale notre dame de paris",
+                "Cathédrale Notre-Dame de Paris",
+            ),
+        ]);
+        let index = make_index(&[
+            ("C/Notre_Dame_De_Paris", "church gothic island french landmark", "Notre-Dame"),
+        ]);
+        let notre_dame_html: &'static [u8] = "<html><body><h1>Cathédrale Notre-Dame de Paris</h1>\
+            <p>The cathedral stands on the Île de la Cité.</p></body></html>".as_bytes();
+        let content = [
+            TestEntry {
+                namespace: b'C',
+                url: "Notre_Dame_De_Paris",
+                title: "",
+                mime: 0,
+                body: notre_dame_html,
+            },
+        ];
+        let bytes = build_archive_indexes(&["text/html"], &content, &[], 0, Some(&index), Some(&titles));
+        std::fs::write(dir.path().join("test.zim"), &bytes).unwrap();
+        let library = Arc::new(ZimLibrary::scan(dir.path()).unwrap());
+        assert!(library.archives[0].searchable());
+        (ZimMcpServer::new(library), dir)
+    }
+
+    #[test]
+    fn e2e_search_title_band_splits_punctuation_delimited_words() {
+        let (server, _keep) = hyphen_title_test_server();
+
+        // The title tier's AND is built from the query's punctuation-SPLIT
+        // words (cathedrale, notre, dame, de, paris): every one is a term
+        // of the title-index document, so the article is found, styled as a
+        // title match (first intro sentence, no sections). While
+        // `title_words` still FUSED punctuation-delimited words
+        // ("notre-dame" -> "notredame"), the AND queried a term no title
+        // document carries and the band came back silently empty - this
+        // search returned nothing at all.
+        let hits = search(&server, "cathédrale notre-dame de paris");
+        assert_eq!(hits.len(), 1, "{hits:?}");
+        assert_eq!(hits[0].path, "C/Notre_Dame_De_Paris", "{hits:?}");
+        assert_eq!(hits[0].title, "Cathédrale Notre-Dame de Paris");
+        assert_eq!(hits[0].preview, "The cathedral stands on the Île de la Cité.");
+        assert_eq!(hits[0].sections, None);
+
+        // The fused form is nobody's term: not a URL/title, not in the
+        // title index (the indexer splits it), not in the full-text index.
+        let hits = search(&server, "notredame");
+        assert!(hits.is_empty(), "{hits:?}");
     }
 
     /// An archive where BM25 alone ranks the wrong article first: the
