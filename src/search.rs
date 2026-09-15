@@ -76,10 +76,32 @@ pub struct SearchResults {
     pub results: Vec<SearchHit>,
 }
 
+/// Fold accents away the way the ZIM indexes were built: libzim runs every
+/// indexed text through the ICU transliterator `Lower; NFD; [:M:] remove;
+/// NFC` (`removeAccents` in libzim's tools.cpp) - lowercase, canonically
+/// decompose, drop the combining marks, recompose - so "élections" is
+/// indexed as "elections" and neither embedded index carries accented terms
+/// (measured on fr.zim's full-text index: "revolu" df 11042, every accented
+/// variant absent). Query words must take the same route or every accented
+/// word misses the index entirely. Marks outside U+0300..=U+036F (Hebrew
+/// nikkud, Arabic harakat, Indic vowel signs) are not stripped - no measured
+/// archive carries them; every mark a Latin, Greek, or Cyrillic letter
+/// decomposes to sits in that range.
+fn fold_accents(text: &str) -> String {
+    use unicode_normalization::UnicodeNormalization;
+    text.to_lowercase()
+        .nfd()
+        .filter(|c| !('\u{300}'..='\u{36f}').contains(c))
+        .nfc()
+        .collect()
+}
+
 /// The query's non-stopword terms, stemmed the way the ZIM full-text
-/// indexes were built (unprefixed Porter2 stems, lowercased): split on
-/// whitespace, keep alphanumeric characters only per word, lowercase, drop
-/// stopwords, stem, dedupe (preserving first-occurrence order).
+/// indexes were built (accent-folded, lowercased, unprefixed Porter2
+/// stems): split on whitespace, keep alphanumeric characters only per word,
+/// lowercase, drop stopwords, stem, dedupe (preserving first-occurrence
+/// order). The query text arrives accent-folded already (see `search`);
+/// the fold in [`Stemmer::stem`] is idempotent.
 fn query_terms(query: &str, stem: &mut Stemmer) -> Vec<String> {
     let mut terms: Vec<String> = Vec::new();
     for word in query.split_whitespace() {
@@ -154,12 +176,15 @@ impl Stemmer {
         })
     }
 
-    /// The word's stem, cased and stemmed the way `query_terms` and the ZIM
-    /// full-text indexes were built (lowercased Porter2 stems).
+    /// The word's stem, built the way `query_terms` and the ZIM full-text
+    /// indexes were built (accents folded - see [`fold_accents`] - then
+    /// lowercased Porter2 stems). Hit-preview paragraph matching feeds raw
+    /// article words through here, so the fold keeps them comparable with
+    /// the folded query terms (the index never saw the accents either).
     fn stem(&mut self, word: &str) -> &str {
         if !self.cache.contains_key(word) {
-            let lowered = word.to_lowercase();
-            let stemmed = self.stem.apply(&lowered).unwrap_or(lowered);
+            let folded = fold_accents(word);
+            let stemmed = self.stem.apply(&folded).unwrap_or(folded);
             self.cache.insert(word.to_string(), stemmed);
         }
         self.cache[word].as_str()
@@ -191,11 +216,13 @@ impl ArchiveQuery {
         })?;
         let terms = query_terms(query, &mut stemmer);
 
-        // openZIM's full-text indexes contain unprefixed Porter2 stems
-        // (libzim indexes with STEM_ALL), so queries must be stemmed the
-        // same way - Xapian's default strategy would turn lowercase terms
-        // into "Z"-prefixed stem terms that never match. Default
-        // combining op is OR.
+        // openZIM's full-text indexes contain unprefixed, accent-folded
+        // Porter2 stems (libzim indexes STEM_ALL over removeAccents'd
+        // text), so queries must be stemmed the same way - Xapian's default
+        // strategy would turn lowercase terms into "Z"-prefixed stem terms
+        // that never match. The query arrives accent-folded (see `search`),
+        // so the parser's unstemmed terms land in the index's folded
+        // vocabulary too. Default combining op is OR.
         let mut qp = QueryParser::new()?;
         qp.set_stemmer(&language)?;
         qp.set_stemming_strategy(StemStrategy::All)?;
@@ -213,6 +240,13 @@ pub fn search(library: &ZimLibrary, query: &str) -> Result<SearchResults, ToolEr
     if query.trim().is_empty() {
         return Err(ToolError::InvalidArgument("query must not be empty".into()));
     }
+
+    // Fold the query like the index text (see `fold_accents`): the parsed
+    // full-text query and the stemmed terms must use the index's folded
+    // vocabulary ("révolution" is indexed as "revolution"). The exact
+    // title/URL probe below still gets the raw query - article paths and
+    // directory titles carry their accents ("C/Université").
+    let folded_query = fold_accents(query);
 
     // Which band produced a hit. Exact and title-index hits are title
     // matches: their preview is the lead paragraph and `sections` is
@@ -239,7 +273,7 @@ pub fn search(library: &ZimLibrary, query: &str) -> Result<SearchResults, ToolEr
     let mut queries: Vec<ArchiveQuery> = library
         .archives
         .iter()
-        .map(|arc| ArchiveQuery::build(arc, query))
+        .map(|arc| ArchiveQuery::build(arc, &folded_query))
         .collect::<Result<_, ToolError>>()?;
 
     // Exact title/URL matches, found in the ZIM directory itself: redirects
@@ -779,10 +813,11 @@ Meltwater streams out of the ice.
     }
 
     /// [`make_index`], parameterized by the index language: `Some(code)`
-    /// stems the given SURFACE words with that language's stemmer (resolved
-    /// exactly like the query side resolves an archive's Language metadata),
-    /// the way libzim stems an archive's content with its Language
-    /// metadata. `None` adds the terms verbatim.
+    /// folds and stems the given SURFACE words with that language's stemmer
+    /// (resolved exactly like the query side resolves an archive's Language
+    /// metadata, accents folded away first), the way libzim indexes an
+    /// archive's content with its Language metadata (removeAccents, then
+    /// the stemmer). `None` adds the terms verbatim.
     fn make_index_stemmed(language: Option<&str>, docs: &[(&str, &str, &str)]) -> Vec<u8> {
         let mut stem = language.map(|code| {
             Stem::new(&resolve_stem_language(code)).expect("resolved language must be stemmable")
@@ -799,7 +834,8 @@ Meltwater streams out of the ice.
                 }
                 for t in terms.split_whitespace() {
                     let term = match &mut stem {
-                        Some(stem) => stem.apply(&t.to_lowercase()).unwrap(),
+                        // libzim folds before stemming (removeAccents).
+                        Some(stem) => stem.apply(&fold_accents(t)).unwrap(),
                         None => t.to_string(),
                     };
                     doc.add_term(&term, 1).unwrap();
@@ -851,22 +887,41 @@ Meltwater streams out of the ice.
     }
 
     #[test]
+    fn fold_accents_mirrors_the_index_folding() {
+        // libzim's "Lower; NFD; [:M:] remove; NFC" transliterator.
+        assert_eq!(fold_accents("Révolution française"), "revolution francaise");
+        assert_eq!(fold_accents("ÉLECTIONS"), "elections");
+        // No canonical decomposition: ß, ø, and the Œ ligature keep their
+        // shape (NFD leaves them whole, so the index does too).
+        assert_eq!(fold_accents("Straße"), "straße");
+        assert_eq!(fold_accents("Ørestad Øl"), "ørestad øl");
+        // ASCII passes through untouched (the EN pipeline is a no-op).
+        assert_eq!(fold_accents("Black Holes!"), "black holes!");
+    }
+
+    #[test]
     fn resolved_stemmer_stems_like_the_index_language() {
         // The "fra" fallback really stems FRENCH: inflected forms share a
-        // stem, and it stems deeper than the English stemmer (which only
-        // strips the plural "s" of "élections").
+        // stem - the FOLDED stem the index carries ("elections" -> "elect";
+        // the fold in `Stemmer::stem` happens before stemming, like libzim's
+        // removeAccents before its TermGenerator).
         let mut fr = Stemmer::new(&resolve_stem_language("fra")).unwrap();
         let plural = fr.stem("élections").to_string();
         assert_eq!(plural, fr.stem("élection"));
+        assert_eq!(plural, "elect");
+        // It still stems deeper than the English stemmer where the
+        // languages genuinely diverge ("chevaux": French "cheval",
+        // English leaves the word whole).
         assert_ne!(
-            fr.stem("élections"),
-            Stemmer::new(&resolve_stem_language("eng")).unwrap().stem("élections")
+            fr.stem("chevaux"),
+            Stemmer::new(&resolve_stem_language("eng")).unwrap().stem("chevaux")
         );
-        // "zho" resolves to no stemming: words come back unchanged (a
-        // Chinese index and Chinese queries then agree word for word).
+        // "zho" resolves to no stemming: words come back accent-folded and
+        // lowercased but unstemed (a Chinese index and Chinese queries then
+        // agree word for word).
         let mut zh = Stemmer::new(&resolve_stem_language("zho")).unwrap();
         assert_eq!(zh.stem("的"), "的");
-        assert_eq!(zh.stem("Élections"), "élections");
+        assert_eq!(zh.stem("Élections"), "elections");
     }
 
     /// A Language=fra archive whose index was built with French stems
@@ -891,6 +946,11 @@ Meltwater streams out of the ice.
                     "la géographie étudie les paysages et les reliefs de la terre",
                     "Géographie",
                 ),
+                (
+                    "C/École",
+                    "une école primaire accueille les enfants du village",
+                    "École",
+                ),
             ],
         );
         let election_html: &'static [u8] = "<html><body><h1>Élection</h1>\
@@ -898,9 +958,12 @@ Meltwater streams out of the ice.
             ont lieu tous les cinq ans.</p></body></html>".as_bytes();
         let geo_html: &'static [u8] = "<html><body><h1>Géographie</h1>\
             <p>La géographie étudie les paysages.</p></body></html>".as_bytes();
+        let school_html: &'static [u8] = "<html><body><h1>École</h1>\
+            <p>Une école primaire accueille les enfants du village.</p></body></html>".as_bytes();
         let content = [
             TestEntry { namespace: b'C', url: "Élection", title: "Élection", mime: 0, body: election_html },
             TestEntry { namespace: b'C', url: "Géographie", title: "Géographie", mime: 0, body: geo_html },
+            TestEntry { namespace: b'C', url: "École", title: "École", mime: 0, body: school_html },
             language_metadata_entry("fra"),
         ];
         let bytes = build_archive(&["text/html"], &content, &[], 0, Some(&index));
@@ -926,6 +989,15 @@ Meltwater streams out of the ice.
         let hits = search(&server, "scrutin");
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].path, "C/Élection");
+        // An accented inflected form finds the school article through the
+        // FOLD: "écoles" folds to "ecoles" and stems to "ecol", the index
+        // term of "école" (the fold runs before the stemmer, like libzim's
+        // removeAccents). Unfolded, the query stems to "écol" and the
+        // folded index term matches nothing.
+        let hits = search(&server, "écoles");
+        assert_eq!(hits.len(), 1, "{hits:?}");
+        assert_eq!(hits[0].path, "C/École");
+        assert_eq!(hits[0].title, "École");
         // Nothing matches a term absent from the index.
         let hits = search(&server, "zzzzz");
         assert!(hits.is_empty());

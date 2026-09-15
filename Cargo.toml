@@ -25,6 +25,7 @@ memmap2 = "0.9"
 zstd = "0.13"
 xz2 = "0.1"
 base64 = "0.22"
+unicode-normalization = "0.1"
 
 [dev-dependencies]
 tempfile = "3"
