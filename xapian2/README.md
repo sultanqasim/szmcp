@@ -21,12 +21,12 @@ there is no `open_memview`, the default query operator is `Or`, etc.).
 
 | Type | Key methods | Send / Sync |
 | --- | --- | --- |
-| `Database` | `open(path)`, `open_at(path, offset)`, `doc_count()`, `termfreq(t)`, `get_document(id)`, `compact_to(dir)`, `compact_single_file(path)` | `Send` only |
+| `Database` | `open(path)`, `open_at(path, offset)`, `get_document(id)`, `compact_to(dir)`, `compact_single_file(path)` | `Send` only |
 | `Document` | `id()`, `data()`, `value(slot)`, `termlist_count()`, `set_data/add_term/set_value` (mutable) | `Send` only |
 | `Query` | `term(t)`, `match_all()`, `combine(op, a, b)` | `Send + Sync` |
 | `QueryParser` | `new()`, `parse_query(s)`, `set_default_op(op)`, `add_prefix`, `add_boolean_prefix`, `set_stemmer`, `set_database` | `Send` only |
 | `Enquire` | `new(&db)`, `set_query(&q)`, `set_sort_by_relevance()`, `get_mset(first, max, atleast)` | `Send` only |
-| `MSet` | `size()`, `docid/weight/percent/rank(i)`, `termfreq(t)`, `document(i)`, `iter()` | `Send + Sync` |
+| `MSet` | `size()`, `docid/weight/percent/rank(i)`, `document(i)`, `iter()` | `Send + Sync` |
 | `WritableDatabase` | `create(path)`, `add_document(&doc)`, `commit()` (minimal, for tests/tooling) | `Send` only |
 
 Errors: Xapian exceptions are captured per-thread and surfaced as

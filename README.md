@@ -8,20 +8,18 @@ browsers) or as one-shot CLI subcommands.
 
 ## Tools
 
-- **`zim_search`** — full-text search across all ZIM files. Multi-word queries
-  rank articles containing all of the query's distinctive words higher (a
-  word shared by more than ~1% of the archive's articles is not distinctive),
-  but partial matches are still returned. Articles whose titles match the
-  query words (found in the archive's embedded title index) come right after
-  exact title matches —
-  titles containing all the query words before partial title matches —
-  ahead of the body-text matches. Each result has the ZIM file name (relative to the ZIM
+- **`zim_search`** — search across all ZIM files in three tiers: an exact
+  title/URL match comes first (a matching redirect reports the article it
+  points to), then articles whose title contains every query word, then
+  full-text matches ranked by BM25 relevance over all query words — partial
+  matches still return. Each result has the ZIM file name (relative to the ZIM
   directory), the article path, the title, and `preview` — the article's first
-  paragraph when the query matches the title or that paragraph, otherwise
+  intro sentence when the query matches the title, otherwise
   the sentence with the most query matches (followed by the rest of its
   paragraph) together with `sections` (the matching regions' names, the
   intro listed as `_intro`). `sections` is omitted when the query matches
-  the title or the first intro paragraph.
+  the title or the first intro paragraph. The same article is reported once
+  even when several spellings of it match.
   Use `zim` + `path` with `zim_get`/`zim_get_section`.
 - **`zim_get`** — get the full content of an article/page/object. Arguments:
   the ZIM file name and the article path — or an article title such as

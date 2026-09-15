@@ -1,6 +1,7 @@
-//! The search pipeline behind the `zim_search` tool: query parsing and
-//! ranking against the ZIM full-text indexes, cross-archive merging, and
-//! the per-hit preview/section reporting.
+//! The search pipeline behind the `zim_search` tool: three simple tiers
+//! (exact title/URL probe, all-words title match, full-text OR), ranked
+//! against the ZIM embedded Xapian indexes, merged across archives, and
+//! reported with per-hit previews.
 
 use crate::html;
 use crate::markdown;
@@ -10,7 +11,7 @@ use schemars::JsonSchema;
 use serde::Serialize;
 use std::sync::Arc;
 use xapian2::{
-    resolve_stem_language, Database, Enquire, Operator, Query, QueryParser, Stem, StemStrategy,
+    resolve_stem_language, Enquire, Operator, Query, QueryParser, Stem, StemStrategy,
 };
 
 /// Number of results `zim_search` returns in total (across all archives).
@@ -27,27 +28,6 @@ const HIT_READ_BYTES: u64 = 1024 * 1024;
 /// reporting is truncated to `INTRO_CHARS` separately.
 const PARA_MATCH_CHARS: usize = 2000;
 
-/// Common English words dropped when collecting the query's stemmed terms
-/// (they drive the all-words branch, the title-index band, and the paragraph
-/// matching). They are stopped at index time (libzim's TermGenerator), so
-/// they are absent from the index terms and an AND over them would match
-/// nothing.
-const STOPWORDS: &[&str] = &[
-    "a", "an", "and", "are", "as", "at", "be", "but", "by", "for", "from", "has", "have", "in",
-    "is", "it", "its", "not", "of", "on", "or", "that", "the", "these", "this", "those", "to",
-    "was", "were", "which", "with",
-];
-
-/// A stemmed query term is *specific* enough to define the all-words tier
-/// when its document frequency in the archive's full-text index is at most
-/// this fraction of the archive's document count. A term occurring in more
-/// than 1% of the archive is background vocabulary - in a Wikipedia edition
-/// "attractions"/"attraction"/"attractive" all stem to one term present in
-/// 5.7% of all articles - so its incidental occurrences in near-random
-/// documents must not define the all-words tier, and a genuinely relevant
-/// article that happens to miss that one word must not sink under it.
-const AND_TERM_MAX_DF_FRAC: f64 = 0.01;
-
 /// One search result.
 #[derive(Serialize, JsonSchema, Debug)]
 pub struct SearchHit {
@@ -57,8 +37,8 @@ pub struct SearchHit {
     pub path: String,
     /// Page/article title
     pub title: String,
-    /// Preview of the article: the first paragraph when the query matches
-    /// the title or that paragraph, otherwise the sentence with the most
+    /// Preview of the article: the first sentence of the introduction when
+    /// the query matches the title, otherwise the sentence with the most
     /// query matches, followed by its paragraph's next sentences up to the
     /// length cap
     pub preview: String,
@@ -96,29 +76,24 @@ fn fold_accents(text: &str) -> String {
         .collect()
 }
 
-/// The query's words as (surface form, stem) pairs for the title-index
-/// band: split on whitespace, keep alphanumeric characters only per word,
-/// lowercase, drop stopwords, one pair per distinct word in
-/// first-occurrence order. The title index stores titles as written -
-/// lowercased, accent-folded surface forms (see `fold_accents`; measured on
-/// md1m: df("beatles")=186 against df("beatl")=0) - so the band must match
-/// each word by its surface form as well as by its stem. The query text
-/// arrives accent-folded already (see `search`); the fold in
-/// [`Stemmer::stem`] is idempotent.
-fn query_words(query: &str, stem: &mut Stemmer) -> Vec<(String, String)> {
-    let mut words: Vec<(String, String)> = Vec::new();
+/// The query's words for the title tier: split on whitespace, keep
+/// alphanumeric characters only per word, lowercase, one entry per distinct
+/// word in first-occurrence order. The title index stores titles as written
+/// - lowercased, accent-folded surface forms (measured on md1m:
+/// df("beatles")=186 against df("beatl")=0) - so the tier must match the
+/// words exactly as they appear. The query text arrives accent-folded
+/// already (see `search`).
+fn title_words(query: &str) -> Vec<String> {
+    let mut words: Vec<String> = Vec::new();
     for word in query.split_whitespace() {
         // Punctuation never appears in index terms either, so strip it.
         let word: String = word.chars().filter(|c| c.is_alphanumeric()).collect();
         let word = word.to_lowercase();
-        if word.is_empty() || STOPWORDS.contains(&word.as_str()) {
+        if word.is_empty() {
             continue;
         }
-        // The index has no spelling data, so an unknown word just stems to
-        // something that matches nothing; it cannot break anything here.
-        let stemmed = stem.stem(&word).to_string();
-        if !words.iter().any(|(w, _)| *w == word) {
-            words.push((word, stemmed));
+        if !words.contains(&word) {
+            words.push(word);
         }
     }
     words
@@ -132,33 +107,6 @@ fn combine_terms<T: AsRef<str>>(op: Operator, terms: &[T]) -> xapian2::Result<Qu
         query = Query::combine(op, &query, &Query::term(term.as_ref())?)?;
     }
     Ok(query)
-}
-
-/// The all-words branch of one archive's full-text query: an AND over the
-/// query's *specific* terms (see [`AND_TERM_MAX_DF_FRAC`]) when at least
-/// two of them qualify, else `None` - the parsed OR query runs alone. BM25
-/// sums term weights across OR branches, so ORing this AND with the parsed
-/// query ranks articles containing every specific word above partial
-/// matches, while partial matches still return; the branch is built per
-/// archive because document frequencies are per database. (OP_PHRASE and
-/// OP_NEAR are no substitute: the indexes carry no positional data. A
-/// misspelled word matches nothing here while the parsed OR side still
-/// retrieves results for the good words.)
-fn all_words_branch(
-    fulltext: &Database,
-    terms: &[String],
-    max_df_frac: f64,
-) -> xapian2::Result<Option<Query>> {
-    let cap = max_df_frac * f64::from(fulltext.doc_count());
-    let specific: Vec<&str> = terms
-        .iter()
-        .map(String::as_str)
-        .filter(|t| f64::from(fulltext.termfreq(t)) <= cap)
-        .collect();
-    if specific.len() < 2 {
-        return Ok(None);
-    }
-    Ok(Some(combine_terms(Operator::And, &specific)?))
 }
 
 /// A stemmer that remembers the stem of every word it has seen. Natural
@@ -179,11 +127,11 @@ impl Stemmer {
         })
     }
 
-    /// The word's stem, built the way `query_terms` and the ZIM full-text
-    /// indexes were built (accents folded - see [`fold_accents`] - then
-    /// lowercased Porter2 stems). Hit-preview paragraph matching feeds raw
-    /// article words through here, so the fold keeps them comparable with
-    /// the folded query terms (the index never saw the accents either).
+    /// The word's stem, built the way the ZIM full-text indexes were built
+    /// (accents folded - see [`fold_accents`] - then lowercased Porter2
+    /// stems). Hit-preview paragraph matching feeds raw article words
+    /// through here, so the fold keeps them comparable with the folded
+    /// query terms (the index never saw the accents either).
     fn stem(&mut self, word: &str) -> &str {
         if !self.cache.contains_key(word) {
             let folded = fold_accents(word);
@@ -202,13 +150,15 @@ impl Stemmer {
 /// English stemmer finds nothing (and vice versa).
 struct ArchiveQuery {
     stemmer: Stemmer,
-    /// Folded stems of the query's non-stopword words: the all-words branch
-    /// of the full-text query (the full-text index is stemmed) and the hit
-    /// previews' paragraph matching.
+    /// Folded stems of the query's words (deduped, first-occurrence
+    /// order): the hit previews' paragraph matching, scored against the
+    /// archive's full-text vocabulary.
     terms: Vec<String>,
-    /// The same words as (surface form, stem) pairs: the title-index band,
-    /// whose index stores surface word forms (see [`query_words`]).
-    title_words: Vec<(String, String)>,
+    /// The query's folded surface words (see [`title_words`]): the title
+    /// tier's AND query, one term per word.
+    title_words: Vec<String>,
+    /// The query parsed with the archive's stemmer (default op OR): the
+    /// full-text tier, plain BM25 over all query terms.
     xquery: Query,
 }
 
@@ -223,14 +173,12 @@ impl ArchiveQuery {
         let mut stemmer = Stemmer::new(&language).map_err(|e| {
             ToolError::Internal(format!("failed to create {language} stemmer: {}", e.msg()))
         })?;
-        // The words drive two different vocabularies: the title index
-        // stores surface word forms, the full-text index unprefixed stems
-        // - the stems here are deduped preserving first-occurrence order.
-        let title_words = query_words(query, &mut stemmer);
+        let title_words = title_words(query);
         let mut terms: Vec<String> = Vec::new();
-        for (_, stemmed) in &title_words {
-            if !terms.contains(stemmed) {
-                terms.push(stemmed.clone());
+        for word in &title_words {
+            let stemmed = stemmer.stem(word).to_string();
+            if !terms.contains(&stemmed) {
+                terms.push(stemmed);
             }
         }
 
@@ -252,6 +200,17 @@ impl ArchiveQuery {
     }
 }
 
+/// A display title derived from an article path: the namespace prefix
+/// stripped, underscores as spaces ("C/Citric_acid_cycle" -> "Citric acid
+/// cycle"). The last fallback for archives whose directory entries and
+/// index documents carry no title.
+fn path_title(path: &str) -> String {
+    path.split_once('/')
+        .map(|(_, url)| url)
+        .unwrap_or(path)
+        .replace('_', " ")
+}
+
 /// Search all articles in all ZIM files of the library - the pipeline behind
 /// the `zim_search` tool: ranked hits, best first.
 pub fn search(library: &ZimLibrary, query: &str) -> Result<SearchResults, ToolError> {
@@ -265,16 +224,21 @@ pub fn search(library: &ZimLibrary, query: &str) -> Result<SearchResults, ToolEr
     // title/URL probe below still gets the raw query - article paths and
     // directory titles carry their accents ("C/Université").
     let folded_query = fold_accents(query);
+    // Quoted phrases build OP_PHRASE subqueries, but the indexes carry no
+    // positional data (libzim indexes `index_text_without_positions`), so
+    // a phrase matches nothing and silently loses the whole full-text
+    // band: strip the quotes and parse the words (BM25 OR over them).
+    let fulltext_query = folded_query.replace('"', " ");
 
-    // Which band produced a hit. Exact and title-index hits are title
-    // matches: their preview is the lead paragraph and `sections` is
+    // Which tier produced a hit. Exact and title-tier hits are title
+    // matches: their preview is the first intro sentence and `sections` is
     // omitted.
     #[derive(Clone, Copy, PartialEq)]
     enum HitKind {
         /// Exact title/URL probe hit (the ZIM directory itself).
-        ExactTitle,
+        Exact,
         /// Hit from the archive's title index (`X/title/xapian`).
-        TitleIndex,
+        Title,
         /// Hit from the archive's full-text index.
         Fulltext,
     }
@@ -284,164 +248,93 @@ pub fn search(library: &ZimLibrary, query: &str) -> Result<SearchResults, ToolEr
     // that archive's Language metadata, so the parsed query, the stemmed
     // terms, and the stemmer used for hit previews are per archive (one
     // English stemmer used to find nothing on a Language=fra archive).
-    // The terms drive the all-words branch of the full-text query (built
-    // per archive from that archive's term statistics - see
-    // `all_words_branch`), the title-index band, and the paragraph
-    // matching when the hits are built.
+    // The terms drive the previews' paragraph matching, the surface words
+    // the title tier, and the parsed query the full-text tier.
     let mut queries: Vec<ArchiveQuery> = library
         .archives
         .iter()
-        .map(|arc| ArchiveQuery::build(arc, &folded_query))
+        .map(|arc| ArchiveQuery::build(arc, &fulltext_query))
         .collect::<Result<_, ToolError>>()?;
 
-    // Exact title/URL matches, found in the ZIM directory itself: redirects
-    // are not in the search indexes, and a query that names an article
-    // exactly must rank first no matter what BM25 produces. One probe per
-    // archive; a failed probe simply contributes nothing. The title falls
-    // back to the query (spaces restored) because modern openZIM archives
-    // leave directory-entry titles empty.
+    // Tier 1 - exact title/URL matches, found in the ZIM directory itself:
+    // redirects are not in the search indexes, and a query that names an
+    // article exactly must rank first no matter what BM25 produces. One
+    // probe per archive; a failed probe simply contributes nothing. The
+    // entry is resolved to its terminal article below (a redirect match
+    // reports the article it names, not itself).
     let mut merged: Vec<(&Arc<Archive>, String, String, HitKind)> = Vec::new();
     for arc in &library.archives {
-        if let Some((path, title)) = arc.lookup_exact(query)? {
-            let title = if title.is_empty() { query.replace('_', " ") } else { title };
-            merged.push((arc, path, title, HitKind::ExactTitle));
+        if let Some((path, _)) = arc.lookup_exact(query)? {
+            merged.push((arc, path, String::new(), HitKind::Exact));
         }
     }
 
-    // Per-archive ranked hit lists. Each archive's Xapian handles are
+    // Tiers 2 and 3, per archive. Each archive's Xapian handles are
     // checked out of that archive's pool for the duration of the search:
     // concurrent searches never share a handle (Xapian does not support
     // concurrent calls on one database object).
     //
-    // The title-index band queries the archive's title index (`X/title/xapian`;
-    // documents ARE titles) in two sub-bands: for multi-word queries an AND
-    // over ALL the query words first (titles containing every query word),
-    // then the OR of the words (partial title matches). Every word is
-    // matched by BOTH its surface form and its stem: the title index stores
-    // titles as written - lowercased, accent-folded surface forms (measured
-    // on md1m: df("beatles")=186 against df("beatl")=0) - so querying
-    // stems alone only ever matched stem=surface coincidences (the
-    // measured top EN defect), while the stem variant still reaches
-    // inflected titles ("black holes" finds "Black hole") and the stems
-    // libzim's STEM_SOME adds for uncapitalised title words (fr.zim title
-    // index: "revolution" df 328, its stem "revolu" df 1). A 0-df variant
-    // is harmless. Under the OR ranking alone, a title matching one
-    // ultra-common query word can outrank titles containing every word -
-    // the AND sub-band fixes the ordering inside the band. The band ranks
-    // its hits ahead of every full-text match - a title that says the whole
-    // query is far stronger evidence than body words - and is skipped for
-    // archives without a title index and queries with no usable terms.
+    // Tier 2 - the title tier queries the archive's title index
+    // (`X/title/xapian`; documents ARE titles) with an AND over ALL the
+    // query words' surface forms (see `title_words`): a title that says
+    // the whole query is far stronger evidence than body words, and an
+    // article matching only part of the query in its title is not
+    // promoted at all - that judgment is left to the full-text tier's
+    // BM25, whose IDF already down-weights common words. Single-word
+    // queries are the one-word AND. The band is skipped for archives
+    // without a title index and queries with no usable words.
+    //
+    // Tier 3 - the full-text tier is the parsed query alone: plain BM25
+    // OR over all query terms. Xapian's BM25 weights every term by its
+    // document frequency, so the common words cannot out-rank the rare
+    // ones that identify the topic; no all-words AND branch is layered
+    // on top.
     let mut title_lists: Vec<(&Arc<Archive>, Vec<(String, String)>)> = Vec::new();
-    // Full-text band: (weight, path, title from the index).
+    // Full-text tier: (weight, path, title from the index).
     let mut per_archive: Vec<(&Arc<Archive>, Vec<(f64, String, String)>)> = Vec::new();
     for (arc, query_state) in library.archives.iter().zip(queries.iter_mut()) {
-        // This archive's query: its stemmed terms (all-words branch +
-        // paragraph matching), its per-word surface/stem pairs (title
-        // band), and its parsed query (full text).
-        let terms = &query_state.terms;
         let title_words = &query_state.title_words;
         let xquery = &query_state.xquery;
-        // Paths already reported as exact title/URL matches for THIS archive:
-        // the title band must not report them again (the skip below).
-        let exact_paths: std::collections::HashSet<&str> = merged
-            .iter()
-            .filter(|(a, ..)| Arc::ptr_eq(a, arc))
-            .map(|(_, path, ..)| path.as_str())
-            .collect();
         let Some((title_list, list)) = arc.with_xapian(|h| -> Result<_, ToolError> {
             let mut title_list = Vec::new();
-            if !terms.is_empty() {
+            if !title_words.is_empty() {
                 if let Some(title_db) = &h.title {
-                    // Sub-band queries, in band order: for multi-word
-                    // queries the AND over every word's OR(surface, stem)
-                    // subquery, then the OR over all the variants. Every
-                    // AND hit reappears in the OR's results (a title with
-                    // all the words also matches any subset of them), so
-                    // the OR pass skips the docids the AND pass already
-                    // reported.
-                    let multi = title_words.len() >= 2;
-                    let mut and_query: Option<Query> = None;
-                    let mut or_terms: Vec<&str> = Vec::new();
-                    for (surface, stemmed) in title_words {
-                        // Deduped when the stem equals the surface (a
-                        // duplicated variant would double its BM25 count).
-                        let variants: Vec<&str> = if surface == stemmed {
-                            vec![surface.as_str()]
-                        } else {
-                            vec![surface.as_str(), stemmed.as_str()]
-                        };
-                        for v in &variants {
-                            if !or_terms.contains(v) {
-                                or_terms.push(*v);
-                            }
-                        }
-                        if multi {
-                            let word_query = combine_terms(Operator::Or, &variants)?;
-                            and_query = Some(match and_query {
-                                None => word_query,
-                                Some(acc) => Query::combine(Operator::And, &acc, &word_query)?,
-                            });
-                        }
-                    }
-                    let or_query = combine_terms(Operator::Or, &or_terms)?;
-                    let mut taken: std::collections::HashSet<u32> = std::collections::HashSet::new();
+                    let and_query = combine_terms(Operator::And, title_words)?;
                     let mut enquire = Enquire::new(title_db)?;
                     enquire.set_sort_by_relevance();
-                    for tquery in [and_query, Some(or_query)].into_iter().flatten() {
-                        enquire.set_query(&tquery)?;
-                        let mset = enquire.get_mset(0, SEARCH_LIMIT, 0)?;
-                        for j in 0..mset.size() {
-                            // One band slot per title-index document.
-                            if !taken.insert(mset.docid(j)) {
-                                continue;
-                            }
-                            let mut doc = mset.document(j)?;
-                            // The title-index document's data is the article
-                            // path and its value slot 0 the title (same shape
-                            // as the full-text index, one shared docid space).
-                            // Should a producer leave either empty, the
-                            // full-text document of the same docid fills it in.
-                            let mut path = doc.data_str()?;
-                            let mut title = String::from_utf8_lossy(&doc.value(0)?).into_owned();
-                            if path.is_empty() || title.is_empty() {
-                                if let Ok(mut ftdoc) = h.fulltext.get_document(mset.docid(j)) {
-                                    if path.is_empty() {
-                                        path = ftdoc.data_str()?;
-                                    }
-                                    if title.is_empty() {
-                                        title =
-                                            String::from_utf8_lossy(&ftdoc.value(0)?).into_owned();
-                                    }
+                    enquire.set_query(&and_query)?;
+                    let mset = enquire.get_mset(0, SEARCH_LIMIT, 0)?;
+                    for j in 0..mset.size() {
+                        let mut doc = mset.document(j)?;
+                        // The title-index document's data is the article
+                        // path and its value slot 0 the title (same shape
+                        // as the full-text index, one shared docid space).
+                        // Should a producer leave either empty, the
+                        // full-text document of the same docid fills it in.
+                        let mut path = doc.data_str()?;
+                        let mut title = String::from_utf8_lossy(&doc.value(0)?).into_owned();
+                        if path.is_empty() || title.is_empty() {
+                            if let Ok(mut ftdoc) = h.fulltext.get_document(mset.docid(j)) {
+                                if path.is_empty() {
+                                    path = ftdoc.data_str()?;
+                                }
+                                if title.is_empty() {
+                                    title =
+                                        String::from_utf8_lossy(&ftdoc.value(0)?).into_owned();
                                 }
                             }
-                            if path.is_empty() {
-                                continue;
-                            }
-                            // An article already reported as an exact
-                            // title/URL match keeps that first-band slot:
-                            // its exact-match title (the query itself when
-                            // the directory entry title is empty) need not
-                            // equal the index title, which the final
-                            // normalized-title dedupe cannot see through.
-                            if exact_paths.contains(path.as_str()) {
-                                continue;
-                            }
-                            title_list.push((path, title));
                         }
+                        if path.is_empty() {
+                            continue;
+                        }
+                        title_list.push((path, title));
                     }
                 }
             }
 
-            // The full-text band: the parsed OR query, with this archive's
-            // all-words branch OR-ed in when its term statistics produce
-            // one (see `all_words_branch`).
+            // The full-text tier: plain BM25 over the parsed query.
             let mut enquire = Enquire::new(&h.fulltext)?;
-            match all_words_branch(&h.fulltext, &terms, AND_TERM_MAX_DF_FRAC)? {
-                Some(and_query) => {
-                    enquire.set_query(&Query::combine(Operator::Or, &and_query, &xquery)?)?
-                }
-                None => enquire.set_query(&xquery)?,
-            }
+            enquire.set_query(xquery)?;
             enquire.set_sort_by_relevance();
             let mset = enquire.get_mset(0, SEARCH_LIMIT, 0)?;
             let mut list = Vec::with_capacity(mset.size() as usize);
@@ -471,17 +364,17 @@ pub fn search(library: &ZimLibrary, query: &str) -> Result<SearchResults, ToolEr
     }
 
     // Xapian weights are computed from per-database statistics and are not
-    // comparable across archives, so each band merges its archives' ranked
-    // lists by rotation instead of by weight: every archive contributes its
-    // best match before any archive contributes its second best. The bands
-    // keep their order: exact title/URL probe hits (already in `merged`),
-    // then title-index matches, then full-text matches.
+    // comparable across archives, so each tier merges its archives' ranked
+    // lists by rotation instead of by weight: every archive contributes
+    // its best match before any archive contributes its second best. The
+    // tiers keep their order: exact title/URL probe hits (already in
+    // `merged`), then title-tier matches, then full-text matches.
     let mut rank = 0usize;
     loop {
         let mut picked = false;
         for (arc, list) in &title_lists {
             if let Some((path, title)) = list.get(rank) {
-                merged.push((arc, path.clone(), title.clone(), HitKind::TitleIndex));
+                merged.push((arc, path.clone(), title.clone(), HitKind::Title));
                 picked = true;
             }
         }
@@ -505,42 +398,59 @@ pub fn search(library: &ZimLibrary, query: &str) -> Result<SearchResults, ToolEr
         rank += 1;
     }
 
-    // The same article is often present in several archives (e.g. an HTML
-    // and a Markdown edition of the same ZIM), and one article can surface
-    // in several bands of the same archive (its title index document AND
-    // its full-text document both match): dedupe by normalized title so
-    // each article is reported once, from the band/archives ranked first.
-    // Exact matches come first, so duplicates of them drop out here, and a
-    // title-index hit shadows the same article's full-text hit.
-    let mut seen = std::collections::HashSet::new();
-    merged.retain(|(_, path, title, _)| {
-        let key = if title.is_empty() { path.as_str() } else { title.as_str() };
-        seen.insert(html::normalize(key))
-    });
+    // Resolve every candidate to the terminal article of its entry before
+    // dedupe, then dedupe on that identity: the same article must never
+    // appear twice, no matter how many tiers and redirect spellings reach
+    // it. Title-index redirect documents (old-namespace archives) carry
+    // their OWN title in value slot 0 while pointing at the redirect
+    // entry - keying on the index title reported the same article under
+    // several titles (the measured French "Tour Eiffel" duplicates), so
+    // the identity here is the terminal entry's path (within the archive)
+    // plus its resolved title for the cross-archive dedupe (the same
+    // article published twice - an HTML and a Markdown edition - carries
+    // the same title but different paths). The reported title is the
+    // terminal entry's directory title when one exists, else the index
+    // title, else derived from the terminal path ("C/Citric_acid_cycle" ->
+    // "Citric acid cycle"). Resolution failures (a degenerate index doc)
+    // keep the raw path, like the preview below.
+    let mut seen_titles = std::collections::HashSet::new();
+    let mut seen_paths = std::collections::HashSet::new();
+    merged = merged
+        .into_iter()
+        .filter_map(|(arc, path, idx_title, kind)| {
+            let (path, entry_title) =
+                arc.resolve_terminal(&path).ok().flatten().unwrap_or((path, String::new()));
+            let title = if !entry_title.is_empty() {
+                entry_title
+            } else if !idx_title.is_empty() {
+                idx_title
+            } else {
+                path_title(&path)
+            };
+            let title_key = if title.is_empty() { path.clone() } else { title.clone() };
+            if !seen_titles.insert(html::normalize(&title_key)) {
+                return None;
+            }
+            // Within one archive the terminal path is the article's
+            // identity; two index documents can still name it under
+            // different titles.
+            if !seen_paths.insert((Arc::as_ptr(arc) as usize, path.clone())) {
+                return None;
+            }
+            Some((arc, path, title, kind))
+        })
+        .collect();
     merged.truncate(SEARCH_LIMIT as usize);
 
     let mut hits = Vec::with_capacity(merged.len());
-    for (arc, path, idx_title, kind) in &merged {
-        // Exact and title-index hits are title matches: the lead is the
-        // right preview and there is nothing to point at section-wise.
+    for (arc, path, title, kind) in &merged {
+        // Exact and title-tier hits are title matches: the first intro
+        // sentence is the right preview and there is nothing to point at
+        // section-wise.
         let title_match = *kind != HitKind::Fulltext;
-        let (entry_title, mime, bytes) = match arc.article_preview(path, HIT_READ_BYTES) {
-            Ok(Some((entry_title, mime, bytes))) => (entry_title, mime, bytes),
-            _ => (String::new(), None, Vec::new()),
-        };
-        // An exact match's title is already final - the redirect's own
-        // title, not the target's (which `entry_title` is). For the rest,
-        // prefer the entry's own title; many openZIM archives leave the
-        // directory-entry title empty and only carry the title in the
-        // index (which we already read as `idx_title`).
-        let title = if *kind == HitKind::ExactTitle {
-            idx_title.clone()
-        } else if !entry_title.is_empty() {
-            entry_title
-        } else if !idx_title.is_empty() {
-            idx_title.clone()
-        } else {
-            path.clone()
+        let (mime, bytes) = match arc.article_preview(path, HIT_READ_BYTES) {
+            Ok(Some((_, mime, bytes))) => (mime, bytes),
+            _ => (None, Vec::new()),
         };
         let article = String::from_utf8_lossy(&bytes);
         // Markdown editions carry plain Markdown, not HTML: pick the matching
@@ -564,7 +474,7 @@ pub fn search(library: &ZimLibrary, query: &str) -> Result<SearchResults, ToolEr
         hits.push(SearchHit {
             zim: arc.name.clone(),
             path: path.clone(),
-            title,
+            title: title.clone(),
             preview,
             sections,
         });
@@ -573,10 +483,11 @@ pub fn search(library: &ZimLibrary, query: &str) -> Result<SearchResults, ToolEr
 }
 
 /// How many of `text`'s word occurrences are query terms - the paragraph's
-/// match count, stemmed the same way the index and the query are.
+/// match count, stemmed the same way the index and the query are. Every
+/// query term counts: BM25 scored them all too.
 fn para_matches(text: &str, terms: &[String], stem: &mut Stemmer) -> usize {
     text.split(|c: char| !c.is_alphanumeric())
-        .filter(|w| !w.is_empty() && !STOPWORDS.iter().any(|s| s.eq_ignore_ascii_case(w)))
+        .filter(|w| !w.is_empty())
         .filter(|w| terms.iter().any(|t| t == stem.stem(w)))
         .count()
 }
@@ -586,7 +497,7 @@ fn covers_all_terms(text: &str, terms: &[String], stem: &mut Stemmer) -> bool {
     let mut covered = vec![false; terms.len()];
     let mut left = terms.len();
     for word in text.split(|c: char| !c.is_alphanumeric()) {
-        if word.is_empty() || STOPWORDS.iter().any(|s| s.eq_ignore_ascii_case(word)) {
+        if word.is_empty() {
             continue;
         }
         let stemmed = stem.stem(word);
@@ -629,8 +540,9 @@ fn sentences(paragraph: &str) -> Vec<&str> {
 /// text (`is_markdown` picks the Markdown or the HTML splitter):
 ///
 /// - a title match (`title_match`: the query named the article exactly, or
-///   the hit came from the title index) gets the first intro paragraph as
-///   its preview and no sections - the title already said everything;
+///   the hit came from the title tier) gets the lead paragraph's FIRST
+///   sentence as its preview and no sections - the title already said
+///   everything;
 /// - otherwise, when every query term occurs in the first intro paragraph,
 ///   same: the lead already covers the query;
 /// - otherwise every region is scanned - the intro first (under its
@@ -665,7 +577,21 @@ fn hit_preview(
             .map(|p| p.chars().take(INTRO_CHARS).collect())
             .unwrap_or_default()
     };
-    if title_match || intro.first().is_some_and(|p| covers_all_terms(p, terms, stem)) {
+    if title_match {
+        // The first sentence of the lead: the title said what the article
+        // is; one sentence of it is enough of a preview (and stays far
+        // from the body sections the full-text hits point at).
+        let first = intro
+            .first()
+            .and_then(|p| {
+                sentences(p)
+                    .first()
+                    .map(|s| s.chars().take(INTRO_CHARS).collect::<String>())
+            })
+            .unwrap_or_default();
+        return (first, None);
+    }
+    if intro.first().is_some_and(|p| covers_all_terms(p, terms, stem)) {
         return (lead(), None);
     }
     let secs = if is_markdown {
@@ -735,7 +661,7 @@ pub(crate) mod tests {
     };
     use rmcp::handler::server::router::tool::AsyncTool;
     use std::future::Future;
-    use xapian2::{Database, Document, Enquire, WritableDatabase};
+    use xapian2::{Document, WritableDatabase};
 
     /// Run an async tool invocation to completion on this thread: the tools
     /// are async (each hops to a blocking thread), and these tests are sync
@@ -780,12 +706,12 @@ pub(crate) mod tests {
         <p>Aeronautics is the science of flight.</p>\
         </body></html>";
 
-    /// For the title-index tests: an article whose title contains all the
+    /// For the title-tier tests: an article whose title contains all the
     /// query's words ("Nitrogen Gas Effects" for "effects of nitrogen gas")
     /// with the matching words also in its body (so its full-text document
-    /// matches too and the cross-band dedupe has something to do), and an
+    /// matches too and the cross-tier dedupe has something to do), and an
     /// article that only matches the query in its body.
-    const NITROGEN_GAS_EFFECTS_HTML: &str = "<html><body><h1>Nitrogen Gas Effects</h1>\
+    const NITROGEN_GAS_EFFECTS_HTML: &str = "<html><body><h1>Effects of Nitrogen Gas</h1>\
         <p>Nitrogen gas surrounds us all.</p>\
         <h2>Everywhere</h2>\
         <p>The effects of nitrogen gas are unavoidable.</p>\
@@ -830,16 +756,6 @@ Glaciers move under their own weight. The flow is slower than a river. \
 Meltwater streams out of the ice.
 ";
 
-    /// Bodies for the all-words-tier pathology test (`e2e_search_common_word_does_not_block_all_words_tier`).
-    const BEACONSFIELD_QUEBEC_HTML: &str = "<html><body><h1>Beaconsfield, Quebec</h1>\
-        <p>Beaconsfield is a suburban borough of Montreal, Quebec, Canada.</p></body></html>";
-
-    const CANADIAN_AMATEUR_HTML: &str = "<html><body><h1>Canadian Amateur Championship</h1>\
-        <p>The Canadian Amateur Championship is a golf tournament.</p></body></html>";
-
-    const FREDERICK_STANLEY_HTML: &str = "<html><body><h1>Frederick Stanley</h1>\
-        <p>Frederick Stanley, 16th Earl of Derby, was Governor General of Canada.</p></body></html>";
-
     fn search(server: &ZimMcpServer, query: &str) -> Vec<SearchHit> {
         let params = serde_json::from_value::<ZimSearchParams>(
             serde_json::json!({ "query": query }),
@@ -855,8 +771,8 @@ Meltwater streams out of the ice.
     /// ("appl" is the stem of "apple", "comput" of "computing"). The terms
     /// are passed in already stemmed (the English stem shapes the existing
     /// tests use). Real TITLE indexes store surface word forms instead -
-    /// `title_inflection_test_server` passes surfaces there; the older
-    /// title tests pass stems, which the band's stem variants still match.
+    /// every title fixture below passes surfaces there, as the band
+    /// matches surface forms.
     fn make_index(docs: &[(&str, &str, &str)]) -> Vec<u8> {
         make_index_stemmed(None, docs)
     }
@@ -1066,7 +982,8 @@ Meltwater streams out of the ice.
         assert_eq!(first.zim, "test.zim");
         assert_eq!(first.path, "C/Apple");
         assert_eq!(first.title, "Apple");
-        // An exact title match reports the lead paragraph as its preview.
+        // An exact title match reports the lead's first sentence as its
+        // preview (the lead is one sentence here).
         assert_eq!(first.preview, "An apple is the fruit of <rosaceae> trees.");
         assert_eq!(first.sections, None);
 
@@ -1180,8 +1097,9 @@ Meltwater streams out of the ice.
     /// An archive with BOTH embedded indexes, the way libzim builds them:
     /// the full-text index over article bodies plus a title index
     /// (`X/title/xapian`) with one document per article whose terms are the
-    /// title's words and whose value slot 0 is the title (the document data
-    /// is the article path in both indexes).
+    /// title's SURFACE words (lowercased, as written) and whose value slot
+    /// 0 is the title (the document data is the article path in both
+    /// indexes).
     fn title_index_test_server() -> (ZimMcpServer, tempfile::TempDir) {
         let dir = tempfile::tempdir().unwrap();
         let index = make_index(&[
@@ -1189,14 +1107,19 @@ Meltwater streams out of the ice.
             ("C/Weather", "weather forecast describ effect air pressur gas law explan atmospher", "Weather"),
         ]);
         let titles = make_index(&[
-            ("C/Nitrogen_Gas_Effects", "nitrogen gas effect", "Nitrogen Gas Effects"),
+            ("C/Nitrogen_Gas_Effects", "effects of nitrogen gas", "Effects of Nitrogen Gas"),
             ("C/Weather", "weather", "Weather"),
+            // Real title indexes carry function words unstopped (measured on
+            // md1m: df("of")=204037, df("on")=7658) - one such doc keeps the
+            // AND below realistic against a query containing "of".
+            ("C/History_Of_Salt", "history of salt", "History of Salt"),
         ]);
         let content = [
             // Empty directory-entry title, as in modern openZIM archives:
             // the title lives in the indexes (value slot 0) only.
             TestEntry { namespace: b'C', url: "Nitrogen_Gas_Effects", title: "", mime: 0, body: NITROGEN_GAS_EFFECTS_HTML.as_bytes() },
             TestEntry { namespace: b'C', url: "Weather", title: "Weather", mime: 0, body: WEATHER_HTML.as_bytes() },
+            TestEntry { namespace: b'C', url: "History_Of_Salt", title: "", mime: 0, body: b"<html><body><h1>History of Salt</h1><p>Salt has been traded for centuries.</p></body></html>" },
         ];
         let bytes = build_archive_indexes(&["text/html"], &content, &[], 0, Some(&index), Some(&titles));
         std::fs::write(dir.path().join("test.zim"), &bytes).unwrap();
@@ -1209,76 +1132,69 @@ Meltwater streams out of the ice.
     fn e2e_search_title_index_ranks_title_matches_above_fulltext() {
         let (server, _keep) = title_index_test_server();
 
-        // "effects of nitrogen gas" is nobody's title or URL (the article is
-        // "Nitrogen Gas Effects"), but the article's title contains every
-        // query word: its title-index document outranks the full-text-only
-        // matches (whose titles carry no query word), and the hit is styled
-        // as a title match.
+        // "effects of nitrogen gas" is nobody's title or URL (the article
+        // sits on C/Nitrogen_Gas_Effects), but the article's title contains
+        // every query word - function word included, like real unstopped
+        // title indexes ("Effects of climate change on agriculture" for the
+        // measured md1m query): its title-index document IS the title tier
+        // and ranks ahead of the full-text-only matches (whose titles carry
+        // no query word); the hit is styled as a title match.
         let hits = search(&server, "effects of nitrogen gas");
         assert_eq!(hits.len(), 2, "{hits:?}");
         assert_eq!(hits[0].path, "C/Nitrogen_Gas_Effects", "{hits:?}");
-        assert_eq!(hits[0].title, "Nitrogen Gas Effects");
-        // Title-match semantics: the lead paragraph and no sections - NOT
-        // the Everywhere section (the "effects ..." paragraph with more
-        // query matches) the full-text band would have reported.
+        assert_eq!(hits[0].title, "Effects of Nitrogen Gas");
+        // Title-match semantics: the lead's FIRST sentence and no sections -
+        // NOT the Everywhere section (the "effects ..." paragraph with more
+        // query matches) the full-text tier would have reported.
         assert_eq!(hits[0].preview, "Nitrogen gas surrounds us all.");
         assert_eq!(hits[0].sections, None);
         let json = serde_json::to_string(&hits[0]).unwrap();
         assert!(!json.contains("sections"), "{json}");
-        // The article also matched in the full-text band (its body carries
-        // the query words): reported exactly once, from the title band.
+        // The article also matched in the full-text tier (its body carries
+        // the query words): reported exactly once, from the title tier.
         assert_eq!(hits.iter().filter(|h| h.path == "C/Nitrogen_Gas_Effects").count(), 1);
-        // The full-text-only match follows, with full-text hit semantics.
+        // The full-text-only matches follow, with full-text hit semantics.
         assert_eq!(hits[1].path, "C/Weather", "{hits:?}");
         assert_eq!(hits[1].title, "Weather");
         assert_eq!(hits[1].sections, Some(vec!["_intro".to_string()]));
 
-        // No usable terms: the title band is skipped by design and the
-        // full-text band matches nothing (stopwords are stopped at index
-        // time) - no hits, no error.
+        // No usable terms: the title tier's AND over words absent from the
+        // title index matches nothing and the full-text tier matches
+        // nothing either (no such terms in this index) - no hits, no error.
         let hits = search(&server, "the of");
         assert!(hits.is_empty(), "{hits:?}");
     }
 
-    /// An archive whose title band's OR query alone ranks a PARTIAL title
-    /// match above the all-words title match: the short "Quebec, Quebec"
-    /// title repeats its query word, while the word it is missing - "city" -
-    /// is ultra-common (seven of the eight titles contain it), so its BM25
-    /// contribution collapses. OR-only weights measured on exactly this
-    /// document set: "Quebec, Quebec" 1.298 vs "Quebec City" 1.081.
+    /// An archive whose titles do NOT contain every query word: under the
+    /// title tier's AND-only query a partial title match must not be
+    /// promoted at all - that judgment belongs to the full-text tier's
+    /// BM25. This is the measured junk source of the old title band's OR
+    /// sub-band (any title sharing ONE query word flooded ahead of the
+    /// full-text results).
     fn title_and_test_server() -> (ZimMcpServer, tempfile::TempDir) {
         let dir = tempfile::tempdir().unwrap();
         let titles = make_index(&[
-            ("C/Quebec,_Quebec", "quebec quebec", "Quebec, Quebec"),
-            ("C/Quebec_City", "quebec citi", "Quebec City"),
-            ("C/New_York_City", "new york citi", "New York City"),
-            ("C/Kansas_City", "kansas citi", "Kansas City"),
-            ("C/Mexico_City", "mexico citi", "Mexico City"),
-            ("C/Atlantic_City", "atlantic citi", "Atlantic City"),
-            ("C/Jersey_City", "jersey citi", "Jersey City"),
-            ("C/Salt_Lake_City", "salt lake citi", "Salt Lake City"),
+            ("C/New_York_City", "new york city", "New York City"),
+            ("C/Quebec_City", "quebec city", "Quebec City"),
+            ("C/Kansas_City", "kansas city", "Kansas City"),
+            ("C/Mexico_City", "mexico city", "Mexico City"),
+            ("C/Weather", "weather", "Weather"),
         ]);
         let index = make_index(&[
-            ("C/Quebec,_Quebec", "quebec quebec appear twice own titl", "Quebec, Quebec"),
-            ("C/Quebec_City", "quebec citi capit provinc", "Quebec City"),
             ("C/New_York_City", "new york citi largest unit state", "New York City"),
-            ("C/Kansas_City", "kansas citi", "Kansas City"),
-            ("C/Mexico_City", "mexico citi", "Mexico City"),
-            ("C/Atlantic_City", "atlantic citi", "Atlantic City"),
-            ("C/Jersey_City", "jersey citi", "Jersey City"),
-            ("C/Salt_Lake_City", "salt lake citi", "Salt Lake City"),
+            ("C/Quebec_City", "quebec citi capit provinc", "Quebec City"),
+            ("C/Kansas_City", "kansas citi straddl state", "Kansas City"),
+            ("C/Mexico_City", "mexico citi capit", "Mexico City"),
+            ("C/Weather", "weather forecast effect atmospher", "Weather"),
         ]);
         let content = [
             // Empty directory-entry titles, as in modern openZIM archives:
             // the titles live in the indexes (value slot 0) only.
-            TestEntry { namespace: b'C', url: "Quebec,_Quebec", title: "", mime: 0, body: b"<html><body><h1>Quebec, Quebec</h1><p>Quebec, Quebec appears twice in its own title.</p></body></html>" },
+            TestEntry { namespace: b'C', url: "New_York_City", title: "", mime: 0, body: b"<html><body><h1>New York City</h1><p>New York City is the largest city in the United States. It sits at the mouth of the Hudson.</p></body></html>" },
             TestEntry { namespace: b'C', url: "Quebec_City", title: "", mime: 0, body: b"<html><body><h1>Quebec City</h1><p>Quebec City is the capital of the province.</p></body></html>" },
-            TestEntry { namespace: b'C', url: "New_York_City", title: "", mime: 0, body: b"<html><body><h1>New York City</h1><p>New York City is the largest in the United States.</p></body></html>" },
             TestEntry { namespace: b'C', url: "Kansas_City", title: "", mime: 0, body: b"<html><body><h1>Kansas City</h1><p>Kansas City straddles two states.</p></body></html>" },
             TestEntry { namespace: b'C', url: "Mexico_City", title: "", mime: 0, body: b"<html><body><h1>Mexico City</h1><p>Mexico City is the capital of Mexico.</p></body></html>" },
-            TestEntry { namespace: b'C', url: "Atlantic_City", title: "", mime: 0, body: b"<html><body><h1>Atlantic City</h1><p>Atlantic City is a resort town.</p></body></html>" },
-            TestEntry { namespace: b'C', url: "Jersey_City", title: "", mime: 0, body: b"<html><body><h1>Jersey City</h1><p>Jersey City sits opposite Manhattan.</p></body></html>" },
-            TestEntry { namespace: b'C', url: "Salt_Lake_City", title: "", mime: 0, body: b"<html><body><h1>Salt Lake City</h1><p>Salt Lake City hosts a famous temple.</p></body></html>" },
+            TestEntry { namespace: b'C', url: "Weather", title: "", mime: 0, body: b"<html><body><h1>Weather</h1><p>Weather forecasts describe the atmosphere.</p></body></html>" },
         ];
         let bytes = build_archive_indexes(&["text/html"], &content, &[], 0, Some(&index), Some(&titles));
         std::fs::write(dir.path().join("test.zim"), &bytes).unwrap();
@@ -1288,40 +1204,48 @@ Meltwater streams out of the ice.
     }
 
     #[test]
-    fn e2e_search_title_band_ranks_all_words_titles_first() {
+    fn e2e_search_title_and_tier_matches_all_words_titles() {
         let (server, _keep) = title_and_test_server();
 
-        // Under OR-only BM25 the partial title match outranks the all-words
-        // title match (weights in the builder comment). Within the band, the
-        // AND sub-band must put the title containing BOTH query words - the
-        // AND query's only hit - ahead of it. ("quebec cities" is
-        // deliberately nobody's URL, so the hits really come from the band.)
-        let hits = search(&server, "quebec cities");
-        assert_eq!(hits.len(), 8, "{hits:?}");
-        assert_eq!(hits[0].path, "C/Quebec_City", "{hits:?}");
-        assert_eq!(hits[0].title, "Quebec City");
-        assert_eq!(hits[1].path, "C/Quebec,_Quebec", "{hits:?}");
-        assert_eq!(hits[1].title, "Quebec, Quebec");
-        // Title-band hits are title matches: the lead as the preview, no
-        // sections - for the all-words hit and the partial one alike.
-        assert_eq!(hits[0].preview, "Quebec City is the capital of the province.");
+        // "new york" is nobody's URL (the article is C/New_York_City), but
+        // the article's title contains BOTH query words: the title tier's
+        // AND surface match ranks it first, styled as a title match. Its
+        // lead holds two sentences; the preview is the FIRST one only
+        // (a full-text preview would have continued into the next one).
+        let hits = search(&server, "new york");
+        assert!(!hits.is_empty(), "{hits:?}");
+        assert_eq!(hits[0].path, "C/New_York_City", "{hits:?}");
+        assert_eq!(hits[0].title, "New York City");
         assert_eq!(hits[0].sections, None);
-        assert_eq!(hits[1].sections, None);
+        assert_eq!(hits[0].preview, "New York City is the largest city in the United States.");
 
-        // A single-term query runs the one OR query only - the unchanged
-        // BM25 order (the short title repeating the term first).
-        let hits = search(&server, "quebec");
-        assert_eq!(hits.len(), 2, "{hits:?}");
-        assert_eq!(hits[0].path, "C/Quebec,_Quebec", "{hits:?}");
-        assert_eq!(hits[1].path, "C/Quebec_City", "{hits:?}");
+        // A partial title match ("kansas city" shares two words with the
+        // "New York City" title, one with "Mexico City" and "Quebec City")
+        // is NOT promoted to the title tier: no title contains all three
+        // query words, so every hit comes from the full-text tier with
+        // full-text semantics (sections reported).
+        let hits = search(&server, "kansas city new");
+        assert!(hits.len() >= 2, "{hits:?}");
+        for hit in &hits {
+            assert!(hit.sections.is_some(), "{hit:?}");
+        }
+        // The city articles are still reachable - through full text.
+        let pos = |t: &str| hits.iter().position(|h| h.title == t);
+        assert!(pos("Kansas City").is_some() && pos("New York City").is_some(), "{hits:?}");
+
+        // A single-word query is the one-word AND: title-tier hits first.
+        let hits = search(&server, "city");
+        assert!(!hits.is_empty(), "{hits:?}");
+        assert_eq!(hits[0].sections, None, "{hits:?}");
+        assert!(hits[0].title.contains("City"), "{hits:?}");
     }
 
     /// The title index stores titles as WRITTEN - lowercased surface word
     /// forms (measured on md1m: df("beatles")=186 against df("beatl")=0;
-    /// on fr.zim "revolution" 328) - so the band matches every word by its
-    /// surface form AND its stem. Titles deliberately sit on URLs the
-    /// queries cannot hit exactly, so every reported hit really comes from
-    /// the title band.
+    /// on fr.zim "revolution" 328) - so the tier matches words by their
+    /// surface form only; no stem variants. Titles deliberately sit on URLs
+    /// the queries cannot hit exactly, so every reported hit really comes
+    /// from the title tier.
     fn title_inflection_test_server() -> (ZimMcpServer, tempfile::TempDir) {
         let dir = tempfile::tempdir().unwrap();
         // Title index: surface word forms, as libzim's indexer stores them.
@@ -1352,40 +1276,33 @@ Meltwater streams out of the ice.
     }
 
     #[test]
-    fn e2e_search_title_band_matches_surface_and_stemmed_word_forms() {
+    fn e2e_search_title_and_tier_matches_surface_forms_only() {
         let (server, _keep) = title_inflection_test_server();
 
-        // Two words: the AND sub-band is an AND over per-word
-        // OR(surface, stem) subqueries, so BOTH black-hole articles match
-        // the all-words pass - "Black hole" through the stem variant of
-        // "holes", "Black holes" through its surface - while the
-        // partial-only "Holes" (no "black") reaches just the OR sub-band,
-        // behind them, and "The Movie" matches nothing. Querying stems
-        // alone (the old behavior) matched only "Black hole" in the AND
-        // pass: the title index has no "beatl"-shaped stems for its
-        // surface words.
+        // The title tier is an AND over the SURFACE forms: "black holes"
+        // matches only the "Black holes" title (the "Black hole" title has
+        // no surface "holes", and there are no stem variants anymore).
+        // The body-matching articles follow through the full-text tier:
+        // Physics1 and Movie1 match the parsed OR (black/hole), Physics2 is
+        // already reported (deduped by terminal path), and "The Movie"
+        // matches nothing. Under the old per-word OR(surface, stem) band
+        // the "Black hole" title doc ALSO matched (via the stem variant).
         let hits = search(&server, "black holes");
         assert_eq!(hits.len(), 3, "{hits:?}");
-        assert_eq!(hits[0].path, "C/Physics1", "{hits:?}");
-        assert_eq!(hits[0].title, "Black hole");
-        assert_eq!(hits[1].path, "C/Physics2", "{hits:?}");
+        assert_eq!(hits[0].path, "C/Physics2", "{hits:?}");
+        assert_eq!(hits[0].title, "Black holes");
+        assert_eq!(hits[0].sections, None, "{hits:?}");
+        assert_eq!(hits[1].path, "C/Physics1", "{hits:?}");
         assert_eq!(hits[2].path, "C/Movie1", "{hits:?}");
-        // Title-band hits are title matches: lead preview, no sections.
-        assert_eq!(hits[0].preview, "A black hole bends spacetime.");
-        assert_eq!(hits[0].sections, None);
 
-        // One inflected word: OR(surface, stem) = OR(holes, hole) finds
-        // the singular-titled article via the stem and the plural-titled
-        // and movie ones via the surface - the stem alone (the old
-        // behavior) matched only "Black hole". BM25 orders them: the stem
-        // term "hole" (df 1 of 4) outweighs "holes" (df 2), and among the
-        // surface matches the one-word "Holes" title beats the longer
-        // "Black holes" one.
+        // One word: the one-word AND matches every title containing the
+        // surface word - "Holes" and "Black holes", ranked by BM25 within
+        // the tier (the one-word title first), then the body-only matches.
         let hits = search(&server, "holes");
         assert_eq!(hits.len(), 3, "{hits:?}");
-        assert_eq!(hits[0].path, "C/Physics1", "{hits:?}");
-        assert_eq!(hits[1].path, "C/Movie1", "{hits:?}");
-        assert_eq!(hits[2].path, "C/Physics2", "{hits:?}");
+        assert_eq!(hits[0].path, "C/Movie1", "{hits:?}");
+        assert_eq!(hits[1].path, "C/Physics2", "{hits:?}");
+        assert_eq!(hits[2].path, "C/Physics1", "{hits:?}");
     }
 
     /// An archive where BM25 alone ranks the wrong article first: the
@@ -1429,7 +1346,8 @@ Meltwater streams out of the ice.
         assert_eq!(hits[0].path, "C/Nitrogen", "{hits:?}");
         assert_eq!(hits[0].title, "Nitrogen");
         assert_eq!(hits[0].zim, "test.zim");
-        // An exact match is a title match: the lead paragraph, no sections.
+        // An exact match is a title match: the lead's first sentence, no
+        // sections.
         assert_eq!(hits[0].preview, "Nitrogen is a colorless, odorless gas.");
         assert_eq!(hits[0].sections, None);
         assert!(!serde_json::to_string(&hits[0]).unwrap().contains("sections"));
@@ -1438,29 +1356,85 @@ Meltwater streams out of the ice.
     }
 
     #[test]
-    fn e2e_search_exact_redirect_title_ranks_first() {
+    fn e2e_search_exact_redirect_reports_terminal_article() {
         let (server, _keep) = exact_test_server();
 
         // "NACA" is a redirect (directory title "NACA") onto the Aeronautics
         // article. Redirects are not in the full-text index, so without the
         // directory lookup this query would report Atmosphere first (it
-        // mentions "naca" twice).
+        // mentions "naca" twice). The exact tier follows the redirect
+        // chain: the RESULT reports the TERMINAL article's title and path,
+        // not the redirect's, and the same article's full-text hit dedupes
+        // into it.
         let hits = search(&server, "NACA");
-        assert_eq!(hits[0].path, "C/NACA", "{hits:?}");
-        assert_eq!(hits[0].title, "NACA");
-        // The preview is built from the redirect target's content.
+        assert_eq!(hits[0].path, "C/Aeronautics", "{hits:?}");
+        assert_eq!(hits[0].title, "Aeronautics");
+        // The preview is the terminal article's lead, first sentence.
         assert_eq!(hits[0].preview, "Aeronautics is the science of flight.");
         assert_eq!(hits[0].sections, None);
-        // Fulltext hits follow in BM25 order.
+        // Fulltext hits follow in BM25 order - Aeronautics itself is
+        // already reported once.
+        assert_eq!(hits.len(), 2, "{hits:?}");
         assert_eq!(hits[1].path, "C/Atmosphere", "{hits:?}");
-        assert_eq!(hits[2].path, "C/Aeronautics", "{hits:?}");
 
-        // A redirect with an empty directory title: the query becomes the
-        // title, and the all-lowercase query still finds the redirect via
-        // the case variants of its URL.
+        // A redirect with an empty directory title: the query still finds
+        // it via the case variants of its URL, and the terminal article is
+        // reported again (its directory title names it).
         let hits = search(&server, "usa");
-        assert_eq!(hits[0].path, "C/Usa", "{hits:?}");
-        assert_eq!(hits[0].title, "usa");
+        assert_eq!(hits[0].path, "C/Aeronautics", "{hits:?}");
+        assert_eq!(hits[0].title, "Aeronautics");
+    }
+
+    /// An archive whose TITLE INDEX contains a redirect document, the way
+    /// old-namespace openZIM archives do: the document's data path points
+    /// at the redirect entry and value slot 0 carries the redirect's own
+    /// title - while the directory also holds the redirect. One query can
+    /// then reach the same article three ways: exact probe (redirect),
+    /// title tier (redirect document), and full text (the target article).
+    fn redirect_dedupe_test_server() -> (ZimMcpServer, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        let index = make_index(&[
+            ("C/Aeronautics", "aeronautics naca aviation flight", "Aeronautics"),
+        ]);
+        let titles = make_index(&[
+            ("C/Aeronautics", "aeronautics", "Aeronautics"),
+            // The redirect's own title-index document.
+            ("C/NACA", "naca", "NACA"),
+        ]);
+        let content = [
+            TestEntry { namespace: b'C', url: "Aeronautics", title: "Aeronautics", mime: 0, body: AERONAUTICS_HTML.as_bytes() },
+        ];
+        let redirects = [
+            TestRedirect { namespace: b'C', url: "NACA", title: "NACA", target_content: 0 },
+        ];
+        let bytes = build_archive_indexes(&["text/html"], &content, &redirects, 0, Some(&index), Some(&titles));
+        std::fs::write(dir.path().join("test.zim"), &bytes).unwrap();
+        let library = Arc::new(ZimLibrary::scan(dir.path()).unwrap());
+        (ZimMcpServer::new(library), dir)
+    }
+
+    #[test]
+    fn e2e_search_redirect_dedupes_across_tiers_by_terminal_path() {
+        let (server, _keep) = redirect_dedupe_test_server();
+
+        // All three tiers reach the Aeronautics article - the exact probe
+        // through the directory redirect, the title tier through the
+        // redirect's own title-index document, and the full-text tier
+        // through the article body - and it must be reported exactly once,
+        // at its highest rank (the exact tier's), under the terminal
+        // article's identity.
+        let hits = search(&server, "naca");
+        assert_eq!(hits.len(), 1, "{hits:?}");
+        assert_eq!(hits[0].path, "C/Aeronautics", "{hits:?}");
+        assert_eq!(hits[0].title, "Aeronautics");
+        assert_eq!(hits[0].preview, "Aeronautics is the science of flight.");
+        assert_eq!(hits[0].sections, None);
+
+        // The article's own title still routes through the tiers to one
+        // hit (exact + title index + full text again).
+        let hits = search(&server, "aeronautics");
+        assert_eq!(hits.len(), 1, "{hits:?}");
+        assert_eq!(hits[0].path, "C/Aeronautics", "{hits:?}");
     }
 
     #[test]
@@ -1638,213 +1612,58 @@ Meltwater streams out of the ice.
         );
     }
 
-    /// A single-archive server whose full-text index holds `fillers` filler
-    /// documents (the shared term "filler" 29 times plus one unique term:
-    /// 30 terms each) ahead of `docs`' documents. This is big enough for
-    /// real-corpus-style document frequencies: on the few-document archives
-    /// of the other tests EVERY term exceeds the production all-words
-    /// threshold (see `AND_TERM_MAX_DF_FRAC`), so the all-words tier never
-    /// fires there and tests of the tier itself need an archive that keeps
-    /// the query terms' df under 1%.
-    ///
-    /// `docs` entries are (path, index terms, title, body); the filler
-    /// documents carry no content entries (they never match a query, so
-    /// their articles are never read).
-    fn big_archive_test_server(
-        fillers: usize,
-        docs: &[(&'static str, String, &'static str, &'static str)],
-    ) -> (ZimMcpServer, tempfile::TempDir) {
+    #[test]
+    fn e2e_search_all_words_doc_wins_under_plain_or() {
+        // Plain BM25 (OR over the query terms) must rank the document that
+        // mentions EACH query term above the ones that repeat a single
+        // term: BM25 saturates term frequency (30 repetitions of "cherri"
+        // are worth only ~1.2x one occurrence) and normalizes by document
+        // length, while IDF rewards the second, rare term. The old code
+        // needed a hand-rolled all-words AND branch (double-counting every
+        // document that matched it) for this; BM25 does it alone.
         let dir = tempfile::tempdir().unwrap();
-        let padding = vec!["filler"; 29].join(" ");
-        let mut index_docs: Vec<(String, String, String)> = (0..fillers)
-            .map(|i| {
-                (
-                    format!("C/Filler_{i}"),
-                    format!("{padding} unicum{i}"),
-                    format!("Filler {i}"),
-                )
-            })
-            .collect();
-        for (path, terms, title, _) in docs {
-            index_docs.push(((*path).to_string(), terms.clone(), (*title).to_string()));
-        }
-        let refs: Vec<(&str, &str, &str)> = index_docs
-            .iter()
-            .map(|(p, t, ti)| (p.as_str(), t.as_str(), ti.as_str()))
-            .collect();
-        let index = make_index(&refs);
-        let content: Vec<TestEntry> = docs
-            .iter()
-            .map(|&(path, _, title, body)| TestEntry {
-                namespace: b'C',
-                url: path.strip_prefix("C/").unwrap_or(path),
-                title,
-                mime: 0,
-                body: body.as_bytes(),
-            })
-            .collect();
+        let cherry_terms = format!("{}{}", "cherri ".repeat(30), "filler ".repeat(400));
+        let pie_terms = format!("{}{}", "pie ".repeat(30), "filler ".repeat(400));
+        let index = make_index(&[
+            ("C/Cherry", cherry_terms.as_str(), "Cherry"),
+            ("C/Dessert_Recipes", "cherri cherri pie pie", "Dessert Recipes"),
+            ("C/Pie_1", pie_terms.as_str(), "Pie 1"),
+            ("C/Pie_2", pie_terms.as_str(), "Pie 2"),
+        ]);
+        let content = [
+            TestEntry { namespace: b'C', url: "Cherry", title: "Cherry", mime: 0, body: CHERRY_HTML.as_bytes() },
+            TestEntry { namespace: b'C', url: "Dessert_Recipes", title: "Dessert Recipes", mime: 0, body: CHERRY_HTML.as_bytes() },
+            TestEntry { namespace: b'C', url: "Pie_1", title: "Pie 1", mime: 0, body: CHERRY_HTML.as_bytes() },
+            TestEntry { namespace: b'C', url: "Pie_2", title: "Pie 2", mime: 0, body: CHERRY_HTML.as_bytes() },
+        ];
         let bytes = build_archive(&["text/html"], &content, &[], 0, Some(&index));
         std::fs::write(dir.path().join("test.zim"), &bytes).unwrap();
         let library = Arc::new(ZimLibrary::scan(dir.path()).unwrap());
         assert!(library.archives[0].searchable());
-        (ZimMcpServer::new(library), dir)
-    }
-
-    #[test]
-    fn all_words_branch_gates_terms_by_document_frequency() {
-        // 300 documents: "rarea"/"rareb" in two of them (df 0.7%), "common"
-        // in six (df 2%). The tier decision is parameterized by the df
-        // fraction, so both sides of it are exercised here: the production
-        // threshold and the forced extremes.
-        let dir = tempfile::tempdir().unwrap();
-        let mut wdb = WritableDatabase::create(dir.path().join("db")).unwrap();
-        for i in 0..300u32 {
-            let mut doc = Document::new().unwrap();
-            doc.set_data(format!("C/D{i}")).unwrap();
-            if i < 2 {
-                doc.add_term("rarea", 1).unwrap();
-                doc.add_term("rareb", 1).unwrap();
-            }
-            if (10..16).contains(&i) {
-                doc.add_term("common", 1).unwrap();
-            }
-            wdb.add_document(&doc).unwrap();
-        }
-        wdb.commit().unwrap();
-        let db = Database::open(dir.path().join("db")).unwrap();
-        assert_eq!(db.doc_count(), 300);
-
-        let terms = vec!["common".into(), "rarea".into(), "rareb".into()];
-        let mut enquire = Enquire::new(&db).unwrap();
-        // At the production threshold the two rare terms are specific and
-        // "common" is gated out: the branch is an AND over exactly those
-        // two terms, matching only the documents carrying both. (An AND
-        // that included "common" would match none of them.)
-        let branch = all_words_branch(&db, &terms, AND_TERM_MAX_DF_FRAC)
-            .unwrap()
-            .unwrap();
-        enquire.set_query(&branch).unwrap();
-        let mset = enquire.get_mset(0, 10, 0).unwrap();
-        assert_eq!(mset.size(), 2, "{:?}", (0..mset.size()).map(|i| mset.docid(i)).collect::<Vec<_>>());
-
-        // At df fraction 0 nothing is specific: no branch. At 1 every term
-        // is specific: the branch is the old all-terms AND, which here
-        // matches nothing (no document carries all three terms).
-        assert!(all_words_branch(&db, &terms, 0.0).unwrap().is_none());
-        let all = all_words_branch(&db, &terms, 1.0).unwrap().unwrap();
-        enquire.set_query(&all).unwrap();
-        assert_eq!(enquire.get_mset(0, 10, 0).unwrap().size(), 0);
-
-        // Fewer than two specific terms, no branch (an AND over one term is
-        // plain OR with the term counted twice); a single-term query never
-        // gets a branch.
-        let two = vec!["common".into(), "rarea".into()];
-        assert!(all_words_branch(&db, &two, AND_TERM_MAX_DF_FRAC).unwrap().is_none());
-        let one = vec!["rarea".into()];
-        assert!(all_words_branch(&db, &one, 1.0).unwrap().is_none());
-    }
-
-    #[test]
-    fn e2e_search_all_words_tier_ranks_full_matches_first() {
-        // BM25 alone ranks the "Cherry" document first: thirty repetitions
-        // of one term in a short document outweigh a document mentioning
-        // each term once. The all-words branch must lift "Dessert Recipes"
-        // (the only document with BOTH terms) above it, while the partial
-        // match still appears. The archive is big (see
-        // `big_archive_test_server`) so that "cherri" (2 of 404 documents)
-        // and "pie" (3 of 404) stay under the production df threshold and
-        // the tier actually fires - on a tiny archive every term exceeds
-        // 1% df and the branch would never be built.
-        let cherri_terms = "cherri ".repeat(30);
-        let dessert_terms = format!("cherri pie{}", " filler".repeat(28));
-        let pie_terms = format!("pie pie{}", " filler".repeat(28));
-        let (server, _keep) = big_archive_test_server(
-            400,
-            &[
-                ("C/Cherry", cherri_terms, "Cherry", CHERRY_HTML),
-                ("C/Dessert_Recipes", dessert_terms, "Dessert Recipes", CHERRY_HTML),
-                ("C/Pie_1", pie_terms.clone(), "Pie 1", CHERRY_HTML),
-                ("C/Pie_2", pie_terms, "Pie 2", CHERRY_HTML),
-            ],
-        );
+        let server = ZimMcpServer::new(library);
 
         let hits = search(&server, "cherry pie");
         assert_eq!(hits[0].path, "C/Dessert_Recipes", "{hits:?}");
         assert_eq!(hits[0].title, "Dessert Recipes");
-        // The partial match (only "cherry") is still reported, right behind.
+        // The single-term matches still appear, behind the all-words doc.
         assert_eq!(hits[1].path, "C/Cherry", "{hits:?}");
+        assert_eq!(hits[2].path, "C/Pie_1", "{hits:?}");
+        assert_eq!(hits[3].path, "C/Pie_2", "{hits:?}");
         // Neither hit's lead covers both terms, and "cherry" does match the
-        // intro: it is reported as the matching region _intro, and the preview
-        // is the intro's matching paragraph.
+        // intro: it is reported as the matching region _intro, and the
+        // preview is the intro's matching paragraph.
         assert_eq!(hits[0].sections, Some(vec!["_intro".to_string()]));
         assert!(hits[0].preview.contains("cherry is the fruit"), "{:?}", hits[0].preview);
-    }
-
-    #[test]
-    fn e2e_search_common_word_does_not_block_all_words_tier() {
-        // The measured pathology this change fixes, synthetic: for
-        // "beaconsfield quebec attractions" the term "attract" is common
-        // (10 of 411 documents, 2.4% - gated), while "beaconsfield" and
-        // "quebec" are specific (3 of 411 each). The target document is
-        // missing the common word entirely; the incidental documents carry
-        // it once. Under the old all-terms AND the target got nothing from
-        // the AND branch while the incidentals were double-counted (they
-        // match AND and OR), so they outranked it; with the common word
-        // gated out, the target's strong beaconsfield/quebec matches put it
-        // on top and the incidentals sink below it.
-        let beaconsfield_terms = format!(
-            "{}{}{}",
-            " filler".repeat(12),
-            " beaconsfield".repeat(10),
-            " quebec".repeat(8)
-        );
-        let amateur_terms = format!("beaconsfield quebec attract{}", " filler".repeat(27));
-        let stanley_terms = format!("beaconsfield quebec attract{}", " filler".repeat(27));
-        let attract_filler = format!("attract{}", " filler".repeat(29));
-        let (server, _keep) = big_archive_test_server(
-            400,
-            &[
-                ("C/Beaconsfield,_Quebec", beaconsfield_terms, "Beaconsfield, Quebec", BEACONSFIELD_QUEBEC_HTML),
-                ("C/Canadian_Amateur_Championship", amateur_terms, "Canadian Amateur Championship", CANADIAN_AMATEUR_HTML),
-                ("C/Frederick_Stanley", stanley_terms, "Frederick Stanley", FREDERICK_STANLEY_HTML),
-                ("C/Attract_Filler_1", attract_filler.clone(), "Attract Filler 1", CANADIAN_AMATEUR_HTML),
-                ("C/Attract_Filler_2", attract_filler.clone(), "Attract Filler 2", CANADIAN_AMATEUR_HTML),
-                ("C/Attract_Filler_3", attract_filler.clone(), "Attract Filler 3", CANADIAN_AMATEUR_HTML),
-                ("C/Attract_Filler_4", attract_filler.clone(), "Attract Filler 4", CANADIAN_AMATEUR_HTML),
-                ("C/Attract_Filler_5", attract_filler.clone(), "Attract Filler 5", CANADIAN_AMATEUR_HTML),
-                ("C/Attract_Filler_6", attract_filler.clone(), "Attract Filler 6", CANADIAN_AMATEUR_HTML),
-                ("C/Attract_Filler_7", attract_filler.clone(), "Attract Filler 7", CANADIAN_AMATEUR_HTML),
-                ("C/Attract_Filler_8", attract_filler, "Attract Filler 8", CANADIAN_AMATEUR_HTML),
-            ],
-        );
-
-        let hits = search(&server, "beaconsfield quebec attractions");
-        assert_eq!(hits[0].path, "C/Beaconsfield,_Quebec", "{hits:?}");
-        assert_eq!(hits[0].title, "Beaconsfield, Quebec");
-        // The incidental documents (which carry the gated common word) rank
-        // behind the target, and the attract-only filler documents behind
-        // them.
-        let pos = |p: &str| {
-            hits.iter()
-                .position(|h| h.path == p)
-                .unwrap_or_else(|| panic!("{p} missing from {hits:?}"))
-        };
-        let amateur = pos("C/Canadian_Amateur_Championship");
-        let stanley = pos("C/Frederick_Stanley");
-        assert!(amateur > 0 && stanley > 0, "{hits:?}");
-        let first_filler = hits
-            .iter()
-            .position(|h| h.title.starts_with("Attract Filler"))
-            .unwrap_or(hits.len());
-        assert!(first_filler > amateur && first_filler > stanley, "{hits:?}");
     }
 
     #[test]
     fn e2e_search_stopword_only_query_returns_nothing() {
         let (server, _keep) = test_server();
 
-        // A query made only of stopwords matches nothing (they are stopped
-        // at index time, so the terms are absent) and must not error.
+        // A query made only of function words matches nothing on this
+        // archive (none of the words is in the index) and must not error.
+        // Real libzim indexes do carry such words (nothing stops them), so
+        // there this stays graceful junk - like every OR query.
         let hits = search(&server, "the in of");
         assert!(hits.is_empty(), "{hits:?}");
     }
@@ -1854,9 +1673,8 @@ Meltwater streams out of the ice.
         let (server, _keep) = test_server();
 
         // The indexes have no spelling data, so a nonsense word matches
-        // nothing: on this tiny archive no term is specific, so there is no
-        // all-words branch at all, and the parsed OR query still retrieves
-        // the results for the real word.
+        // nothing and the OR over the real word still retrieves its
+        // results.
         let hits = search(&server, "apple zzzzqq");
         assert!(!hits.is_empty(), "{hits:?}");
         assert_eq!(hits[0].path, "C/Apple", "{hits:?}");
@@ -1983,9 +1801,9 @@ Ancient India smelted zinc early.
         let server = ZimMcpServer::new(library);
 
         // Search: the preview is plain text derived from the Markdown, free of
-        // markup, and is the lead paragraph - the leading `# Zinc` title
-        // line (a separate field of every hit) and the hatnote are dropped.
-        // An exact title match never carries sections.
+        // markup, and is the lead's first sentence - the leading `# Zinc`
+        // title line (a separate field of every hit) and the hatnote are
+        // dropped. An exact title match never carries sections.
         let params = serde_json::from_value::<ZimSearchParams>(
             serde_json::json!({ "query": "zinc" }),
         )

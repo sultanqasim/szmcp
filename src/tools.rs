@@ -104,16 +104,16 @@ impl ToolBase for ZimSearchTool {
     }
     fn description() -> Option<Cow<'static, str>> {
         Some(
-            "Search all articles in all ZIM files. Results are ranked best first: an exact \
-             title match comes first, followed by articles whose titles contain the query \
-             words - titles containing all the query words ahead of partial title matches - \
-             then full-text matches, where articles containing all of the query's distinctive \
-             words rank higher; each result has the ZIM file name, the article \
-             path, the page title, and preview - the article's first paragraph when the query \
-             matches the title or that paragraph, otherwise the sentence that best matches \
-             the query together with \"sections\", the matching regions' names (the intro \
-             listed as \"_intro\"). Use the returned zim and path with the zim_get and \
-             zim_get_section tools."
+            "Search all articles in all ZIM files. Results are ranked best first in three \
+             tiers: an exact title/URL match comes first (a matching redirect reports the \
+             article it points to), then articles whose title contains every query word, \
+             then full-text matches ranked by BM25 relevance over all query words (partial \
+             matches still return). Each result has the ZIM file name, the article path, \
+             the page title, and a preview - the article's first intro sentence for title \
+             matches, otherwise the sentence that best matches the query together with \
+             \"sections\", the matching regions' names (the intro listed as \"_intro\"). \
+             The same article is reported once even when several spellings of it match. \
+             Use the returned zim and path with the zim_get and zim_get_section tools."
                 .into(),
         )
     }

@@ -86,25 +86,6 @@ Xapian::Database *xapian2_db_open_fd(int fd, int flags) {
     return nullptr;
 }
 
-uint32_t xapian2_db_doccount(const Xapian::Database *db) {
-    try {
-        return static_cast<uint32_t>(db->get_doccount());
-    } catch (const Xapian::Error &e) {
-        g_error = describe(e);
-    }
-    return 0;
-}
-
-// The term's document frequency (`get_termfreq`); 0 for an absent term.
-uint32_t xapian2_db_termfreq(const Xapian::Database *db, const char *term, uint32_t len) {
-    try {
-        return static_cast<uint32_t>(db->get_termfreq(std::string_view(term, len)));
-    } catch (const Xapian::Error &e) {
-        g_error = describe(e);
-    }
-    return 0;
-}
-
 XDoc *xapian2_db_get_document(const Xapian::Database *db, uint32_t did) {
     try {
         return new XDoc{db->get_document(did), {}};
@@ -496,15 +477,6 @@ int32_t xapian2_mset_percent(const Xapian::MSet *m, uint32_t i) {
 uint32_t xapian2_mset_rank(const Xapian::MSet *m, uint32_t i) {
     try {
         return static_cast<uint32_t>(m->operator[](i).get_rank());
-    } catch (const Xapian::Error &e) {
-        g_error = describe(e);
-    }
-    return 0;
-}
-
-uint32_t xapian2_mset_termfreq(const Xapian::MSet *m, const char *term, uint32_t len) {
-    try {
-        return static_cast<uint32_t>(m->get_termfreq(std::string_view(term, len)));
     } catch (const Xapian::Error &e) {
         g_error = describe(e);
     }

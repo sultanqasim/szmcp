@@ -853,6 +853,21 @@ impl Archive {
         Ok(None)
     }
 
+    /// Follow `path`'s redirect chain to its terminal entry (bounded, see
+    /// `MAX_REDIRECT_HOPS`). Returns the terminal entry's full path and raw
+    /// directory title (often empty in modern openZIM archives - callers
+    /// apply fallbacks); `None` when the path resolves to no entry. Search
+    /// candidates resolve through this before dedupe so that a redirect
+    /// entry (or a redirect's title-index document) reports the article it
+    /// names - and dedupes against it - instead of reporting itself.
+    pub fn resolve_terminal(&self, path: &str) -> io::Result<Option<(String, String)>> {
+        let Some(idx) = self.zim.resolve_path(path)? else {
+            return Ok(None);
+        };
+        let entry = self.resolve_entry(idx)?;
+        Ok(Some((full_path(&entry), entry.title)))
+    }
+
     /// Resolve `path` (following redirects) and read the article's content.
     pub fn get_article(&self, path: &str) -> io::Result<Article> {
         let Some(idx) = self.zim.resolve_path(path)? else {

@@ -77,8 +77,6 @@ mod ffi {
         // Database
         pub fn xapian2_db_open(path: *const c_char, flags: c_int) -> *mut c_void;
         pub fn xapian2_db_open_fd(fd: c_int, flags: c_int) -> *mut c_void;
-        pub fn xapian2_db_doccount(db: *mut c_void) -> u32;
-        pub fn xapian2_db_termfreq(db: *mut c_void, term: *const c_char, len: u32) -> u32;
         pub fn xapian2_db_get_document(db: *mut c_void, did: u32) -> *mut c_void;
         pub fn xapian2_db_compact(db: *mut c_void, output: *const c_char) -> c_int;
         pub fn xapian2_db_compact_single_file(db: *mut c_void, output: *const c_char) -> c_int;
@@ -151,7 +149,6 @@ mod ffi {
         pub fn xapian2_mset_weight(m: *mut c_void, i: u32) -> f64;
         pub fn xapian2_mset_percent(m: *mut c_void, i: u32) -> i32;
         pub fn xapian2_mset_rank(m: *mut c_void, i: u32) -> u32;
-        pub fn xapian2_mset_termfreq(m: *mut c_void, term: *const c_char, len: u32) -> u32;
         pub fn xapian2_mset_convert_to_percent(m: *mut c_void, weight: f64) -> i32;
         pub fn xapian2_mset_get_document(m: *mut c_void, i: u32) -> *mut c_void;
         pub fn xapian2_mset_free(m: *mut c_void);
@@ -418,29 +415,12 @@ impl Database {
         Error::from_ptr(ptr, "failed to open embedded database").map(|ptr| Self { ptr })
     }
 
-    /// The number of documents in the database.
-    pub fn doc_count(&self) -> u32 {
-        // SAFETY: the handle is valid for the lifetime of `self`.
-        unsafe { ffi::xapian2_db_doccount(self.handle()) }
-    }
-
-    /// The number of documents in the database that index `term`
-    /// (`get_termfreq`, the term's document frequency); 0 for a term absent
-    /// from the index.
-    pub fn termfreq(&self, term: &str) -> u32 {
-        let bytes = term.as_bytes();
-        // SAFETY: `bytes` is a valid byte slice; the shim copies it.
-        unsafe {
-            ffi::xapian2_db_termfreq(self.handle(), bytes.as_ptr() as *const _, bytes.len() as u32)
-        }
-    }
-
     /// Fetch the document with the given id.
     ///
     /// Fails with `InvalidArgumentError` for id 0 and
     /// `DocNotFoundError` for unknown ids.
     pub fn get_document(&self, id: u32) -> Result<Document> {
-        // SAFETY: see doc_count.
+        // SAFETY: the handle is valid for the lifetime of `self`.
         let ptr = unsafe { ffi::xapian2_db_get_document(self.handle(), id) };
         Error::from_ptr(ptr, "failed to fetch document").map(|ptr| Document { ptr })
     }
@@ -448,7 +428,7 @@ impl Database {
     /// Produce a compacted glass *directory* at `output`.
     pub fn compact_to(&self, output: impl AsRef<Path>) -> Result<()> {
         let c_out = cstr(&output.as_ref().to_string_lossy())?;
-        // SAFETY: see doc_count.
+        // SAFETY: the handle is valid for the lifetime of `self`.
         let status = unsafe { ffi::xapian2_db_compact(self.handle(), c_out.as_ptr()) };
         Error::from_status(status)
     }
@@ -460,7 +440,7 @@ impl Database {
     /// `fulltext/xapian` item, and what [`Database::open_at`] can open.
     pub fn compact_single_file(&self, output: impl AsRef<Path>) -> Result<()> {
         let c_out = cstr(&output.as_ref().to_string_lossy())?;
-        // SAFETY: see doc_count.
+        // SAFETY: the handle is valid for the lifetime of `self`.
         let status = unsafe { ffi::xapian2_db_compact_single_file(self.handle(), c_out.as_ptr()) };
         Error::from_status(status)
     }
@@ -1041,16 +1021,6 @@ impl MSet {
     pub fn rank(&self, i: u32) -> u32 {
         // SAFETY: see size().
         unsafe { ffi::xapian2_mset_rank(self.handle(), i) }
-    }
-
-    /// The number of documents in which `term` occurs (as seen by this
-    /// match set).
-    pub fn termfreq(&self, term: &str) -> u32 {
-        let bytes = term.as_bytes();
-        // SAFETY: `bytes` is a valid byte slice; the shim copies it.
-        unsafe {
-            ffi::xapian2_mset_termfreq(self.handle(), bytes.as_ptr() as *const _, bytes.len() as u32)
-        }
     }
 
     /// Convert an absolute weight to a 0-100 percentage, accounting for
