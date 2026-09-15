@@ -105,44 +105,29 @@ fn fold_accents(text: &str) -> String {
         .collect()
 }
 
-/// The query's words for the title tier: split on runs of non-alphanumeric
-/// characters (whitespace AND intra-word punctuation), lowercase, one entry
-/// per distinct word in first-occurrence order. The title index stores
-/// titles as written - lowercased, accent-folded surface forms (measured on
-/// md1m: df("beatles")=186 against df("beatl")=0) - so the tier must match
-/// the words exactly as they appear. The query text arrives accent-folded
-/// already (see `search`).
-///
-/// The split must include punctuation, not just whitespace: index terms are
-/// split the same way (libzim's indexer breaks text on non-alphanumeric
-/// characters), so a title "Notre-Dame de Paris" is carried as the terms
-/// `notre` (df 164) and `dame` (df 191) on fr.zim's title index, never as a
-/// fused `notredame`. Stripping punctuation instead of splitting fused
-/// "notre-dame" into "notredame" - a term with df 0 - and the title tier's
-/// AND silently matched nothing for any query with a punctuation-delimited
-/// word.
-fn title_words(query: &str) -> Vec<String> {
-    let mut words: Vec<String> = Vec::new();
-    for word in query.split(|c: char| !c.is_alphanumeric()) {
-        if word.is_empty() {
-            continue;
-        }
-        let word = word.to_lowercase();
-        if !words.contains(&word) {
-            words.push(word);
-        }
+/// The title tier's query: `text` - the accent-folded query with every
+/// non-alphanumeric character mapped to a space (see `title_text`) -
+/// parsed with the QueryParser, which tokenizes it exactly like the
+/// indexer's TermGenerator ("notre-dame" splits into `notre` + `dame`, the
+/// terms a title index carries) and ANDs every word via the default op -
+/// the same all-words AND over the same unstemmed surface forms the
+/// hand-rolled `Query::term` tree built (raw terms, no parser: punctuation
+/// handling had to be reimplemented here, and once fused "notre-dame" into
+/// the df-0 term "notredame" - fixed in 0fdbde4). Returns `None` when
+/// `text` has no words (an all-punctuation query): the caller skips the
+/// band, as [`fulltext_query`]'s `None` skips the fulltext band.
+fn title_query(text: &str) -> Result<Option<Query>, ToolError> {
+    if text.split_whitespace().next().is_none() {
+        return Ok(None);
     }
-    words
-}
-
-/// Combine `terms` (non-empty) with `op`, left to right; Xapian flattens
-/// the resulting tree itself.
-fn combine_terms<T: AsRef<str>>(op: Operator, terms: &[T]) -> xapian2::Result<Query> {
-    let mut query = Query::term(terms[0].as_ref())?;
-    for term in &terms[1..] {
-        query = Query::combine(op, &query, &Query::term(term.as_ref())?)?;
-    }
-    Ok(query)
+    let mut qp = QueryParser::new()?;
+    qp.set_stemmer("none")?;
+    qp.set_stemming_strategy(StemStrategy::None)?;
+    qp.set_default_op(Operator::And)?;
+    let query = qp
+        .parse_query(text)
+        .map_err(|e| ToolError::InvalidArgument(format!("failed to parse title query: {e}")))?;
+    Ok(Some(query))
 }
 
 /// A stemmer that remembers the stem of every word it has seen. Natural
@@ -216,17 +201,21 @@ struct ArchiveQuery {
     /// order): the hit previews' paragraph matching, scored against the
     /// archive's full-text vocabulary.
     terms: Vec<String>,
-    /// The query's folded surface words (see [`title_words`]): the title
-    /// tier's AND query, one term per word.
-    title_words: Vec<String>,
+    /// The title tier's query text: the folded query with every
+    /// non-alphanumeric character mapped to a space, so the QueryParser
+    /// (see [`title_query`]) only ever sees clean words - no `foo:bar`
+    /// prefix attempts, no operators, no phrases, no love/hate - while it
+    /// owns the tokenization semantics, consistent with the indexer's
+    /// TermGenerator. The words are already lowercase (the fold
+    /// lowercases; see `search`).
+    title_text: String,
     /// The folded query's whitespace tokens, as written (see `search`):
     /// the fulltext query is parsed from the KEPT ones (see
     /// [`FT_WORD_MAX_DF_FRAC`], [`fulltext_query`]). Tokens, not the title
-    /// tier's alphanumeric-only words, because the QueryParser tokenizes
-    /// intra-word punctuation itself - "notre-dame" must reach it whole,
-    /// or the hyphen fusion ("notredame") builds a term the index never
-    /// carries and the Cathédrale Notre-Dame article drops out of its own
-    /// query (measured).
+    /// tier's per-word split (`title_text`), because these reach the
+    /// parser as written and the fulltext index is stemmed (`STEM_ALL`) -
+    /// "notre-dame" must reach it whole so the parser's own
+    /// tokenization/stemming applies to its parts.
     ft_words: Vec<String>,
     /// The stems of `ft_words`' alphanumeric-only forms, same order: the
     /// df filter's lookup keys (the index's terms are folded Porter2
@@ -246,10 +235,15 @@ impl ArchiveQuery {
             ToolError::Internal(format!("failed to create {language} stemmer: {}", e.msg()))
         })?;
         // `query` arrives accent-folded (see `search`), so the tier words
-        // stem through the no-second-fold path (`stem_folded`).
-        let title_words = title_words(query);
+        // stem through the no-second-fold path (`stem_folded`). The title
+        // tier's words are the parser's: punctuation mapped to spaces (see
+        // `title_text`), the remainder split on the whitespace runs.
+        let title_text: String = query
+            .chars()
+            .map(|c| if c.is_alphanumeric() { c } else { ' ' })
+            .collect();
         let mut terms: Vec<String> = Vec::new();
-        for word in &title_words {
+        for word in title_text.split_whitespace() {
             let stemmed = stemmer.stem_folded(word).to_string();
             if !terms.contains(&stemmed) {
                 terms.push(stemmed);
@@ -263,9 +257,10 @@ impl ArchiveQuery {
         // but a conservative key. A fused hyphenated compound like
         // "notre-dame" -> "notredame" is a word no document text contains
         // (the indexer splits on non-alphanumeric characters, exactly like
-        // `title_words`), so its df measures 0 and the filter always keeps
-        // the token - hyphenated compounds are discriminative, and the
-        // QueryParser splits the token as written anyway. The pathological
+        // the title tier's QueryParser parse), so its df measures 0 and
+        // the filter always keeps the token - hyphenated compounds are
+        // discriminative, and the QueryParser splits the token as written
+        // anyway. The pathological
         // shape is a fused form colliding with a common standalone word
         // ("u.s." -> "us", the df of the ordinary word "us"): such a token
         // can be dropped from the FULLTEXT query though its parts are rare
@@ -291,7 +286,7 @@ impl ArchiveQuery {
             ft_words.push(token.to_string());
             ft_stems.push(stem);
         }
-        Ok(Self { stemmer, language, terms, title_words, ft_words, ft_stems })
+        Ok(Self { stemmer, language, terms, title_text, ft_words, ft_stems })
     }
 }
 
@@ -442,8 +437,9 @@ pub fn search(library: &ZimLibrary, query: &str) -> Result<SearchResults, ToolEr
     //
     // Tier 2 - the title tier queries the archive's title index
     // (`X/title/xapian`; documents ARE titles) with an AND over ALL the
-    // query words' surface forms (see `title_words`): a title that says
-    // the whole query is far stronger evidence than body words, and an
+    // query words' surface forms, parsed by the QueryParser from the
+    // punctuation-to-spaces normalized text (`title_query`): a title that
+    // says the whole query is far stronger evidence than body words, and an
     // article matching only part of the query in its title is not
     // promoted at all - that judgment is left to the full-text tier's
     // BM25, whose IDF already down-weights common words. Single-word
@@ -463,9 +459,8 @@ pub fn search(library: &ZimLibrary, query: &str) -> Result<SearchResults, ToolEr
     for (arc, query_state) in library.archives.iter().zip(queries.iter_mut()) {
         let Some((title_list, list)) = arc.with_xapian(|h| -> Result<_, ToolError> {
             let mut title_list = Vec::new();
-            if !query_state.title_words.is_empty() {
+            if let Some(and_query) = title_query(&query_state.title_text)? {
                 if let Some(title_db) = &h.title {
-                    let and_query = combine_terms(Operator::And, &query_state.title_words)?;
                     let mut enquire = Enquire::new(title_db)?;
                     enquire.set_sort_by_relevance();
                     enquire.set_query(&and_query)?;
@@ -1797,11 +1792,13 @@ Meltwater streams out of the ice.
     fn e2e_search_title_band_splits_punctuation_delimited_words() {
         let (server, _keep) = hyphen_title_test_server();
 
-        // The title tier's AND is built from the query's punctuation-SPLIT
-        // words (cathedrale, notre, dame, de, paris): every one is a term
-        // of the title-index document, so the article is found, styled as a
-        // title match (first intro sentence, no sections). While
-        // `title_words` still FUSED punctuation-delimited words
+        // The title tier parses the punctuation-to-spaces normalized query
+        // with the QueryParser, so the words are punctuation-SPLIT
+        // (cathedrale, notre, dame, de, paris) and the parser's default op
+        // ANDs them: every one is a term of the title-index document, so
+        // the article is found, styled as a title match (first intro
+        // sentence, no sections). While the tier hand-built its AND from
+        // raw `Query::term`s and FUSED punctuation-delimited words
         // ("notre-dame" -> "notredame"), the AND queried a term no title
         // document carries and the band came back silently empty - this
         // search returned nothing at all.
