@@ -920,11 +920,26 @@ impl Archive {
     }
 }
 
+/// How the library was opened: one ZIM file, or a directory scanned for
+/// ZIM files. The MCP tool set is shaped by it: single mode drops the
+/// `zim` argument from zim_get/zim_get_section (there is nothing to name)
+/// and has no zim_list; directory mode requires the argument and adds
+/// zim_list plus an optional zim filter on zim_search.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Mode {
+    /// Opened with a single ZIM file.
+    Single,
+    /// Opened with a directory, scanned recursively.
+    Directory,
+}
+
 /// A set of ZIM archives: everything under a directory (`scan`), or a
 /// single file (`single`).
 pub struct ZimLibrary {
     pub root: PathBuf,
     pub archives: Vec<Arc<Archive>>,
+    /// How the library was opened - the MCP tool set is shaped by it.
+    pub mode: Mode,
 }
 
 impl ZimLibrary {
@@ -948,7 +963,7 @@ impl ZimLibrary {
                 Err(e) => eprintln!("szmcp: skipping {}: {e}", name),
             }
         }
-        Ok(ZimLibrary { root: root.to_path_buf(), archives })
+        Ok(ZimLibrary { root: root.to_path_buf(), archives, mode: Mode::Directory })
     }
 
     /// Open the single ZIM archive at `file` (`*.zim`, or the first
@@ -965,7 +980,11 @@ impl ZimLibrary {
         // Store::open pick up the chunked form x.zimaa, x.zimab, ...
         let zim = Zim::open(file.with_file_name(&name))?;
         let root = file.parent().unwrap_or(Path::new(".")).to_path_buf();
-        Ok(ZimLibrary { root, archives: vec![Arc::new(Archive::new(name, zim))] })
+        Ok(ZimLibrary {
+            root,
+            archives: vec![Arc::new(Archive::new(name, zim))],
+            mode: Mode::Single,
+        })
     }
 
     /// The loaded archive whose name (relative to the ZIM directory) is `name`
@@ -983,6 +1002,16 @@ impl ZimLibrary {
             return None;
         }
         self.archives.iter().find(|a| a.name == wanted)
+    }
+
+    /// The one archive of a single-file library; `None` for a scanned
+    /// directory (its tools take the archive by name instead).
+    pub fn single_archive(&self) -> Option<&Arc<Archive>> {
+        if self.mode == Mode::Single {
+            self.archives.first()
+        } else {
+            None
+        }
     }
 }
 
@@ -1530,5 +1559,34 @@ pub(crate) mod testutil {
         let dir = tempfile::tempdir().unwrap();
         let lib = ZimLibrary::scan(dir.path()).unwrap();
         assert!(lib.archives.is_empty());
+        assert_eq!(lib.mode, Mode::Directory);
+        assert!(lib.single_archive().is_none());
+    }
+
+    #[test]
+    fn library_mode_matches_how_it_was_opened() {
+        // The mode records the launch shape (one file vs. a scanned
+        // directory), and single_archive hands out the one archive only in
+        // single mode - the MCP tool set is built on both facts.
+        let dir = tempfile::tempdir().unwrap();
+        let content = [TestEntry {
+            namespace: b'C',
+            url: "Apple",
+            title: "Apple",
+            mime: 0,
+            body: b"<html><body><h1>Apple</h1><p>An apple a day.</p></body></html>",
+        }];
+        let bytes = build_archive(&["text/html"], &content, &[], 0, None);
+
+        let file = dir.path().join("one.zim");
+        std::fs::write(&file, &bytes).unwrap();
+        let single = ZimLibrary::single(&file).unwrap();
+        assert_eq!(single.mode, Mode::Single);
+        assert!(Arc::ptr_eq(single.single_archive().unwrap(), &single.archives[0]));
+
+        std::fs::write(dir.path().join("two.zim"), &bytes).unwrap();
+        let scanned = ZimLibrary::scan(dir.path()).unwrap();
+        assert_eq!(scanned.mode, Mode::Directory);
+        assert!(scanned.single_archive().is_none());
     }
 }

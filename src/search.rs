@@ -752,7 +752,7 @@ fn hit_preview(
 pub(crate) mod tests {
     use super::*;
     use crate::tools::{
-        ZimGetSectionParams, ZimGetSectionTool, ZimMcpServer, ZimSearchParams, ZimSearchTool,
+        ZimGetSectionDirParams, ZimGetSectionDirTool, ZimMcpServer, ZimSearchParams, ZimSearchTool,
     };
     use crate::zim::testutil::{
         build_archive, build_archive_indexes, language_metadata_entry, TestEntry, TestRedirect,
@@ -925,8 +925,9 @@ Scientists measure the flow from observatories.
         std::fs::read(&single).unwrap()
     }
 
-    pub(crate) fn test_server() -> (ZimMcpServer, tempfile::TempDir) {
-        let dir = tempfile::tempdir().unwrap();
+    /// The bytes of the shared test archive: Apple and Banana with a real
+    /// full-text index, one ZIM file named `test.zim`.
+    fn test_zim_bytes() -> Vec<u8> {
         let index = make_index(
             &[
                 ("C/Apple", "appl histori 10 000 year domest wild kazakhstan comput devic nam", "Apple"),
@@ -937,9 +938,25 @@ Scientists measure the flow from observatories.
             TestEntry { namespace: b'C', url: "Apple", title: "Apple", mime: 0, body: APPLE_HTML.as_bytes() },
             TestEntry { namespace: b'C', url: "Banana", title: "Banana", mime: 0, body: BANANA_HTML.as_bytes() },
         ];
-        let bytes = build_archive(&["text/html"], &content, &[], 0, Some(&index));
-        std::fs::write(dir.path().join("test.zim"), &bytes).unwrap();
+        build_archive(&["text/html"], &content, &[], 0, Some(&index))
+    }
+
+    pub(crate) fn test_server() -> (ZimMcpServer, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("test.zim"), test_zim_bytes()).unwrap();
         let library = Arc::new(ZimLibrary::scan(dir.path()).unwrap());
+        assert!(library.archives[0].searchable());
+        (ZimMcpServer::new(library), dir)
+    }
+
+    /// The same fixture opened as a single-file library: the server boots
+    /// in single mode, whose tools take no `zim` argument.
+    pub(crate) fn test_single_server() -> (ZimMcpServer, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("test.zim");
+        std::fs::write(&file, test_zim_bytes()).unwrap();
+        let library = Arc::new(ZimLibrary::single(&file).unwrap());
+        assert_eq!(library.mode, crate::zim::Mode::Single);
         assert!(library.archives[0].searchable());
         (ZimMcpServer::new(library), dir)
     }
@@ -2016,7 +2033,7 @@ Scientists measure the flow from observatories.
     /// plus one exclusive article each: a.zim holds C/Banana, b.zim holds
     /// C/Cherry. Returns the tempdir (it must outlive the searches) and the
     /// scanned library.
-    fn two_archive_library() -> (tempfile::TempDir, Arc<ZimLibrary>) {
+    pub(crate) fn two_archive_library() -> (tempfile::TempDir, Arc<ZimLibrary>) {
         let dir = tempfile::tempdir().unwrap();
         let index_a = make_index(
             &[
@@ -2233,22 +2250,22 @@ Other transition metals are described elsewhere.
         );
         assert_eq!(hits[0].preview, "Zinc is a chemical element with the symbol Zn.");
         // includes the subsection, reports the heading as written.
-        let params = serde_json::from_value::<ZimGetSectionParams>(
+        let params = serde_json::from_value::<ZimGetSectionDirParams>(
             serde_json::json!({ "zim": "md.zim", "path": "Zinc", "section": "history" }),
         )
         .unwrap();
-        let result = block_on(ZimGetSectionTool::invoke(&server, params)).unwrap();
+        let result = block_on(ZimGetSectionDirTool::invoke(&server, params)).unwrap();
         assert_eq!(result.section, "History");
         assert!(result.content.contains("ancient times"), "{:?}", result.content);
         assert!(result.content.contains("Ancient India smelted zinc early"));
 
         // The reserved intro name: the raw Markdown between the leading
         // title line and the first heading.
-        let params = serde_json::from_value::<ZimGetSectionParams>(
+        let params = serde_json::from_value::<ZimGetSectionDirParams>(
             serde_json::json!({ "zim": "md.zim", "path": "Zinc", "section": "_intro" }),
         )
         .unwrap();
-        let result = block_on(ZimGetSectionTool::invoke(&server, params)).unwrap();
+        let result = block_on(ZimGetSectionDirTool::invoke(&server, params)).unwrap();
         assert_eq!(result.section, "_intro");
         assert!(
             result.content.contains("For other uses, see [[Zinc (disambiguation)]]."),
@@ -2260,12 +2277,12 @@ Other transition metals are described elsewhere.
         assert!(!result.content.contains("History"), "{:?}", result.content);
 
         // Missing section: same error shape as the HTML path.
-        let params = serde_json::from_value::<ZimGetSectionParams>(
+        let params = serde_json::from_value::<ZimGetSectionDirParams>(
             serde_json::json!({ "zim": "md.zim", "path": "Zinc", "section": "Nope" }),
         )
         .unwrap();
         assert!(matches!(
-            block_on(ZimGetSectionTool::invoke(&server, params)),
+            block_on(ZimGetSectionDirTool::invoke(&server, params)),
             Err(ToolError::SectionNotFound(_))
         ));
     }

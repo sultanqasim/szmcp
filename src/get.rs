@@ -26,18 +26,15 @@ fn not_found_if_missing(
 
 /// Find the archive with the given name (relative to the ZIM directory).
 fn find_archive(library: &ZimLibrary, name: &str) -> Result<Arc<Archive>, ToolError> {
-    let wanted = name.trim().trim_start_matches("./");
-    library
-        .archives
-        .iter()
-        .find(|a| a.name == wanted)
-        .cloned()
-        .ok_or_else(|| {
-            ToolError::NotFound(format!(
-                "ZIM file not found: {name} (loaded: {})",
-                library.archives.iter().map(|a| a.name.as_str()).collect::<Vec<_>>().join(", ")
-            ))
-        })
+    // ZimLibrary::archive is the one name matcher, shared with the search
+    // filter: `./` prefixes are trimmed, and names leaving the ZIM
+    // directory (`..` components, absolute paths, empty) are refused.
+    library.archive(name).cloned().ok_or_else(|| {
+        ToolError::NotFound(format!(
+            "ZIM file not found: {name} (loaded: {})",
+            library.archives.iter().map(|a| a.name.as_str()).collect::<Vec<_>>().join(", ")
+        ))
+    })
 }
 
 /// Entries in the `X` namespace are internal (embedded full-text search
@@ -176,7 +173,8 @@ mod tests {
     use super::*;
     use crate::search::tests::test_server;
     use crate::tools::{
-        ZimGetParams, ZimGetSectionParams, ZimGetSectionTool, ZimGetTool, ZimMcpServer,
+        ZimGetDirParams, ZimGetDirTool, ZimGetSectionDirParams, ZimGetSectionDirTool,
+        ZimMcpServer,
     };
     use crate::zim::testutil::{build_archive, TestEntry};
     use rmcp::handler::server::router::tool::AsyncTool;
@@ -196,11 +194,11 @@ mod tests {
     fn e2e_get() {
         let (server, _keep) = test_server();
 
-        let params = serde_json::from_value::<ZimGetParams>(
+        let params = serde_json::from_value::<ZimGetDirParams>(
             serde_json::json!({ "zim": "test.zim", "path": "C/Apple" }),
         )
         .unwrap();
-        let result = block_on(ZimGetTool::invoke(&server, params)).unwrap();
+        let result = block_on(ZimGetDirTool::invoke(&server, params)).unwrap();
         assert_eq!(result.title, "Apple");
         assert_eq!(result.path, "C/Apple");
         assert_eq!(result.mime_type.as_deref(), Some("text/html"));
@@ -208,24 +206,24 @@ mod tests {
         assert!(result.content.contains("10,000 years"));
 
         // Bare path also works.
-        let params = serde_json::from_value::<ZimGetParams>(
+        let params = serde_json::from_value::<ZimGetDirParams>(
             serde_json::json!({ "zim": "test.zim", "path": "Banana" }),
         )
         .unwrap();
-        let result = block_on(ZimGetTool::invoke(&server, params)).unwrap();
+        let result = block_on(ZimGetDirTool::invoke(&server, params)).unwrap();
         assert!(result.content.contains("herbaceous plants"));
 
         // Unknown article / unknown archive.
-        let params = serde_json::from_value::<ZimGetParams>(
+        let params = serde_json::from_value::<ZimGetDirParams>(
             serde_json::json!({ "zim": "test.zim", "path": "Nope" }),
         )
         .unwrap();
-        assert!(matches!(block_on(ZimGetTool::invoke(&server, params)), Err(ToolError::NotFound(_))));
-        let params = serde_json::from_value::<ZimGetParams>(
+        assert!(matches!(block_on(ZimGetDirTool::invoke(&server, params)), Err(ToolError::NotFound(_))));
+        let params = serde_json::from_value::<ZimGetDirParams>(
             serde_json::json!({ "zim": "other.zim", "path": "Apple" }),
         )
         .unwrap();
-        assert!(matches!(block_on(ZimGetTool::invoke(&server, params)), Err(ToolError::NotFound(_))));
+        assert!(matches!(block_on(ZimGetDirTool::invoke(&server, params)), Err(ToolError::NotFound(_))));
     }
     #[test]
     fn e2e_get_accepts_article_titles() {
@@ -252,41 +250,41 @@ mod tests {
         let server = ZimMcpServer::new(library);
 
         // A single-word title resolves to its C/ path.
-        let params = serde_json::from_value::<ZimGetParams>(
+        let params = serde_json::from_value::<ZimGetDirParams>(
             serde_json::json!({ "zim": "salt.zim", "path": "Salt" }),
         )
         .unwrap();
-        let result = block_on(ZimGetTool::invoke(&server, params)).unwrap();
+        let result = block_on(ZimGetDirTool::invoke(&server, params)).unwrap();
         assert_eq!(result.path, "C/Salt");
         assert_eq!(result.title, "Salt");
 
         // A multi-word title maps to the underscored path - a bare path
         // containing a space could never resolve by itself.
-        let params = serde_json::from_value::<ZimGetParams>(
+        let params = serde_json::from_value::<ZimGetDirParams>(
             serde_json::json!({ "zim": "salt.zim", "path": "Dishwasher salt" }),
         )
         .unwrap();
-        let result = block_on(ZimGetTool::invoke(&server, params)).unwrap();
+        let result = block_on(ZimGetDirTool::invoke(&server, params)).unwrap();
         assert_eq!(result.path, "C/Dishwasher_salt");
         assert_eq!(result.title, "Dishwasher salt");
 
         // zim_get_section takes titles too.
-        let params = serde_json::from_value::<ZimGetSectionParams>(
+        let params = serde_json::from_value::<ZimGetSectionDirParams>(
             serde_json::json!({ "zim": "salt.zim", "path": "Salt", "section": "_intro" }),
         )
         .unwrap();
-        let result = block_on(ZimGetSectionTool::invoke(&server, params)).unwrap();
+        let result = block_on(ZimGetSectionDirTool::invoke(&server, params)).unwrap();
         assert_eq!(result.section, "_intro");
         assert_eq!(result.title, "Salt");
         assert!(result.content.contains("Salt is a mineral"), "{:?}", result.content);
 
         // A title that matches nothing errors with the converted path.
-        let params = serde_json::from_value::<ZimGetParams>(
+        let params = serde_json::from_value::<ZimGetDirParams>(
             serde_json::json!({ "zim": "salt.zim", "path": "No Such Article" }),
         )
         .unwrap();
         assert!(matches!(
-            block_on(ZimGetTool::invoke(&server, params)),
+            block_on(ZimGetDirTool::invoke(&server, params)),
             Err(ToolError::NotFound(msg)) if msg.contains("C/No_Such_Article")
         ));
     }
@@ -296,12 +294,12 @@ mod tests {
         let (server, _keep) = test_server();
 
         // The embedded full-text index is an internal entry, not an article.
-        let params = serde_json::from_value::<ZimGetParams>(
+        let params = serde_json::from_value::<ZimGetDirParams>(
             serde_json::json!({ "zim": "test.zim", "path": "X/fulltext/xapian" }),
         )
         .unwrap();
         assert!(matches!(
-            block_on(ZimGetTool::invoke(&server, params)),
+            block_on(ZimGetDirTool::invoke(&server, params)),
             Err(ToolError::InvalidArgument(_))
         ));
 
@@ -313,12 +311,12 @@ mod tests {
         std::fs::write(dir.path().join("big.zim"), &bytes).unwrap();
         let library = Arc::new(ZimLibrary::scan(dir.path()).unwrap());
         let server = ZimMcpServer::new(library);
-        let params = serde_json::from_value::<ZimGetParams>(
+        let params = serde_json::from_value::<ZimGetDirParams>(
             serde_json::json!({ "zim": "big.zim", "path": "C/Big" }),
         )
         .unwrap();
         assert!(matches!(
-            block_on(ZimGetTool::invoke(&server, params)),
+            block_on(ZimGetDirTool::invoke(&server, params)),
             Err(ToolError::InvalidArgument(msg)) if msg.contains("too large")
         ));
     }
@@ -327,11 +325,11 @@ mod tests {
     fn e2e_get_section() {
         let (server, _keep) = test_server();
 
-        let params = serde_json::from_value::<ZimGetSectionParams>(
+        let params = serde_json::from_value::<ZimGetSectionDirParams>(
             serde_json::json!({ "zim": "test.zim", "path": "Apple", "section": "History" }),
         )
         .unwrap();
-        let result = block_on(ZimGetSectionTool::invoke(&server, params)).unwrap();
+        let result = block_on(ZimGetSectionDirTool::invoke(&server, params)).unwrap();
         assert_eq!(result.title, "Apple");
         assert_eq!(result.section, "History");
         assert!(result.content.contains("10,000 years"), "{:?}", result.content);
@@ -340,21 +338,21 @@ mod tests {
         assert!(!result.content.contains("Computing devices"));
 
         // Case-insensitive name match; the actual heading text is reported.
-        let params = serde_json::from_value::<ZimGetSectionParams>(
+        let params = serde_json::from_value::<ZimGetSectionDirParams>(
             serde_json::json!({ "zim": "test.zim", "path": "Banana", "section": "growth" }),
         )
         .unwrap();
-        let result = block_on(ZimGetSectionTool::invoke(&server, params)).unwrap();
+        let result = block_on(ZimGetSectionDirTool::invoke(&server, params)).unwrap();
         assert_eq!(result.section, "Growth");
         assert!(result.content.contains("herbaceous plants"));
 
         // The reserved intro name: the intro region (everything before the
         // first heading), echoed as its reserved name.
-        let params = serde_json::from_value::<ZimGetSectionParams>(
+        let params = serde_json::from_value::<ZimGetSectionDirParams>(
             serde_json::json!({ "zim": "test.zim", "path": "Apple", "section": "_intro" }),
         )
         .unwrap();
-        let result = block_on(ZimGetSectionTool::invoke(&server, params)).unwrap();
+        let result = block_on(ZimGetSectionDirTool::invoke(&server, params)).unwrap();
         assert_eq!(result.section, "_intro");
         assert!(
             result.content.contains("An <b>apple</b> is the fruit of"),
@@ -364,13 +362,36 @@ mod tests {
         assert!(!result.content.contains("10,000 years"), "{:?}", result.content);
 
         // Missing section.
-        let params = serde_json::from_value::<ZimGetSectionParams>(
+        let params = serde_json::from_value::<ZimGetSectionDirParams>(
             serde_json::json!({ "zim": "test.zim", "path": "Banana", "section": "Nope" }),
         )
         .unwrap();
         assert!(matches!(
-            block_on(ZimGetSectionTool::invoke(&server, params)),
+            block_on(ZimGetSectionDirTool::invoke(&server, params)),
             Err(ToolError::SectionNotFound(_))
         ));
+    }
+
+    #[test]
+    fn e2e_get_rejects_zim_names_outside_the_directory() {
+        let (server, _keep) = test_server();
+
+        // Traversal and absolute names leave the ZIM directory; the shared
+        // name matcher refuses both, with the same NotFound shape as an
+        // unknown name (listing the loaded files).
+        for zim in ["../evil.zim", "/etc/passwd"] {
+            let params = serde_json::from_value::<ZimGetDirParams>(
+                serde_json::json!({ "zim": zim, "path": "C/Apple" }),
+            )
+            .unwrap();
+            assert!(
+                matches!(
+                    block_on(ZimGetDirTool::invoke(&server, params)),
+                    Err(ToolError::NotFound(msg))
+                        if msg.contains("not found") && msg.contains("test.zim")
+                ),
+                "{zim}"
+            );
+        }
     }
 }
