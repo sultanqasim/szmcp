@@ -22,9 +22,6 @@ const INTRO_CHARS: usize = 300;
 /// Raw bytes read of an article to locate its matches (regions and
 /// paragraphs). For compressed clusters the whole cluster decompresses anyway.
 const HIT_READ_BYTES: u64 = 1024 * 1024;
-/// Cap on one paragraph's characters while scanning it for matches; a
-/// paragraph chosen for reporting is truncated to `INTRO_CHARS` separately.
-const PARA_MATCH_CHARS: usize = 2000;
 /// Relative BM25 threshold for the `sections` of a fulltext hit: a region
 /// is reported when its BM25 score for the hit's full-text query is at
 /// least this fraction of the article's best-scoring region. 0.4 keeps
@@ -664,9 +661,9 @@ fn hit_preview(
     is_markdown: bool,
 ) -> Result<(String, Option<Vec<String>>), ToolError> {
     let intro = if is_markdown {
-        markdown::intro_paragraphs(article, PARA_MATCH_CHARS)
+        markdown::intro_paragraphs(article)
     } else {
-        html::intro_paragraphs(article, PARA_MATCH_CHARS)
+        html::intro_paragraphs(article)
     };
     let lead = || {
         intro.first()
@@ -692,9 +689,9 @@ fn hit_preview(
         return Ok((lead(), None));
     };
     let secs = if is_markdown {
-        markdown::sections(article, PARA_MATCH_CHARS)
+        markdown::sections(article)
     } else {
-        html::sections(article, PARA_MATCH_CHARS)
+        html::sections(article)
     };
     if secs.is_empty() {
         return Ok((lead(), None));

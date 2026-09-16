@@ -214,11 +214,10 @@ fn article_body(html: &str) -> &str {
 }
 
 /// Strip HTML tags, decode common entities, and collapse whitespace into
-/// single spaces. Stops after `max_chars` characters of text; markup and
-/// whitespace never consume the budget. Hatnotes and the page title's own
-/// elements (`<title>`, `<h1>` - see `INTRO_SKIP_TAGS`) are skipped whole,
-/// so intros start with the article lead, never the article name.
-pub fn intro_from_html(html: &str, max_chars: usize) -> String {
+/// single spaces. Hatnotes and the page title's own elements (`<title>`,
+/// `<h1>` - see `INTRO_SKIP_TAGS`) are skipped whole, so intros start with
+/// the article lead, never the article name.
+pub fn intro_from_html(html: &str) -> String {
     let html = article_body(html);
     let bytes = html.as_bytes();
     let mut out = String::new();
@@ -226,7 +225,7 @@ pub fn intro_from_html(html: &str, max_chars: usize) -> String {
     // separating space when the next text arrives.
     let mut sep = false;
     let mut i = 0usize;
-    while i < bytes.len() && out.chars().count() < max_chars {
+    while i < bytes.len() {
         match bytes[i] {
             b'<' => {
                 let Some((tag_name, attrs, opens, after)) = tag_at(html, i) else {
@@ -293,23 +292,22 @@ const P_CLOSERS: [&str; 14] = [
     "h6",
 ];
 
-/// Finish the paragraph under construction: collapse its whitespace, cap it
-/// at `max_para_chars` characters, and keep it when it holds any text.
-fn push_para(paras: &mut Vec<String>, cur: &mut String, max_para_chars: usize) {
+/// Finish the paragraph under construction: collapse its whitespace and
+/// keep it when it holds any text.
+fn push_para(paras: &mut Vec<String>, cur: &mut String) {
     let text: String = cur.split_whitespace().collect::<Vec<_>>().join(" ");
     cur.clear();
     if !text.is_empty() {
-        paras.push(text.chars().take(max_para_chars).collect());
+        paras.push(text);
     }
 }
 
 /// The cleaned paragraph texts of an HTML region: one per `<p>` element,
 /// extracted with the same skip machinery as `intro_from_html` (skipped
 /// elements and hatnotes yield nothing), tags stripped, entities decoded,
-/// whitespace collapsed, each capped at `max_para_chars`. Text outside
-/// `<p>` elements - heading text, list items, navigation blocks - stays
-/// out.
-fn paragraphs(html: &str, max_para_chars: usize) -> Vec<String> {
+/// whitespace collapsed. Text outside `<p>` elements - heading text, list
+/// items, navigation blocks - stays out.
+fn paragraphs(html: &str) -> Vec<String> {
     let bytes = html.as_bytes();
     let mut paras: Vec<String> = Vec::new();
     // The `<p>` currently open and its text so far (uncollapsed).
@@ -330,13 +328,13 @@ fn paragraphs(html: &str, max_para_chars: usize) -> Vec<String> {
                     continue;
                 }
                 if opens && tag_name.eq_ignore_ascii_case("p") {
-                    push_para(&mut paras, &mut cur, max_para_chars);
+                    push_para(&mut paras, &mut cur);
                     in_p = true;
                 } else if !opens && tag_name.eq_ignore_ascii_case("p") {
-                    push_para(&mut paras, &mut cur, max_para_chars);
+                    push_para(&mut paras, &mut cur);
                     in_p = false;
                 } else if opens && P_CLOSERS.iter().any(|t| tag_name.eq_ignore_ascii_case(t)) {
-                    push_para(&mut paras, &mut cur, max_para_chars);
+                    push_para(&mut paras, &mut cur);
                     in_p = false;
                 }
                 i = after;
@@ -373,7 +371,7 @@ fn paragraphs(html: &str, max_para_chars: usize) -> Vec<String> {
         }
     }
     // A `<p>` left open (e.g. the scan was truncated inside it) still counts.
-    push_para(&mut paras, &mut cur, max_para_chars);
+    push_para(&mut paras, &mut cur);
     paras
 }
 
@@ -386,18 +384,18 @@ fn paragraphs(html: &str, max_para_chars: usize) -> Vec<String> {
 /// `<h3>`'s paragraphs belong to its own entry and to the enclosing
 /// `<h2>`'s. `<h1>` carries the page title, not a section: it bounds no
 /// entry and is skipped like in `intro_from_html`.
-pub fn sections(html: &str, max_para_chars: usize) -> Vec<(String, Vec<String>)> {
+pub fn sections(html: &str) -> Vec<(String, Vec<String>)> {
     let body = article_body(html);
     let headings = collect_headings(body);
     let mut out = Vec::with_capacity(headings.len() + 1);
     out.push((
         INTRO_SECTION.to_string(),
-        paragraphs(&body[..intro_region_end(body, &headings)], max_para_chars),
+        paragraphs(&body[..intro_region_end(body, &headings)]),
     ));
     for h in headings.iter().filter(|h| h.level >= 2) {
         out.push((
             h.name.clone(),
-            paragraphs(&body[h.content_start..h.content_end], max_para_chars),
+            paragraphs(&body[h.content_start..h.content_end]),
         ));
     }
     out
@@ -406,10 +404,10 @@ pub fn sections(html: &str, max_para_chars: usize) -> Vec<(String, Vec<String>)>
 /// The intro region's paragraphs: the paragraphs [`sections`] reports for
 /// its `INTRO_SECTION` entry, without extracting any body section's
 /// paragraphs (a search hit's lead fast path needs only these).
-pub fn intro_paragraphs(html: &str, max_para_chars: usize) -> Vec<String> {
+pub fn intro_paragraphs(html: &str) -> Vec<String> {
     let body = article_body(html);
     let headings = collect_headings(body);
-    paragraphs(&body[..intro_region_end(body, &headings)], max_para_chars)
+    paragraphs(&body[..intro_region_end(body, &headings)])
 }
 
 /// Where the intro region ends: at the first heading of level >= 2 (`<h1>`
@@ -633,7 +631,7 @@ mod tests {
 
     #[test]
     fn intro_strips_tags_scripts_and_entities() {
-        let intro = intro_from_html(WIKI, 100);
+        let intro = intro_from_html(WIKI);
         // The <title> and <h1> carry the page title, which every search hit
         // already reports as its own field: their text must not open the
         // intro, so it starts at the lead paragraph.
@@ -646,11 +644,12 @@ mod tests {
         assert!(!intro.contains("disambiguation"), "{intro:?}");
     }
     #[test]
-    fn intro_budget_ignores_markup() {
-        // Markup between texts must not eat the character budget: even
-        // hundreds of tags cannot crowd later text out of the intro.
+    fn intro_skips_markup_between_texts() {
+        // Skipped markup between two texts neither leaks into the intro nor
+        // disturbs the join: hundreds of empty spans leave both texts,
+        // separated by one space.
         let page = format!("<p>x</p>{}<p>real text here</p>", "<span></span>".repeat(400));
-        let intro = intro_from_html(&page, 20);
+        let intro = intro_from_html(&page);
         assert_eq!(intro, "x real text here", "{intro:?}");
     }
 
@@ -664,7 +663,7 @@ mod tests {
             <figure>Aromatic hydrocarbon rings</figure>\
             <p><b>Chemistry</b> is the study of &amp; matter.</p>\
             </div></div><footer>Navigation menu</footer></body></html>";
-        let intro = intro_from_html(page, 100);
+        let intro = intro_from_html(page);
         assert!(intro.starts_with("Chemistry is the study of & matter"), "{intro:?}");
         assert!(!intro.contains("atomic weight"), "{intro:?}");
         assert!(!intro.contains("hydrocarbon"), "{intro:?}");
@@ -680,7 +679,7 @@ mod tests {
         let page = "<html><head><title>Beryllium - Wikipedia</title></head>\
             <body><h1 id=\"firstHeading\">Beryllium</h1>\
             <p>It is a lightweight metal.</p></body></html>";
-        let intro = intro_from_html(page, 100);
+        let intro = intro_from_html(page);
         assert_eq!(intro, "It is a lightweight metal.");
     }
 
@@ -707,13 +706,13 @@ mod tests {
             <table><tbody><tr><td><table><tbody><tr><td>inner</td></tr></tbody></table></td></tr>\
             <tr><td>Written in Objective-C</td></tr></tbody></table>\
             <p><b>Apple Books</b> is an e-book reader.</p></div></div>";
-        let intro = intro_from_html(page, 100);
+        let intro = intro_from_html(page);
         assert_eq!(intro, "Apple Books is an e-book reader.");
 
         // A scan truncated inside the table skips to the end of the input:
         // everything after is the table's content.
         let page = "<div id=\"mw-content-text\"><table><tr><td>infobox";
-        assert_eq!(intro_from_html(page, 100), "");
+        assert_eq!(intro_from_html(page), "");
     }
 
     #[test]
@@ -734,7 +733,7 @@ mod tests {
             let page = format!(
                 "<div id=\"mw-content-text\">{el}<p>Lead text here.</p></div>"
             );
-            let intro = intro_from_html(&page, 100);
+            let intro = intro_from_html(&page);
             assert_eq!(intro, "Lead text here.", "{el}");
         }
     }
@@ -755,14 +754,14 @@ mod tests {
             let page = format!(
                 "<div id=\"mw-content-text\">{el}<p>Lead text here.</p></div>"
             );
-            let intro = intro_from_html(&page, 100);
+            let intro = intro_from_html(&page);
             assert_eq!(intro, "For other uses, see X. Lead text here.", "{el}");
         }
         // The word "hatnote" in plain text changes nothing, and close tags
         // (`</div>`) are never mistaken for hatnote open tags.
         let page = "<div id=\"mw-content-text\"><p>The hatnote template renders notes.</p><p>More.</p></div>";
         assert_eq!(
-            intro_from_html(page, 100),
+            intro_from_html(page),
             "The hatnote template renders notes. More."
         );
     }
@@ -776,7 +775,7 @@ mod tests {
         assert_eq!(attr_value(" /", "class"), None);
         assert_eq!(attr_value(" /", "role"), None);
         assert!(!is_hatnote_attrs(" /"));
-        assert_eq!(intro_from_html("<p>a<br />b</p>", 10), "a b");
+        assert_eq!(intro_from_html("<p>a<br />b</p>"), "a b");
     }
 
     #[test]
@@ -861,7 +860,7 @@ mod tests {
             <p>Salt seasons food and preserves it.</p>\
             </div></div><footer>Navigation menu</footer></body></html>";
 
-        let secs = sections(page, 300);
+        let secs = sections(page);
         // The intro region: the lead paragraphs only (title, hatnote and
         // infobox skipped).
         assert_eq!(secs[0].0, "_intro");
@@ -894,11 +893,8 @@ mod tests {
 
         // No headings: a single intro entry.
         let flat = "<p>Just a lead.</p><p>And more.</p>";
-        assert_eq!(sections(flat, 100), vec![("_intro".to_string(), vec!["Just a lead.".to_string(), "And more.".to_string()])]);
+        assert_eq!(sections(flat), vec![("_intro".to_string(), vec!["Just a lead.".to_string(), "And more.".to_string()])]);
         // No <p> anywhere: empty regions (callers fall back gracefully).
-        assert_eq!(sections("<div>no paragraphs here</div>", 100), vec![("_intro".to_string(), Vec::<String>::new())]);
-        // A paragraph is capped at `max_para_chars` characters.
-        let long = sections("<p>0123456789 0123456789 0123456789</p>", 12);
-        assert_eq!(long[0].1, vec!["0123456789 0"]);
+        assert_eq!(sections("<div>no paragraphs here</div>"), vec![("_intro".to_string(), Vec::<String>::new())]);
     }
 }

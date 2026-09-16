@@ -7,31 +7,21 @@
 
 use crate::html::{self, normalize, INTRO_SECTION};
 
-/// Append plain text to the intro under construction: a single space
-/// separates it from any text already emitted, whitespace inside the text
-/// collapses the same way, and whitespace never consumes the character
-/// budget (same rule as `intro_from_html`).
-fn push_text(out: &mut String, text: &str, max_chars: usize) {
-    // A space is due before the first character unless the intro is empty.
+/// Append plain text to the paragraph under construction: a single space
+/// separates it from any text already emitted, and runs of whitespace
+/// inside the text collapse to that single space.
+fn push_text(out: &mut String, text: &str) {
+    // A space is due before the next character unless nothing is out yet.
     let mut sep = !out.is_empty();
-    // The character count of `out`, tracked as we go: recounting per
-    // character would make long paragraphs quadratic.
-    let mut len = out.chars().count();
     for c in text.chars() {
         if c.is_whitespace() {
             sep = true;
             continue;
         }
-        // Room for the pending separator space (if any) and the char itself.
-        if len + sep as usize >= max_chars {
-            return;
-        }
         if sep {
             out.push(' ');
-            len += 1;
         }
         out.push(c);
-        len += 1;
         sep = false;
     }
 }
@@ -112,11 +102,11 @@ fn is_hatnote(para: &str) -> bool {
         && !t[1..t.len() - 1].contains('*')
 }
 
-/// Append one cleaned paragraph to the list, capped at `max_para_chars`
-/// characters (whitespace collapses the way [`push_text`] collapses it).
-fn push_paragraph(paras: &mut Vec<String>, text: &str, max_para_chars: usize) {
+/// Append one cleaned paragraph to the list, dropping it when it holds no
+/// text (whitespace collapses the way [`push_text`] collapses it).
+fn push_paragraph(paras: &mut Vec<String>, text: &str) {
     let mut out = String::new();
-    push_text(&mut out, text, max_para_chars);
+    push_text(&mut out, text);
     if !out.is_empty() {
         paras.push(out);
     }
@@ -125,10 +115,10 @@ fn push_paragraph(paras: &mut Vec<String>, text: &str, max_para_chars: usize) {
 /// The cleaned paragraph texts of one Markdown region: one per
 /// blank-line-separated block (wikilinks resolved, emphasis and inline-code
 /// markers stripped, hatnotes dropped, fenced blocks skipped, raw HTML
-/// blocks handed to `intro_from_html`), each capped at `max_para_chars`.
-/// Deeper headings inside the region are dropped like the HTML path drops
-/// heading text: they name subregions whose paragraphs follow right after.
-fn md_paragraphs(lines: &[&str], max_para_chars: usize) -> Vec<String> {
+/// blocks handed to `intro_from_html`). Deeper headings inside the region
+/// are dropped like the HTML path drops heading text: they name subregions
+/// whose paragraphs follow right after.
+fn md_paragraphs(lines: &[&str]) -> Vec<String> {
     let mut paras: Vec<String> = Vec::new();
     let mut in_fence = false;
     let mut i = 0usize;
@@ -163,7 +153,7 @@ fn md_paragraphs(lines: &[&str], max_para_chars: usize) -> Vec<String> {
                     cells.push_str(row);
                 }
             }
-            push_paragraph(&mut paras, &cells, max_para_chars);
+            push_paragraph(&mut paras, &cells);
             continue;
         }
         if t.starts_with('<') {
@@ -177,8 +167,8 @@ fn md_paragraphs(lines: &[&str], max_para_chars: usize) -> Vec<String> {
                 block.push_str(lines[i]);
                 i += 1;
             }
-            let text = html::intro_from_html(&block, max_para_chars);
-            push_paragraph(&mut paras, &text, max_para_chars);
+            let text = html::intro_from_html(&block);
+            push_paragraph(&mut paras, &text);
             continue;
         }
         if list_marker_len(t).is_some() {
@@ -197,7 +187,7 @@ fn md_paragraphs(lines: &[&str], max_para_chars: usize) -> Vec<String> {
                     items.push_str(&strip_inline(body));
                 }
             }
-            push_paragraph(&mut paras, &items, max_para_chars);
+            push_paragraph(&mut paras, &items);
             continue;
         }
         // A plain paragraph: gather its remaining lines so a hatnote (see
@@ -228,7 +218,7 @@ fn md_paragraphs(lines: &[&str], max_para_chars: usize) -> Vec<String> {
         if is_hatnote(&para) {
             continue;
         }
-        push_paragraph(&mut paras, &strip_inline(&para), max_para_chars);
+        push_paragraph(&mut paras, &strip_inline(&para));
     }
     paras
 }
@@ -243,14 +233,14 @@ fn md_paragraphs(lines: &[&str], max_para_chars: usize) -> Vec<String> {
 /// enclosing `##`'s. The leading `# Title` heading is the article title - a
 /// separate field of every search hit - not a section: it is dropped and
 /// the intro region runs from after it (see [`title_split`]).
-pub fn sections(md: &str, max_para_chars: usize) -> Vec<(String, Vec<String>)> {
+pub fn sections(md: &str) -> Vec<(String, Vec<String>)> {
     let lines: Vec<&str> = md.lines().collect();
     let headings = collect_headings(&lines);
     let (intro_start, first_section) = title_split(&lines, &headings);
     let intro_end = headings
         .get(first_section)
         .map_or(lines.len(), |h| h.line);
-    let mut out = vec![(INTRO_SECTION.to_string(), md_paragraphs(&lines[intro_start..intro_end], max_para_chars))];
+    let mut out = vec![(INTRO_SECTION.to_string(), md_paragraphs(&lines[intro_start..intro_end]))];
     for (i, h) in headings.iter().enumerate().skip(first_section) {
         let end = headings[i + 1..]
             .iter()
@@ -258,7 +248,7 @@ pub fn sections(md: &str, max_para_chars: usize) -> Vec<(String, Vec<String>)> {
             .map_or(lines.len(), |n| n.line);
         out.push((
             h.name.clone(),
-            md_paragraphs(&lines[h.line + 1..end], max_para_chars),
+            md_paragraphs(&lines[h.line + 1..end]),
         ));
     }
     out
@@ -267,14 +257,14 @@ pub fn sections(md: &str, max_para_chars: usize) -> Vec<(String, Vec<String>)> {
 /// The intro region's paragraphs: the paragraphs [`sections`] reports for
 /// its `INTRO_SECTION` entry, computed without extracting any body
 /// section's paragraphs (a search hit's lead fast path needs only these).
-pub fn intro_paragraphs(md: &str, max_para_chars: usize) -> Vec<String> {
+pub fn intro_paragraphs(md: &str) -> Vec<String> {
     let lines: Vec<&str> = md.lines().collect();
     let headings = collect_headings(&lines);
     let (intro_start, first_section) = title_split(&lines, &headings);
     let intro_end = headings
         .get(first_section)
         .map_or(lines.len(), |h| h.line);
-    md_paragraphs(&lines[intro_start..intro_end], max_para_chars)
+    md_paragraphs(&lines[intro_start..intro_end])
 }
 
 /// Where the intro region starts and where the section entries begin: a
@@ -532,7 +522,7 @@ That is all.
 
     #[test]
     fn sections_split_intro_and_headings_with_clean_paragraphs() {
-        let secs = sections(SECTIONS_MD, 400);
+        let secs = sections(SECTIONS_MD);
         // The intro region: the paragraphs after the dropped title line,
         // hatnote dropped, under the reserved intro name.
         assert_eq!(secs[0].0, "_intro");
@@ -585,7 +575,7 @@ That is all.
         let md = "# Doc\n\nSee [[Earth's age]], [[Mean anomaly#Mean anomaly at epoch]], \
                   [[Chemical_element]], [[Block (periodic table)#p-block|p-block]] \
                   and [[[Helium|He]]] atoms.";
-        let secs = sections(md, 300);
+        let secs = sections(md);
         assert_eq!(
             secs[0].1,
             vec!["See Earth's age, Mean anomaly, Chemical element, p-block and [He] atoms.".to_string()]
@@ -597,7 +587,7 @@ That is all.
         // A document that does not open with `# Title`: nothing is dropped,
         // the plain lead is the intro region.
         let md = "Plain lead text.\n\n## Section\n\nBody.\n";
-        let secs = sections(md, 100);
+        let secs = sections(md);
         assert_eq!(secs[0].0, "_intro");
         assert_eq!(secs[0].1, vec!["Plain lead text."]);
         assert_eq!(secs[1].0, "Section");
@@ -605,14 +595,8 @@ That is all.
 
         // No headings at all: a single intro entry.
         assert_eq!(
-            sections("One.\n\nTwo.\n", 100),
+            sections("One.\n\nTwo.\n"),
             vec![("_intro".to_string(), vec!["One.".to_string(), "Two.".to_string()])]
         );
-    }
-    #[test]
-    fn sections_cap_paragraph_characters() {
-        let secs = sections(SECTIONS_MD, 12);
-        assert_eq!(secs[0].1[0], "Salt is a mi");
-        assert!(secs.iter().all(|(_, paras)| paras.iter().all(|p| p.chars().count() <= 12)));
     }
 }
