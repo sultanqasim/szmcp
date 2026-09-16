@@ -33,29 +33,31 @@ const PARA_MATCH_CHARS: usize = 2000;
 /// from it - the title tier keeps every word, and hit previews score every
 /// query term).
 ///
-/// A word appearing in more than 10% of the archive's documents is
+/// A word appearing in more than 8% of the archive's documents is
 /// background vocabulary, not a query discriminator - English "the" (59% of
 /// the md1m fulltext index), "of" (63%), "and" (56%); French "de" (79% of
 /// fr.zim), "la" (74%), "un" (71%) - and so is everything mid-frequency
 /// (EN "work" 25%, FR "faire" 44%): a BM25 OR cannot rank by such words
-/// anyway. The measured threshold sweep (E4 in the profiling report) was
-/// quality-neutral-to-positive on both benchmark archives and cut FR
-/// latency by a third at the limit. It cannot separate the wanted articles
+/// anyway. It cannot separate the wanted articles
 /// from the
 /// rest, and BM25 - whose IDF already down-weights it - still floods the
 /// query with its huge postlist. This is the language-agnostic replacement
 /// for a stopword list: no hand-picked list works across languages, while
-/// the >10% document-frequency rule is computed from the archive itself and
+/// the >8% document-frequency rule is computed from the archive itself and
 /// drops exactly the background vocabulary of whatever language(s) the
-/// archive is written in - a word occurring in more than a tenth of the
-/// documents is background vocabulary in any language (measured on the
-/// benchmarks: EN the/of/and at 59/63/56% of md1m, FR de/la/un/du at
-/// 71-79% of fr.zim, but also mid-frequency words like EN "work" 25% or FR
-/// "faire" 44% that contribute no discrimination to a BM25 OR; the measured
-/// threshold sweep was quality-neutral-to-positive on both archives and cut
-/// FR latency by a third at the limit). The title tier keeps every word -
+/// archive is written in (measured on the benchmarks: EN the/of/and at
+/// 59/63/56% of md1m, FR de/la/un/du at 71-79% of fr.zim, but also
+/// mid-frequency words like EN "work" 25% or FR "faire" 44% that contribute
+/// no discrimination to a BM25 OR). 0.08 (69a6c2c set 0.1) is measured, not
+/// guessed: on the EN top-1M corpus (1,774,450 docs) the 8% line drops the
+/// last flood words - "how" (9.8% of the archive), "engin" (8.2%) - whose
+/// ~150k-doc postlists flooded the BM25 OR at 0.1, while it keeps the
+/// mid-frequency discriminators ("data" 6.4%, "roman" 6.5%) that make the
+/// cleaned rare bands rank the right articles (benchmark stage 9 measured
+/// 0.08 as the maximum of the sweep around it; 0.05 and 0.03 measured lower
+/// or equal). The title tier keeps every word -
 /// the filter is fulltext-only (see [`fulltext_query`]).
-const FT_WORD_MAX_DF_FRAC: f64 = 0.1;
+const FT_WORD_MAX_DF_FRAC: f64 = 0.08;
 
 /// One search result.
 #[derive(Serialize, JsonSchema, Debug)]
