@@ -970,6 +970,23 @@ impl ZimLibrary {
         let root = file.parent().unwrap_or(Path::new(".")).to_path_buf();
         Ok(ZimLibrary { root, archives: vec![Arc::new(Archive::new(name, zim))] })
     }
+
+    /// The loaded archive whose name (relative to the ZIM directory) is `name`
+    /// - the form search results report and zim_list will list. The name must
+    /// stay inside the directory: a `..` component, an absolute path, or an
+    /// empty string yields `None` (traversal outside the ZIM directory is
+    /// refused), while symlinks are fine because the scan records the
+    /// directory-entry name the symlink shows. `./` prefixes are trimmed.
+    pub fn archive(&self, name: &str) -> Option<&Arc<Archive>> {
+        let wanted = name.trim().trim_start_matches("./");
+        if wanted.is_empty()
+            || std::path::Path::new(wanted).is_absolute()
+            || wanted.split('/').any(|part| part == "..")
+        {
+            return None;
+        }
+        self.archives.iter().find(|a| a.name == wanted)
+    }
 }
 
 /// Map a file name to an archive name, if it is one ("x.zim" -> "x.zim";
@@ -1477,5 +1494,34 @@ pub(crate) mod testutil {
         let file = dir.path().join("notes.txt");
         std::fs::write(&file, b"definitely not a ZIM archive").unwrap();
         assert!(ZimLibrary::single(&file).is_err());
+    }
+
+    #[test]
+    fn archive_name_resolution() {
+        let dir = tempfile::tempdir().unwrap();
+        let content = [TestEntry {
+            namespace: b'C',
+            url: "Apple",
+            title: "Apple",
+            mime: 0,
+            body: b"<html><body><h1>Apple</h1><p>An apple a day.</p></body></html>",
+        }];
+        let bytes = build_archive(&["text/html"], &content, &[], 0, None);
+        std::fs::write(dir.path().join("a.zim"), &bytes).unwrap();
+        std::fs::create_dir(dir.path().join("sub")).unwrap();
+        std::fs::write(dir.path().join("sub/b.zim"), &bytes).unwrap();
+        let lib = ZimLibrary::scan(dir.path()).unwrap();
+        assert_eq!(lib.archives.len(), 2);
+
+        // Plain and nested relative names resolve to the scanned archive.
+        assert!(Arc::ptr_eq(lib.archive("a.zim").unwrap(), &lib.archives[0]));
+        assert!(Arc::ptr_eq(lib.archive("sub/b.zim").unwrap(), &lib.archives[1]));
+        // A "./" prefix is trimmed.
+        assert!(Arc::ptr_eq(lib.archive("./a.zim").unwrap(), &lib.archives[0]));
+        // Names leaving the ZIM directory are refused, unknown ones too.
+        assert!(lib.archive("../a.zim").is_none());
+        assert!(lib.archive("/etc/a.zim").is_none());
+        assert!(lib.archive("").is_none());
+        assert!(lib.archive("nope.zim").is_none());
     }
 }

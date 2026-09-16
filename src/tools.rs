@@ -122,7 +122,7 @@ impl ToolBase for ZimSearchTool {
 impl AsyncTool<ZimMcpServer> for ZimSearchTool {
     async fn invoke(server: &ZimMcpServer, params: Self::Parameter) -> Result<Self::Output, Self::Error> {
         let library = server.library.clone();
-        tokio::task::spawn_blocking(move || search(&library, &params.query))
+        tokio::task::spawn_blocking(move || search(&library, None, &params.query))
             .await
             .map_err(|e| ToolError::Internal(format!("zim_search task failed: {e}")))?
     }

@@ -1,7 +1,8 @@
 //! The search pipeline behind the `zim_search` tool: three simple tiers
 //! (exact title/URL probe, all-words title match, full-text OR over all
 //! the query words), ranked against the ZIM embedded Xapian indexes,
-//! merged across archives, and reported with per-hit previews.
+//! merged across archives (optionally restricted to the single archive a
+//! `zim` name resolves to), and reported with per-hit previews.
 
 use crate::html;
 use crate::markdown;
@@ -54,7 +55,7 @@ pub struct SearchHit {
 }
 
 /// The search result set (best matches first).
-#[derive(Serialize, JsonSchema)]
+#[derive(Serialize, JsonSchema, Debug)]
 pub struct SearchResults {
     /// The search results
     pub results: Vec<SearchHit>,
@@ -237,12 +238,41 @@ fn path_title(path: &str) -> String {
         .replace('_', " ")
 }
 
-/// Search all articles in all ZIM files of the library - the pipeline behind
-/// the `zim_search` tool: ranked hits, best first.
-pub fn search(library: &ZimLibrary, query: &str) -> Result<SearchResults, ToolError> {
+/// Search the ZIM files of the library - the pipeline behind the
+/// `zim_search` tool: ranked hits, best first. `only` restricts the whole
+/// pipeline to the one named archive (`None` searches every archive); the
+/// name is the relative form results report - see [`ZimLibrary::archive`].
+pub fn search(
+    library: &ZimLibrary,
+    only: Option<&str>,
+    query: &str,
+) -> Result<SearchResults, ToolError> {
     if query.trim().is_empty() {
         return Err(ToolError::InvalidArgument("query must not be empty".into()));
     }
+
+    // The archives the search runs over: the one named archive when a filter
+    // is given (every per-archive step below covers only it), otherwise all
+    // of them in scan order. An unresolvable filter name (unknown, or one
+    // that leaves the ZIM directory) is a NotFound - the same message shape
+    // the article lookups report.
+    let archives: Vec<&Arc<Archive>> = match only {
+        None => library.archives.iter().collect(),
+        Some(name) => match library.archive(name) {
+            Some(arc) => vec![arc],
+            None => {
+                return Err(ToolError::NotFound(format!(
+                    "ZIM file not found: {name} (loaded: {})",
+                    library
+                        .archives
+                        .iter()
+                        .map(|a| a.name.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                )));
+            }
+        },
+    };
 
     // Quoted phrases build OP_PHRASE subqueries, but the indexes carry no
     // positional data (libzim indexes `index_text_without_positions`), so a
@@ -266,10 +296,9 @@ pub fn search(library: &ZimLibrary, query: &str) -> Result<SearchResults, ToolEr
         Fulltext,
     }
 
-    // One query view per archive, in `library.archives` order (see
-    // [`ArchiveQuery`]: the embedded index's stemmer is per archive).
-    let mut queries: Vec<ArchiveQuery> = library
-        .archives
+    // One query view per archive under the search (see [`ArchiveQuery`]:
+    // the embedded index's stemmer is per archive).
+    let mut queries: Vec<ArchiveQuery> = archives
         .iter()
         .map(|arc| ArchiveQuery::build(arc, &folded_query))
         .collect::<Result<_, ToolError>>()?;
@@ -279,9 +308,9 @@ pub fn search(library: &ZimLibrary, query: &str) -> Result<SearchResults, ToolEr
     // article exactly must rank first no matter what BM25 produces. The
     // entry is resolved to its terminal article below.
     let mut merged: Vec<(&Arc<Archive>, String, String, HitKind)> = Vec::new();
-    for arc in &library.archives {
+    for arc in &archives {
         if let Some((path, _)) = arc.lookup_exact(query)? {
-            merged.push((arc, path, String::new(), HitKind::Exact));
+            merged.push((*arc, path, String::new(), HitKind::Exact));
         }
     }
 
@@ -301,7 +330,7 @@ pub fn search(library: &ZimLibrary, query: &str) -> Result<SearchResults, ToolEr
     let mut title_lists: Vec<(&Arc<Archive>, Vec<(String, String)>)> = Vec::new();
     // Full-text tier: (weight, path, title from the index).
     let mut per_archive: Vec<(&Arc<Archive>, Vec<(f64, String, String)>)> = Vec::new();
-    for (arc, query_state) in library.archives.iter().zip(queries.iter_mut()) {
+    for (&arc, query_state) in archives.iter().zip(queries.iter_mut()) {
         let Some((title_list, list)) = arc.with_xapian(|h| -> Result<_, ToolError> {
             let mut title_list = Vec::new();
             if let Some(and_query) = title_query(&query_state.title_text)? {
@@ -455,8 +484,7 @@ pub fn search(library: &ZimLibrary, query: &str) -> Result<SearchResults, ToolEr
         // Section scoring runs the hit archive's own full-text query and its
         // stemmer (the archive is always from the library, so the lookup
         // cannot fail).
-        let qi = library
-            .archives
+        let qi = archives
             .iter()
             .position(|a| Arc::ptr_eq(a, arc))
             .expect("hit archive is from the library");
@@ -844,7 +872,12 @@ Scientists measure the flow from observatories.
     /// (`ZimSearchTool`) is exercised by the empty-query validation test
     /// below.
     fn search(server: &ZimMcpServer, query: &str) -> Vec<SearchHit> {
-        super::search(&server.library, query).unwrap().results
+        super::search(&server.library, None, query).unwrap().results
+    }
+
+    /// [`search`] with the optional single-archive filter filled in.
+    fn search_one(server: &ZimMcpServer, only: &str, query: &str) -> Vec<SearchHit> {
+        super::search(&server.library, Some(only), query).unwrap().results
     }
 
     /// Build a single-file glass Xapian index the way openZIM does: document
@@ -1978,11 +2011,13 @@ Scientists measure the flow from observatories.
         // whole article and the coverage cap suppresses the list.
         assert_eq!(hits[0].sections, None);
         assert!(hits[0].preview.contains("cherry is the fruit"), "{:?}", hits[0].preview);
-    }    #[test]
-    fn e2e_search_interleaves_archives_and_dedupes_within_archives() {
+    }    /// Two archives (a.zim, b.zim) that both carry an "Apple" article (the
+    /// same article, as in an HTML and a Markdown edition of the same ZIM),
+    /// plus one exclusive article each: a.zim holds C/Banana, b.zim holds
+    /// C/Cherry. Returns the tempdir (it must outlive the searches) and the
+    /// scanned library.
+    fn two_archive_library() -> (tempfile::TempDir, Arc<ZimLibrary>) {
         let dir = tempfile::tempdir().unwrap();
-        // Two archives; both carry an "Apple" article (same article, as in an
-        // HTML and a Markdown edition of the same ZIM), plus one exclusive
         let index_a = make_index(
             &[
                 ("C/Apple", "appl histori 10 000 year domest wild kazakhstan comput devic nam", "Apple"),
@@ -2007,6 +2042,12 @@ Scientists measure the flow from observatories.
         std::fs::write(dir.path().join("b.zim"), build_archive(&["text/html"], &content_b, &[], 0, Some(&index_b))).unwrap();
         let library = Arc::new(ZimLibrary::scan(dir.path()).unwrap());
         assert_eq!(library.archives.len(), 2);
+        (dir, library)
+    }
+
+    #[test]
+    fn e2e_search_interleaves_archives_and_dedupes_within_archives() {
+        let (_dir, library) = two_archive_library();
         let server = ZimMcpServer::new(library);
 
         // The same title in both archives is NOT deduped across archives:
@@ -2022,6 +2063,58 @@ Scientists measure the flow from observatories.
         assert_eq!(hits.len(), 2, "{hits:?}");
         assert_eq!((hits[0].zim.as_str(), hits[0].path.as_str()), ("a.zim", "C/Banana"));
         assert_eq!((hits[1].zim.as_str(), hits[1].path.as_str()), ("b.zim", "C/Cherry"));
+    }
+
+    #[test]
+    fn e2e_search_single_archive_filter_scopes_every_tier() {
+        let (_dir, library) = two_archive_library();
+        let server = ZimMcpServer::new(library);
+
+        // Unfiltered, each archive's one hit takes part in the merge.
+        assert_eq!(search(&server, "banana cherry").len(), 2);
+        // With the filter, only the named archive's per-archive work runs:
+        // its exclusive article is the sole hit, the other archive nothing.
+        let hits = search_one(&server, "a.zim", "banana cherry");
+        assert_eq!(hits.len(), 1, "{hits:?}");
+        assert_eq!((hits[0].zim.as_str(), hits[0].path.as_str()), ("a.zim", "C/Banana"));
+        let hits = search_one(&server, "b.zim", "banana cherry");
+        assert_eq!(hits.len(), 1, "{hits:?}");
+        assert_eq!((hits[0].zim.as_str(), hits[0].path.as_str()), ("b.zim", "C/Cherry"));
+
+        // A title both archives carry is not deduped across archives, so the
+        // filter still reports the named archive's own copy - exactly one
+        // hit, with none from the other archive.
+        assert_eq!(search(&server, "apple").len(), 2);
+        let hits = search_one(&server, "a.zim", "apple");
+        assert_eq!(hits.len(), 1, "{hits:?}");
+        assert_eq!((hits[0].zim.as_str(), hits[0].path.as_str()), ("a.zim", "C/Apple"));
+        let hits = search_one(&server, "b.zim", "apple");
+        assert_eq!(hits.len(), 1, "{hits:?}");
+        assert_eq!((hits[0].zim.as_str(), hits[0].path.as_str()), ("b.zim", "C/Apple"));
+
+        // A "./" prefix is trimmed like every archive name lookup.
+        let hits = search_one(&server, "./a.zim", "banana cherry");
+        assert_eq!(hits.len(), 1, "{hits:?}");
+        assert_eq!(hits[0].zim, "a.zim");
+    }
+
+    #[test]
+    fn e2e_search_single_archive_filter_rejects_outside_names() {
+        let (_dir, library) = two_archive_library();
+        let server = ZimMcpServer::new(library);
+
+        // Unknown, traversal, and absolute names are all refused, with the
+        // same NotFound message the article lookups report.
+        for name in ["nope.zim", "../a.zim", "/etc/a.zim"] {
+            let err = super::search(&server.library, Some(name), "apple").unwrap_err();
+            let ToolError::NotFound(msg) = err else {
+                panic!("expected NotFound for {name}: {err:?}");
+            };
+            assert!(
+                msg.contains(&format!("ZIM file not found: {name} (loaded: a.zim, b.zim)")),
+                "{msg}"
+            );
+        }
     }
     /// A filler markdown article.
     const BANANA_MD: &str = "\
