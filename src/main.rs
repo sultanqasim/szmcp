@@ -52,6 +52,10 @@ enum Command {
         zim_path: PathBuf,
         /// Path of the article inside the ZIM file
         path: String,
+        /// Print the article content to stdout instead of the JSON tool
+        /// response
+        #[arg(long)]
+        content: bool,
     },
     /// Get one section of an article from a ZIM file, by its heading text
     GetSection {
@@ -61,6 +65,10 @@ enum Command {
         path: String,
         /// Name of the section (heading text) to retrieve
         section: String,
+        /// Print the section content to stdout instead of the JSON tool
+        /// response
+        #[arg(long)]
+        content: bool,
     },
 }
 
@@ -124,17 +132,27 @@ async fn run(command: Command) -> Result<(), String> {
             let results = search(&library, &query).map_err(|e| e.to_string())?;
             print_result(&results)
         }
-        Command::Get { zim_path, path } => {
+        Command::Get { zim_path, path, content } => {
             let library = open_single_zim(&zim_path)?;
             let zim = single_archive_name(&library)?;
             let result = get_article(&library, &zim, &path).map_err(|e| e.to_string())?;
-            print_result(&result)
+            if content {
+                println!("{}", result.content);
+                Ok(())
+            } else {
+                print_result(&result)
+            }
         }
-        Command::GetSection { zim_path, path, section } => {
+        Command::GetSection { zim_path, path, section, content } => {
             let library = open_single_zim(&zim_path)?;
             let zim = single_archive_name(&library)?;
             let result = get_section(&library, &zim, &path, &section).map_err(|e| e.to_string())?;
-            print_result(&result)
+            if content {
+                println!("{}", result.content);
+                Ok(())
+            } else {
+                print_result(&result)
+            }
         }
     }
 }
@@ -230,5 +248,30 @@ mod tests {
         };
         assert!(err.contains("expected a ZIM file, not a directory"), "{err}");
         assert!(err.contains(&canonical.display().to_string()), "{err}");
+    }
+
+    #[test]
+    fn get_and_get_section_accept_content_flag() {
+        for args in [
+            vec!["szmcp", "get", "x.zim", "C/foo", "--content"],
+            vec!["szmcp", "get", "x.zim", "C/foo"],
+            vec!["szmcp", "get_section", "x.zim", "C/foo", "Intro", "--content"],
+            vec!["szmcp", "get_section", "x.zim", "C/foo", "Intro"],
+        ] {
+            // Accepted (flag present or absent); variant shape checked below.
+            Cli::try_parse_from(&args).unwrap_or_else(|e| panic!("{args:?}: {e}"));
+        }
+        // The flag defaults to JSON output.
+        match Cli::try_parse_from(["szmcp", "get", "x.zim", "C/foo"]).unwrap().command {
+            Command::Get { content, .. } => assert!(!content),
+            _ => panic!("expected get"),
+        }
+        match Cli::try_parse_from(["szmcp", "get_section", "x.zim", "C/foo", "Intro"])
+            .unwrap()
+            .command
+        {
+            Command::GetSection { content, .. } => assert!(!content),
+            _ => panic!("expected get_section"),
+        }
     }
 }
