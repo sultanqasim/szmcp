@@ -5,7 +5,8 @@
 //! The tool set is shaped by the library's launch mode: a single-file
 //! library takes no `zim` argument (there is nothing to name), a scanned
 //! directory takes one (required on the get tools, an optional filter on
-//! search). The two shapes are separate tool types, registered per mode by
+//! search) and gains `zim_list` to report the file names the other tools
+//! take. The two shapes are separate tool types, registered per mode by
 //! [`ZimMcpServer::router`].
 //!
 //! The tools are async: each one moves its arguments onto a blocking thread
@@ -25,7 +26,7 @@ use rmcp::handler::server::ServerHandler;
 use rmcp::model::{Implementation, ServerInfo};
 use rmcp::ErrorData;
 use schemars::JsonSchema;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::borrow::Cow;
 use std::sync::Arc;
 use thiserror::Error;
@@ -81,7 +82,8 @@ impl ZimMcpServer {
             Mode::Directory => ToolRouter::new()
                 .with_async_tool::<ZimSearchDirTool>()
                 .with_async_tool::<ZimGetDirTool>()
-                .with_async_tool::<ZimGetSectionDirTool>(),
+                .with_async_tool::<ZimGetSectionDirTool>()
+                .with_async_tool::<ZimListTool>(),
         };
 
         let mut router = Router::new(self);
@@ -387,10 +389,55 @@ impl AsyncTool<ZimMcpServer> for ZimGetSectionDirTool {
     }
 }
 
+// ---------------------------------------------------------------------------
+// zim_list (directory mode)
+// ---------------------------------------------------------------------------
+
+#[derive(Deserialize, JsonSchema, Default)]
+pub struct ZimListParams {}
+
+#[derive(Serialize, JsonSchema)]
+pub struct ZimListResult {
+    /// ZIM file names, relative to the ZIM directory
+    pub files: Vec<String>,
+}
+
+pub struct ZimListTool;
+
+impl ToolBase for ZimListTool {
+    type Parameter = ZimListParams;
+    type Output = ZimListResult;
+    type Error = ToolError;
+
+    fn name() -> Cow<'static, str> {
+        "zim_list".into()
+    }
+    fn description() -> Option<Cow<'static, str>> {
+        Some(
+            "List the loaded ZIM files. Returns their names relative to the ZIM \
+             directory - the \"zim\" argument the other tools take."
+                .into(),
+        )
+    }
+}
+
+impl AsyncTool<ZimMcpServer> for ZimListTool {
+    async fn invoke(server: &ZimMcpServer, _params: Self::Parameter) -> Result<Self::Output, Self::Error> {
+        let library = server.library.clone();
+        // Same shape as the real work tools (the listing itself is a
+        // trivial clone of the loaded archive names).
+        tokio::task::spawn_blocking(move || ZimListResult {
+            files: library.archives.iter().map(|a| a.name.clone()).collect(),
+        })
+        .await
+        .map_err(|e| ToolError::Internal(format!("zim_list task failed: {e}")))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::search::tests::{test_single_server, two_archive_library};
+    use crate::search::tests::{test_server, test_single_server, two_archive_library};
     use rmcp::handler::server::router::tool::AsyncTool;
     use std::future::Future;
 
@@ -484,5 +531,13 @@ mod tests {
                 "{zim}"
             );
         }
+    }
+
+    #[test]
+    fn e2e_zim_list_reports_loaded_names() {
+        // The names zim_list reports are the form every other tool takes.
+        let (server, _keep) = test_server();
+        let listing = block_on(ZimListTool::invoke(&server, ZimListParams {})).unwrap();
+        assert_eq!(listing.files, vec!["test.zim".to_string()]);
     }
 }
