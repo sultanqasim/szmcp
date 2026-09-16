@@ -34,8 +34,8 @@ pub struct SearchHit {
     /// Page/article title
     pub title: String,
     /// Preview of the article: the intro's first sentence for title matches,
-    /// otherwise the best-matching sentence plus its paragraph's following
-    /// sentences, capped at the length above
+    /// otherwise the lead (the first intro paragraph), capped at the length
+    /// above
     pub preview: String,
     /// Regions holding query matches (`_intro` first when it matched, then
     /// sections in document order); absent when the query matches the title
@@ -522,16 +522,15 @@ fn sentences(paragraph: &str) -> Vec<&str> {
 }
 
 /// The `preview`/`sections` pair of one search hit, from the article's raw
-/// text (`is_markdown` picks the Markdown or the HTML splitter). A title
-/// match, or an intro paragraph covering every query term, yields the lead
-/// and no sections. Otherwise every region (intro under `_intro`, then body
-/// sections) is scanned: the regions with a match are reported as
-/// `sections` and the preview starts at the best-matching sentence (most
-/// matching occurrences; ties keep the earliest), continued with its
-/// paragraph's remaining sentences up to `INTRO_CHARS` - the matched
-/// sentence sits at the front, so truncation cannot hide the matched words.
-/// No match at all falls back to the lead; empty regions give an empty
-/// preview, never a panic.
+/// text (`is_markdown` picks the Markdown or the HTML splitter). The
+/// preview is the article's lead - the first intro paragraph, truncated to
+/// `INTRO_CHARS` - no matter where in the article the query matched; a
+/// title match keeps the intro's first sentence instead. A lead covering
+/// every query term (like a title match) reports no sections; otherwise
+/// every region (intro under `_intro`, then body sections) is scanned and
+/// the regions with a term match are reported as `sections`. No match at
+/// all reports no sections; empty regions give an empty preview, never a
+/// panic.
 fn hit_preview(
     article: &str,
     terms: &[String],
@@ -560,6 +559,11 @@ fn hit_preview(
             .unwrap_or_default();
         return (first, None);
     }
+    // The preview is the lead regardless of where the query matched: the
+    // old best-matching-sentence search (re-scoring every sentence of
+    // every matched paragraph) is gone. The region scan below feeds only
+    // the `sections` reporting, and it is skipped when the lead already
+    // covers every query term - those hits report no sections, as before.
     if intro.first().is_some_and(|p| covers_all_terms(p, terms, stem)) {
         return (lead(), None);
     }
@@ -568,46 +572,17 @@ fn hit_preview(
     } else {
         html::sections(article, PARA_MATCH_CHARS)
     };
-    // Paragraphs are scored whole only for the `sections` reporting; the
-    // preview picks the best-matching SENTENCE so a mid-paragraph match
-    // stays visible. Ties keep the earlier sentence.
-    let mut best_count = 0usize;
-    let mut best_sent: Option<(&String, usize)> = None;
+    // Paragraphs are scored whole for the `sections` reporting only.
     let mut names: Vec<String> = Vec::new();
     for (name, paras) in &secs {
-        let mut matched = false;
-        for para in paras {
-            if para_matches(para, terms, stem) > 0 {
-                matched = true;
-                for (i, s) in sentences(para).into_iter().enumerate() {
-                    let n = para_matches(s, terms, stem);
-                    if n > best_count {
-                        best_count = n;
-                        best_sent = Some((para, i));
-                    }
-                }
-            }
-        }
-        if matched {
+        if paras.iter().any(|para| para_matches(para, terms, stem) > 0) {
             names.push(name.clone());
         }
     }
-    match best_sent {
-        Some((para, first)) => {
-            let sent = sentences(para);
-            let mut preview = String::new();
-            for s in &sent[first..] {
-                if preview.chars().count() >= INTRO_CHARS {
-                    break;
-                }
-                if !preview.is_empty() {
-                    preview.push(' ');
-                }
-                preview.push_str(s);
-            }
-            (preview.chars().take(INTRO_CHARS).collect(), Some(names))
-        }
-        None => (lead(), None),
+    if names.is_empty() {
+        (lead(), None)
+    } else {
+        (lead(), Some(names))
     }
 }
 
@@ -695,10 +670,10 @@ pub(crate) mod tests {
         <p>People season their food with it.</p>\
         </body></html>";
 
-    /// Articles whose best-matching paragraph holds several sentences, with
-    /// the query matching a mid-paragraph one: the preview must START with
-    /// that sentence. The Volcano lead does not cover its query, so the
-    /// lead fallback does not fire.
+    /// Articles whose query matches a mid-paragraph sentence of a body
+    /// region: the preview is still the intro start, while the matched
+    /// region is reported as `sections`. The Volcano lead does not cover
+    /// its query, so the lead fast path does not fire.
     const VOLCANO_HTML: &str = "<html><body><h1>Volcano</h1>\
         <p>Volcanoes are openings in the crust.</p>\
         <p>Molten rock rises from chambers below. Eruptions reshape the \
@@ -1481,11 +1456,11 @@ Meltwater streams out of the ice.
         assert_eq!(hits[1].preview, "Nitrogen is a colorless, odorless gas.");
     }
     #[test]
-    fn e2e_search_section_match_reports_sections_and_best_paragraph() {
+    fn e2e_search_section_match_reports_sections() {
         // The query term appears only in a later section of the article
         // ("Wild apples grew in Kazakhstan." under History): the intro
-        // cannot cover it, so the hit reports the matched sections and the
-        // best-matching paragraph, not the lead.
+        // cannot cover it, so the hit reports the matched sections while
+        // the preview stays the article's lead.
         let (server, _keep) = test_server();
         let hits = search(&server, "kazakhstan");
         assert_eq!(hits.len(), 1, "{hits:?}");
@@ -1498,7 +1473,7 @@ Meltwater streams out of the ice.
             Some(vec!["History".to_string(), "Domestication".to_string()]),
             "{hit:?}"
         );
-        assert_eq!(hit.preview, "Wild apples grew in Kazakhstan.");
+        assert_eq!(hit.preview, "An apple is the fruit of <rosaceae> trees.");
         // The serialized JSON carries the section names.
         let json = serde_json::to_string(hit).unwrap();
         assert!(json.contains(r#""sections":["History","Domestication"]"#), "{json}");
@@ -1551,16 +1526,19 @@ Meltwater streams out of the ice.
 
     #[test]
     fn e2e_search_intro_match_beyond_first_paragraph_reports_intro_section() {
-        // "himalaya" matches only the intro's second paragraph: the preview is
-        // that paragraph and the intro is reported as the matching region
-        // _intro - not the lead, and not without sections.
+        // "himalaya" matches only the intro's second paragraph: the intro
+        // is reported as the matching region _intro - the preview is
+        // unchanged (the lead).
         let (server, _keep) = intro_test_server();
         let hits = search(&server, "himalaya");
         assert_eq!(hits.len(), 1, "{hits:?}");
         let hit = &hits[0];
         assert_eq!(hit.path, "C/Salt");
         assert_eq!(hit.sections, Some(vec!["_intro".to_string()]), "{hit:?}");
-        assert_eq!(hit.preview, "The Himalaya range holds vast deposits of rock salt.");
+        assert_eq!(
+            hit.preview,
+            "Salt is a mineral composed primarily of sodium chloride."
+        );
         let json = serde_json::to_string(hit).unwrap();
         assert!(json.contains(r#""sections":["_intro"]"#), "{json}");
     }
@@ -1569,9 +1547,7 @@ Meltwater streams out of the ice.
     fn e2e_search_intro_and_section_matches_report_both() {
         // "salt beds" matches the intro's second paragraph ("salt") and the
         // Formation section ("Salt beds ..."): both regions are reported,
-        // _intro first, and the preview is the paragraph with the most
-        // query-term occurrences across all regions (Formation's, two
-        // against the intro paragraphs' one).
+        // _intro first, while the preview stays the article's lead.
         let (server, _keep) = intro_test_server();
         let hits = search(&server, "salt beds");
         assert_eq!(hits.len(), 1, "{hits:?}");
@@ -1582,15 +1558,19 @@ Meltwater streams out of the ice.
             Some(vec!["_intro".to_string(), "Formation".to_string()]),
             "{hit:?}"
         );
-        assert_eq!(hit.preview, "Salt beds form when seas evaporate.");
+        assert_eq!(
+            hit.preview,
+            "Salt is a mineral composed primarily of sodium chloride."
+        );
     }
 
     #[test]
-    fn e2e_search_preview_starts_with_best_sentence() {
-        // The query matches a mid-paragraph sentence: the preview starts
-        // with it, continued with the paragraph's remaining sentences.
-        // Covered for an HTML article (intro match) and a Markdown one
-        // (body-section match).
+    fn e2e_search_section_match_still_reports_sections() {
+        // The query matches a mid-paragraph sentence of a body region: the
+        // preview is the article's lead (the intro start), NOT the matched
+        // sentence - but the matched region is still reported. Covered for
+        // an HTML article (intro match) and a Markdown one (body-section
+        // match).
         let dir = tempfile::tempdir().unwrap();
         let index = make_index(
             &[
@@ -1612,29 +1592,13 @@ Meltwater streams out of the ice.
         assert_eq!(hits.len(), 1, "{hits:?}");
         assert_eq!(hits[0].path, "C/Volcano");
         assert_eq!(hits[0].sections, Some(vec!["_intro".to_string()]));
-        assert!(
-            hits[0].preview.starts_with("Ash clouds can ground aircraft."),
-            "{:?}",
-            hits[0].preview
-        );
-        assert_eq!(
-            hits[0].preview,
-            "Ash clouds can ground aircraft. Farmers fear the fallout."
-        );
+        assert_eq!(hits[0].preview, "Volcanoes are openings in the crust.");
 
         let hits = search(&server, "river");
         assert_eq!(hits.len(), 1, "{hits:?}");
         assert_eq!(hits[0].path, "C/Glacier");
         assert_eq!(hits[0].sections, Some(vec!["Movement".to_string()]));
-        assert!(
-            hits[0].preview.starts_with("The flow is slower than a river."),
-            "{:?}",
-            hits[0].preview
-        );
-        assert_eq!(
-            hits[0].preview,
-            "The flow is slower than a river. Meltwater streams out of the ice."
-        );
+        assert_eq!(hits[0].preview, "A glacier is a body of dense ice.");
     }
 
     #[test]
@@ -1814,8 +1778,8 @@ Ancient India smelted zinc early.
         assert_eq!(hits[0].sections, None);
 
         // A query matching only a body section reports the matched sections
-        // (nested one included) and the best-matching paragraph; the intro
-        // holds no match, so _intro is absent.
+        // (nested one included); the preview stays the article's lead (the
+        // intro holds no match, so _intro is absent).
         let hits = search(&server, "smelting");
         assert_eq!(hits.len(), 1);
         assert_eq!(
@@ -1824,7 +1788,7 @@ Ancient India smelted zinc early.
             "{:?}",
             hits[0]
         );
-        assert_eq!(hits[0].preview, "Zinc smelting is documented in ancient times.");
+        assert_eq!(hits[0].preview, "Zinc is a chemical element with the symbol Zn.");
         // includes the subsection, reports the heading as written.
         let params = serde_json::from_value::<ZimGetSectionParams>(
             serde_json::json!({ "zim": "md.zim", "path": "Zinc", "section": "history" }),
