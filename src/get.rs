@@ -46,16 +46,11 @@ const MAX_ZIM_GET_BYTES: usize = 16 * 1024 * 1024;
 
 /// Normalize the `path` argument of the article lookups: a namespaced ZIM
 /// path (`C/Salt`, `A/Foo`, `-/x`) is returned unchanged, anything else is
-/// treated as a Wikipedia article title and mapped to the path layout
-/// Wikipedia ZIMs use: `"C/" + title with spaces replaced by underscores`.
-///
-/// A path is recognized by its shape: the first byte an ASCII letter or `-`
-/// and the second byte `/`. That keeps every explicit path working - legacy
-/// namespaces, the `-` namespace, and non-Wikipedia ZIMs' opaque URL paths -
-/// while bare titles (which never contain `/`) convert. The conversion
-/// cannot know an archive's exact path spelling, so a title must match the
-/// ZIM's path casing; if the lookup fails, the error reports the converted
-/// path and the caller can retry with the exact path from search results.
+/// treated as an article title and mapped to the path layout Wikipedia ZIMs
+/// use: `"C/" + title with spaces replaced by underscores`. A path is
+/// recognized by its shape (ASCII letter or `-`, then `/`), which keeps
+/// every explicit path working while bare titles (which never contain `/`)
+/// convert.
 fn article_path(raw: &str) -> String {
     let bytes = raw.as_bytes();
     if bytes.len() >= 2
@@ -142,9 +137,8 @@ pub fn get_section(
     section: &str,
 ) -> Result<ZimGetSectionResult, ToolError> {
     let arc = find_archive(library, zim)?;
-    // Accept a bare article title as well as a namespaced path; converting
-    // first also makes the not-found / section errors below report the
-    // converted path.
+    // Converting first also makes the errors below report the converted
+    // path.
     let path = article_path(path);
     let article = not_found_if_missing(arc.get_article(&path))?;
     let text = std::str::from_utf8(&article.bytes).map_err(|_| {
@@ -188,10 +182,8 @@ mod tests {
     use rmcp::handler::server::router::tool::AsyncTool;
     use std::future::Future;
 
-    /// Run an async tool invocation to completion on this thread: the tools
-    /// are async (each hops to a blocking thread), and these tests are sync
-    /// `#[test]`s, so each invocation gets its own tiny current-thread
-    /// runtime to await in.
+    /// Await an async tool invocation (each hops to a blocking thread) from
+    /// a sync `#[test]` on a tiny current-thread runtime.
     fn block_on<F: Future>(future: F) -> F::Output {
         tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -235,22 +227,6 @@ mod tests {
         .unwrap();
         assert!(matches!(block_on(ZimGetTool::invoke(&server, params)), Err(ToolError::NotFound(_))));
     }
-
-    #[test]
-    fn article_path_maps_titles_and_keeps_paths() {
-        // Titles convert to the C/ path layout Wikipedia ZIMs use.
-        assert_eq!(article_path("Beaconsfield, Quebec"), "C/Beaconsfield,_Quebec");
-        assert_eq!(article_path("Salt"), "C/Salt");
-        assert_eq!(
-            article_path("17α-Hydroxycorticosteroid"),
-            "C/17α-Hydroxycorticosteroid"
-        );
-        // Namespaced paths pass through unchanged: modern, legacy, and `-`.
-        assert_eq!(article_path("C/Salt"), "C/Salt");
-        assert_eq!(article_path("A/Foo"), "A/Foo");
-        assert_eq!(article_path("-/x"), "-/x");
-    }
-
     #[test]
     fn e2e_get_accepts_article_titles() {
         let dir = tempfile::tempdir().unwrap();

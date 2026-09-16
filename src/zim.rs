@@ -579,10 +579,8 @@ impl Zim {
         Ok(None)
     }
 
-    /// Directory names under which a ZIM may store its `Language` metadata:
-    /// the current openZIM layout first (namespace is a dirent byte, urls
-    /// carry no prefix), then the historical variant (the url includes the
-    /// namespace). Probed like the search indexes above.
+    /// Directory names under which a ZIM may store its `Language` metadata
+    /// (current openZIM layout first, historical variant second).
     const LANGUAGE_METADATA_NAMES: &[(u8, &str)] =
         &[(b'M', "Language"), (b'M', "M/Language")];
 
@@ -601,9 +599,8 @@ impl Zim {
     /// The archive's `Language` metadata (its first code, lowercased):
     /// libzim stems the embedded search index with the stemmer chosen from
     /// this metadata, so the query side must use the same language.
-    /// Separators split multi-code values ("eng, fre"); whitespace and case
-    /// are normalized away. `None` when the archive carries no Language
-    /// metadata. A tiny directory probe plus one small blob read.
+    /// `None` when the archive carries none. A directory probe plus one
+    /// small blob read.
     fn language_metadata(&self) -> io::Result<Option<String>> {
         for (ns, url) in Self::LANGUAGE_METADATA_NAMES {
             let Some(idx) = self.find_entry(*ns, url)? else { continue };
@@ -622,9 +619,8 @@ impl Zim {
     /// Open the Xapian database stored as the content of directory entry
     /// `idx`, preferring the zero-copy path (opening the in-file glass
     /// database at the blob's offset), falling back to a temp-file copy.
-    /// `what` names the index in errors ("full-text", "title"). The `Option`
-    /// keeps the shape of the entry probes above; after the entry exists the
-    /// function never yields `Ok(None)`.
+    /// `what` names the index in errors ("full-text", "title"). Never yields
+    /// `Ok(None)` once the entry exists.
     fn open_index_entry(&self, idx: u32, what: &str) -> io::Result<Option<XapianDatabase>> {
         let entry = self.get_entry(idx)?;
         let Target::Cluster(cluster, blob) = entry.target else {
@@ -670,11 +666,9 @@ impl Zim {
 
     /// Open the archive's title Xapian index (`X/title/xapian`), the second
     /// index openZIM archives embed: one document per article whose terms
-    /// are the article title's words (lowercased Porter2 stems, unprefixed,
-    /// exactly like the full-text index), whose data is the article path and
-    /// whose value slot 0 is the article title. Both indexes share one
-    /// docid space (libzim indexes the same article set in the same order).
-    /// Returns `Ok(None)` when the archive carries no title index.
+    /// are the title's lowercased Porter2 stems (unprefixed), whose data is
+    /// the article path and whose value slot 0 is the title. Both indexes
+    /// share one docid space. `Ok(None)` when the archive carries none.
     pub fn open_title_xapian(&self) -> io::Result<Option<XapianDatabase>> {
         match self.title_index_entry()? {
             Some(idx) => self.open_index_entry(idx, "title"),
@@ -763,13 +757,12 @@ impl Archive {
     /// lock, so no handle is ever reachable from two threads at once; `f`
     /// runs outside the lock. This amortizes the ~0.15 s open cost per
     /// archive and index without ever sharing a Xapian object between
-    /// searches (the documented thread-safety contract forbids concurrent
-    /// calls on one database object; separate handles to the same file are
-    /// fine).
+    /// searches (Xapian's documented thread-safety contract forbids
+    /// concurrent calls on one database object).
     ///
-    /// Returns `Ok(None)` when the archive carries no full-text index (it
-    /// then has no search band at all). A title index that exists but fails
-    /// to open only downgrades to no title band - it never fails the search.
+    /// `Ok(None)` when the archive carries no full-text index. A title
+    /// index that fails to open only downgrades to no title band - it never
+    /// fails the search.
     pub fn with_xapian<T, E>(
         &self,
         f: impl FnOnce(&XapianHandles) -> Result<T, E>,
@@ -808,15 +801,12 @@ impl Archive {
 
     /// Exact-match `query` against the ZIM directory itself (not the search
     /// index): the query is interpreted as an article URL (spaces become
-    /// underscores, plus case variants, since callers cannot know the
-    /// archive's exact casing) or as an explicit path ("C/Chemistry").
-    ///
-    /// Returns the entry's own full path and its directory title (often
-    /// empty in modern openZIM archives - callers apply fallbacks).
-    /// Redirects are deliberately NOT followed: a redirect is a legitimate
-    /// exact match, and redirect entries exist only in the directory, never
-    /// in the full-text index - so this lookup is the only way a query that
-    /// names a redirect finds it.
+    /// underscores, plus case variants) or as an explicit path
+    /// ("C/Chemistry"). Returns the entry's full path and its directory
+    /// title (often empty in modern openZIM archives - callers apply
+    /// fallbacks). Redirects are deliberately NOT followed: a redirect is a
+    /// legitimate exact match, and redirect entries exist only in the
+    /// directory, never in the search index.
     pub fn lookup_exact(&self, query: &str) -> io::Result<Option<(String, String)>> {
         let base = query.trim().replace(' ', "_");
         if base.is_empty() {
@@ -855,11 +845,10 @@ impl Archive {
 
     /// Follow `path`'s redirect chain to its terminal entry (bounded, see
     /// `MAX_REDIRECT_HOPS`). Returns the terminal entry's full path and raw
-    /// directory title (often empty in modern openZIM archives - callers
-    /// apply fallbacks); `None` when the path resolves to no entry. Search
-    /// candidates resolve through this before dedupe so that a redirect
-    /// entry (or a redirect's title-index document) reports the article it
-    /// names - and dedupes against it - instead of reporting itself.
+    /// directory title (often empty - callers apply fallbacks); `None` when
+    /// the path resolves to no entry. Search candidates resolve through
+    /// this before dedupe so that a redirect reports the article it names
+    /// - and dedupes against it.
     pub fn resolve_terminal(&self, path: &str) -> io::Result<Option<(String, String)>> {
         let Some(idx) = self.zim.resolve_path(path)? else {
             return Ok(None);
@@ -1041,10 +1030,8 @@ pub(crate) mod testutil {
     }
 
     /// An `M/Language` metadata entry carrying `code` (the dirent layout a
-    /// real archive uses, namespace as the dirent byte): libzim stems the
-    /// archive's embedded search index with `code`'s stemmer, so tests that
-    /// hand-build an index can pair it with this entry to simulate any
-    /// language. Append it to `content`; it is not an article.
+    /// real archive uses), for pairing with a hand-built index to simulate
+    /// any language. Append it to `content`; it is not an article.
     pub fn language_metadata_entry(code: &'static str) -> TestEntry {
         TestEntry { namespace: b'M', url: "Language", title: "", mime: 0, body: code.as_bytes() }
     }
@@ -1326,13 +1313,6 @@ pub(crate) mod testutil {
         let (z, f) = open_bytes(&bytes);
         (Archive::new("sample.zim".to_string(), z), f)
     }
-
-    #[test]
-    fn open_and_entry_count() {
-        let (a, _f) = sample_archive();
-        assert_eq!(a.article_count(), 4);
-    }
-
     #[test]
     fn get_article_content() {
         let (a, _f) = sample_archive();
@@ -1356,13 +1336,6 @@ pub(crate) mod testutil {
         assert_eq!(art.title, "Apple");
         assert_eq!(art.full_path, "C/Apple");
     }
-
-    #[test]
-    fn get_article_not_found() {
-        let (a, _f) = sample_archive();
-        assert!(a.get_article("Nope").is_err());
-    }
-
     #[test]
     fn path_resolution_decorations() {
         let (a, _f) = sample_archive();

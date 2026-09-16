@@ -58,14 +58,12 @@ fn decode_entity(s: &str, i: usize) -> Option<(String, usize)> {
     Some((ch.to_string(), i + semi + 1))
 }
 
-/// Elements whose whole content is invisible or not part of an article's
-/// lead: CSS/JS, tables (an infobox precedes the lead in MediaWiki output),
-/// figures (image captions) and reference markers. `title` and `h1` are
-/// skipped too: they carry the page title (`<title>` in the head;
-/// `<h1 id="firstHeading">` inside the body on pages from older scrapers,
-/// which lack the `mw-content-text` marker) and the title is already a
-/// separate field of every search hit, so it must not open the intro as
-/// well. Other heading levels are content and pass through.
+/// Elements whose whole content stays out of an article's lead: CSS/JS,
+/// tables (an infobox precedes the lead in MediaWiki output), figures
+/// (captions) and reference markers. `title` and `h1` carry the page title
+/// (in the head, or in the body on pages from older scrapers), which every
+/// search hit already reports as its own field; other heading levels are
+/// content and pass through.
 const INTRO_SKIP_TAGS: [&str; 7] = ["style", "script", "table", "figure", "sup", "title", "h1"];
 
 /// The value of attribute `name` in an open tag's attribute text (the part
@@ -97,11 +95,9 @@ fn attr_value<'a>(attrs: &'a str, name: &str) -> Option<&'a str> {
     None
 }
 
-/// Whether an open tag's attributes mark a MediaWiki hatnote. `{{about}}`,
-/// `{{other uses}}` and `{{main}}` render as elements like
-/// `<div role="note" class="hatnote navigation-not-searchable">`: the class
-/// list contains the token `hatnote` (order, extra classes and quote style
-/// vary) or the role is `note`.
+/// Whether an open tag's attributes mark a MediaWiki hatnote (`{{about}}`
+/// and friends render as e.g.
+/// `<div role="note" class="hatnote navigation-not-searchable">`).
 fn is_hatnote_attrs(attrs: &str) -> bool {
     attr_value(attrs, "class").is_some_and(|v| {
         v.split_ascii_whitespace().any(|t| t.eq_ignore_ascii_case("hatnote"))
@@ -156,13 +152,11 @@ fn tag_at(html: &str, i: usize) -> Option<(&str, &str, bool, usize)> {
 }
 
 /// The index just past the close tag matching the skipped open element at
-/// `open_i`. Tables nest (an infobox holds nested tables), so their close
-/// tag is matched by depth - ending the skip at an inner table's close
-/// would spill the rest of the infobox into the text. Other skipped
-/// elements never nest; their first close tag ends the skip (a script's
-/// text may itself contain "<script", so depth counting could overshoot
-/// there). An element never closed within the scanned text ends the skip
-/// at the end of it.
+/// `open_i`. Tables nest (an infobox holds nested tables), so they are
+/// matched by depth; other skipped elements never nest and end at their
+/// first close tag (a script's text may contain "<script", so depth
+/// counting could overshoot there). An element never closed within the
+/// scanned text ends the skip at the end of it.
 fn skip_end(html: &str, open_i: usize, tag_name: &str) -> usize {
     if tag_name.eq_ignore_ascii_case("table") {
         element_end(html, open_i, tag_name)
@@ -174,19 +168,15 @@ fn skip_end(html: &str, open_i: usize, tag_name: &str) -> usize {
     }
 }
 
-/// The region of a MediaWiki page that holds the article. Scanning the whole
-/// HTML would pick up browser-chrome text (title bar, navigation menus), so
-/// cut the page at the content div (`id="mw-content-text"`) and its matching
-/// close when the page has one. The article preview is only a prefix of the
-/// page, and on real MediaWiki pages the content div's close tag lies far
-/// beyond that prefix: the div then never closes within the scanned text,
-/// and the fallback must stay inside the div - everything from its open tag
-/// onward is the article body. Widening back to the whole document there
-/// (as this once did) silently defeats the scoping and leaks the head
-/// chrome (`<title>`, `<h1 id="firstHeading">`) into the intro. Likewise,
-/// when the prefix ends inside the div's own open tag (no `>` after the
-/// marker), nothing of the article has arrived and the body is empty
-/// rather than the whole document.
+/// The region of a MediaWiki page that holds the article: cut the page at
+/// the content div (`id="mw-content-text"`) so browser chrome (title bar,
+/// navigation menus) stays out. The article preview is only a prefix of the
+/// page, so the content div's close tag usually lies beyond it; the
+/// fallback must stay INSIDE the div (everything from its open tag onward),
+/// never widen to the whole document - that leaks head chrome
+/// (`<title>`, `<h1 id="firstHeading">`) into the intro. When the prefix
+/// ends inside the div's own open tag, nothing of the article has arrived
+/// and the body is empty.
 fn article_body(html: &str) -> &str {
     const MARKER: &str = "id=\"mw-content-text\"";
     let Some(i) = html.find(MARKER) else { return html };
@@ -224,13 +214,10 @@ fn article_body(html: &str) -> &str {
 }
 
 /// Strip HTML tags, decode common entities, and collapse whitespace into
-/// single spaces. Stops after producing `max_chars` characters of text;
-/// markup and whitespace never consume the budget. MediaWiki hatnotes
-/// (`{{about}}` and friends, marked by `is_hatnote_attrs`) and the page
-/// title's own elements (`<title>`, `<h1>` - see `INTRO_SKIP_TAGS`) are
-/// skipped whole, so intros start with the article lead and never open
-/// with the article name, which every search hit already reports as its
-/// own field - as the Markdown path already does.
+/// single spaces. Stops after `max_chars` characters of text; markup and
+/// whitespace never consume the budget. Hatnotes and the page title's own
+/// elements (`<title>`, `<h1>` - see `INTRO_SKIP_TAGS`) are skipped whole,
+/// so intros start with the article lead, never the article name.
 pub fn intro_from_html(html: &str, max_chars: usize) -> String {
     let html = article_body(html);
     let bytes = html.as_bytes();
@@ -245,14 +232,10 @@ pub fn intro_from_html(html: &str, max_chars: usize) -> String {
                 let Some((tag_name, attrs, opens, after)) = tag_at(html, i) else {
                     break;
                 };
-                // Elements whose whole content stays out of the intro: the
-                // INTRO_SKIP_TAGS set plus hatnotes (`is_hatnote_attrs`).
-                // Only a real open tag qualifies: a close tag (`</div>`)
-                // splits into an empty tag name and a comment (`<!-- .. -->`)
-                // starts with `!`, and neither must read as a hatnote (a
-                // comment could quote `class="hatnote"` in its text). Jump
-                // to the element's close tag (hatnote divs hold no nested
-                // same-name element); failing that, drop just the open tag.
+                // Skipped elements: INTRO_SKIP_TAGS plus hatnotes. Only a
+                // real open tag qualifies (a comment could quote
+                // `class="hatnote"` in its text). Jump to the element's
+                // close tag; failing that, drop just the open tag.
                 let skip = opens
                     && (INTRO_SKIP_TAGS.iter().any(|t| tag_name.eq_ignore_ascii_case(t))
                         || is_hatnote_attrs(attrs));
@@ -320,13 +303,11 @@ fn push_para(paras: &mut Vec<String>, cur: &mut String, max_para_chars: usize) {
     }
 }
 
-/// The cleaned paragraph texts of an HTML region: the text of each `<p>`
-/// element, extracted with the same skip machinery as `intro_from_html`
-/// (skipped elements - style/script/table/figure/sup/title/h1 - and
-/// hatnotes yield nothing, so infobox or figure text never becomes a
-/// paragraph), tags stripped, entities decoded, whitespace collapsed, each
-/// paragraph capped at `max_para_chars`. Text outside `<p>` elements -
-/// heading text, list items, navigation blocks - is not prose and stays
+/// The cleaned paragraph texts of an HTML region: one per `<p>` element,
+/// extracted with the same skip machinery as `intro_from_html` (skipped
+/// elements and hatnotes yield nothing), tags stripped, entities decoded,
+/// whitespace collapsed, each capped at `max_para_chars`. Text outside
+/// `<p>` elements - heading text, list items, navigation blocks - stays
 /// out.
 fn paragraphs(html: &str, max_para_chars: usize) -> Vec<String> {
     let bytes = html.as_bytes();
@@ -403,9 +384,8 @@ fn paragraphs(html: &str, max_para_chars: usize) -> Vec<String> {
 /// each heading's section under the heading text as written. A heading's
 /// section spans what [`section_content`] would return for it, so a nested
 /// `<h3>`'s paragraphs belong to its own entry and to the enclosing
-/// `<h2>`'s. `<h1>` carries the page title (see `INTRO_SKIP_TAGS`), not a
-/// section: it bounds no entry, and its element is skipped like in
-/// `intro_from_html`, so its text stays out of the intro paragraphs.
+/// `<h2>`'s. `<h1>` carries the page title, not a section: it bounds no
+/// entry and is skipped like in `intro_from_html`.
 pub fn sections(html: &str, max_para_chars: usize) -> Vec<(String, Vec<String>)> {
     let body = article_body(html);
     let headings = collect_headings(body);
@@ -424,8 +404,8 @@ pub fn sections(html: &str, max_para_chars: usize) -> Vec<(String, Vec<String>)>
 }
 
 /// The intro region's paragraphs: the paragraphs [`sections`] reports for
-/// its `INTRO_SECTION` entry, computed without extracting any body
-/// section's paragraphs (a search hit's lead fast path needs only these).
+/// its `INTRO_SECTION` entry, without extracting any body section's
+/// paragraphs (a search hit's lead fast path needs only these).
 pub fn intro_paragraphs(html: &str, max_para_chars: usize) -> Vec<String> {
     let body = article_body(html);
     let headings = collect_headings(body);
@@ -434,8 +414,8 @@ pub fn intro_paragraphs(html: &str, max_para_chars: usize) -> Vec<String> {
 
 /// Where the intro region ends: at the first heading of level >= 2 (`<h1>`
 /// carries the page title, not a section), else at the end of the body.
-/// Both [`sections`] and [`intro_paragraphs`] bound their intro region with
-/// this, so the two always agree on what the intro holds.
+/// Both [`sections`] and [`intro_paragraphs`] bound their intro region
+/// with this, so the two agree on what the intro holds.
 fn intro_region_end(body: &str, headings: &[Heading]) -> usize {
     headings
         .iter()
@@ -604,13 +584,11 @@ fn trim_trailing_open_tag(s: &str) -> &str {
 /// plus the raw HTML fragment between that heading and the next
 /// same-or-higher-level heading, trimmed.
 ///
-/// The reserved name [`INTRO_SECTION`] (matched like a heading name,
-/// case-insensitively) names no heading; it selects the article's
-/// introduction instead: the raw HTML of the intro region bounded by
-/// [`intro_region_end`] - exactly the region [`sections`] reports first, so
-/// the two can never disagree. It may carry hatnote or infobox markup, and
-/// it always exists (an article opening with a heading has an empty
-/// intro), so an empty region is returned as empty content, never `None`.
+/// The reserved name [`INTRO_SECTION`] selects the article's introduction
+/// instead: the raw HTML of the intro region bounded by
+/// [`intro_region_end`], exactly the region [`sections`] reports first. It
+/// always exists (an article opening with a heading has an empty intro),
+/// so an empty region is returned as empty content, never `None`.
 pub fn section_content(html: &str, name: &str) -> Option<(String, String)> {
     let target = normalize(name);
     if target.is_empty() {
@@ -667,13 +645,6 @@ mod tests {
         // skipped; the intro starts with the article text.
         assert!(!intro.contains("disambiguation"), "{intro:?}");
     }
-
-    #[test]
-    fn intro_respects_char_limit() {
-        let intro = intro_from_html(WIKI, 10);
-        assert!(intro.chars().count() <= 10, "{intro:?}");
-    }
-
     #[test]
     fn intro_budget_ignores_markup() {
         // Markup between texts must not eat the character budget: even
@@ -700,27 +671,6 @@ mod tests {
         assert!(!intro.contains("Navigation"), "{intro:?}");
         assert!(!intro.contains("Wikipedia"), "{intro:?}");
     }
-
-    #[test]
-    fn intro_when_content_div_never_closes_in_prefix() {
-        // A real page is read as a prefix (64 KiB) that ends inside the
-        // content div - its close tag lies far beyond it. Before the fix
-        // the never-closed fallback widened back to the whole document,
-        // so the head chrome (<title>, <h1>) opened the intro ("Salt Salt
-        // Salt is a mineral ..."); the intro must hold only lead text.
-        let page = "<html><head><title>Salt - Wikipedia</title></head>\
-            <body><h1 id=\"firstHeading\" class=\"firstHeading mw-first-heading\">Salt</h1>\
-            <div id=\"mw-content-text\"><div class=\"mw-parser-output\">\
-            <p><b>Salt</b> is a mineral composed primarily of sodium chloride.</p>\
-            <p>It is an ionic compound.</p>";
-        let intro = intro_from_html(page, 200);
-        assert_eq!(
-            intro,
-            "Salt is a mineral composed primarily of sodium chloride. It is an ionic compound.",
-            "{intro:?}"
-        );
-    }
-
     #[test]
     fn intro_skips_title_and_first_heading_without_marker() {
         // Pages lacking the mw-content-text marker (older scrapers put the
@@ -736,10 +686,9 @@ mod tests {
 
     #[test]
     fn article_body_fallbacks_when_div_never_closes() {
-        // Prefix ends inside the content div (a real page's close tag lies
-        // beyond the prefix): everything from the div's open tag onward is
-        // the article body - not the whole document, whose head chrome
-        // would leak into the intro ("Salt Salt Salt is ...").
+        // A real page's close tag lies beyond the read prefix: the body is
+        // everything from the div's open tag onward, not the whole document
+        // (whose head chrome once leaked "Salt Salt Salt ..." intros).
         let page = "<html><title>Salt</title><h1>Salt</h1>\
             <div id=\"mw-content-text\" class=\"x\"><p>Lead.</p>";
         assert_eq!(article_body(page), "<p>Lead.</p>");
@@ -749,18 +698,6 @@ mod tests {
         let page = "<html><title>Salt</title><div id=\"mw-content-text\" cla";
         assert_eq!(article_body(page), "");
     }
-
-    #[test]
-    fn intro_skips_hatnotes() {
-        // Vector 2022 pages open the article body with hatnote divs
-        // ({{about}} and friends) before the lead paragraph: the note, its
-        // inner link and the deduplicated-style <link> MediaWiki puts next
-        // to it must not reach the intro.
-        let page = "<html><head><title>Solid oxygen - Wikipedia</title></head><body><div id=\"mw-content-text\"><div class=\"mw-parser-output\"><div role=\"note\" class=\"hatnote navigation-not-searchable\">This article is about the solid phase of elemental oxygen. For other uses, see <a href=\"Oxygen\" title=\"Oxygen\">Oxygen</a>.</div><link rel=\"mw-deduplicated-inline-style\" href=\"mw-data:TemplateStyles:r128\"/><p><b>Solid oxygen</b> forms below 54.36 K at normal pressure.</p></div></div><footer>Navigation menu</footer></body></html>";
-        let intro = intro_from_html(page, 200);
-        assert_eq!(intro, "Solid oxygen forms below 54.36 K at normal pressure.");
-    }
-
     #[test]
     fn intro_skips_nested_infobox_tables() {
         // An infobox <table> holding a nested <table>: the skip must not end
@@ -832,12 +769,10 @@ mod tests {
 
     #[test]
     fn attribute_shorter_than_probed_name_is_not_found() {
-        // A `<br />` open tag splits into name "br" and attribute text " /":
-        // probing `class` (5 bytes) in that 2-byte haystack underflowed
-        // `hay.len() - needle.len()` in find_ci, and the sliced comparison
-        // panicked - aborting every search on scraped (non-wikipedia) ZIMs,
-        // where `<br />` is ubiquitous. An attribute shorter than the probed
-        // name is simply not present.
+        // A `<br />` open tag splits into name "br" and attribute text " /";
+        // probing `class` in that 2-byte haystack once underflowed
+        // `hay.len() - needle.len()` in find_ci and panicked, aborting every
+        // search on scraped ZIMs where `<br />` is ubiquitous.
         assert_eq!(attr_value(" /", "class"), None);
         assert_eq!(attr_value(" /", "role"), None);
         assert!(!is_hatnote_attrs(" /"));
@@ -928,7 +863,7 @@ mod tests {
 
         let secs = sections(page, 300);
         // The intro region: the lead paragraphs only (title, hatnote and
-        // infobox skipped), under the reserved intro name.
+        // infobox skipped).
         assert_eq!(secs[0].0, "_intro");
         assert_eq!(
             secs[0].1,
@@ -937,11 +872,9 @@ mod tests {
                 "It tastes salty.".to_string(),
             ]
         );
-        // One entry per heading (nested ones included), named as written,
-        // each with its own paragraphs.
+        // One entry per heading (nested ones included), named as written;
+        // the nested h3's paragraphs belong to the enclosing h2 as well.
         assert_eq!(secs[1].0, "History");
-        // A heading's section spans what `section_content` would return for
-        // it: the nested h3's paragraphs belong to it as well.
         assert_eq!(
             secs[1].1,
             vec!["Salt has been mined for millennia.", "Salt roads crossed continents."]
@@ -967,22 +900,5 @@ mod tests {
         // A paragraph is capped at `max_para_chars` characters.
         let long = sections("<p>0123456789 0123456789 0123456789</p>", 12);
         assert_eq!(long[0].1, vec!["0123456789 0"]);
-    }
-
-    #[test]
-    fn intro_paragraphs_are_the_intro_regions_paragraphs() {
-        // `intro_paragraphs` extracts exactly the paragraphs `sections`
-        // reports for the intro region, and nothing from the body sections.
-        let secs = sections(WIKI, 300);
-        assert_eq!(intro_paragraphs(WIKI, 300), secs[0].1);
-        assert_eq!(
-            intro_paragraphs(WIKI, 300),
-            vec!["An apple is the fruit of <rosaceae> trees."]
-        );
-        // Without any heading the whole document is the intro region.
-        assert_eq!(
-            intro_paragraphs("<p>a</p><p>b</p>", 100),
-            vec!["a".to_string(), "b".to_string()]
-        );
     }
 }

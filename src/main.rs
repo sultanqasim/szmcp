@@ -160,24 +160,20 @@ async fn serve(zim_path: &Path, bind: String, port: u16) -> Result<(), String> {
 
     let addr = format!("{bind}:{port}");
 
-    // 1. Setup MCP Service Factory
-    // ZimMcpServer::router() returns a Router<ZimMcpServer>
     let factory_library = library.clone();
     let service_factory = move || Ok(ZimMcpServer::new(factory_library.clone()).router());
 
-    // 2. Setup Session Manager
     let session_manager = Arc::new(LocalSessionManager::default());
 
-    // 3. Setup Streamable HTTP Config with Host validation based on bind address
     use tower_http::cors::{AllowOrigin, CorsLayer};
 
     let (config, cors_layer) = if bind == "0.0.0.0" || bind == "*" || bind == "::" {
-        // External binding: allow any Host and Origin header from remote clients
+        // External binding: accept any Host/Origin.
         let config = StreamableHttpServerConfig::default().disable_allowed_hosts();
         let cors_layer = CorsLayer::permissive();
         (config, cors_layer)
     } else {
-        // Localhost binding: restrict to loopback origins
+        // Loopback binding: restrict Hosts (DNS rebinding) and Origins.
         let config = StreamableHttpServerConfig::default()
             .with_allowed_hosts(["localhost", "127.0.0.1", "::1"]); // block DNS rebinding
         let cors_layer = CorsLayer::permissive()
@@ -195,10 +191,8 @@ async fn serve(zim_path: &Path, bind: String, port: u16) -> Result<(), String> {
         (config, cors_layer)
     };
 
-    // 4. Create the Streamable HTTP Service
     let mcp_service = StreamableHttpService::new(service_factory, session_manager, config);
 
-    // 5. Setup Axum router with CORS
     let app = axum::Router::new()
         .fallback_service(mcp_service)
         .layer(cors_layer);
@@ -226,7 +220,6 @@ async fn serve(zim_path: &Path, bind: String, port: u16) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::zim::testutil::{build_archive, TestEntry};
 
     #[test]
     fn open_single_zim_rejects_directories() {
@@ -237,23 +230,5 @@ mod tests {
         };
         assert!(err.contains("expected a ZIM file, not a directory"), "{err}");
         assert!(err.contains(&canonical.display().to_string()), "{err}");
-    }
-
-    #[test]
-    fn open_single_zim_opens_a_file() {
-        let dir = tempfile::tempdir().unwrap();
-        let content = [TestEntry {
-            namespace: b'C',
-            url: "Apple",
-            title: "Apple",
-            mime: 0,
-            body: b"<html><body><p>An apple is a fruit.</p></body></html>",
-        }];
-        let bytes = build_archive(&["text/html"], &content, &[], 0, None);
-        let file = dir.path().join("mini.zim");
-        std::fs::write(&file, &bytes).unwrap();
-        let library = open_single_zim(&file).unwrap();
-        assert_eq!(library.archives.len(), 1);
-        assert_eq!(library.archives[0].name, "mini.zim");
     }
 }

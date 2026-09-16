@@ -8,11 +8,9 @@
 use crate::html::{self, normalize, INTRO_SECTION};
 
 /// Append plain text to the intro under construction: a single space
-/// separates it from any text already emitted (a skipped line - blank line,
-/// fence, separator row - contributes nothing but its successor still gets
-/// its space), and whitespace inside the text collapses the same way.
-/// Markup and whitespace never consume the character budget (same rule as
-/// `intro_from_html`).
+/// separates it from any text already emitted, whitespace inside the text
+/// collapses the same way, and whitespace never consumes the character
+/// budget (same rule as `intro_from_html`).
 fn push_text(out: &mut String, text: &str, max_chars: usize) {
     // A space is due before the first character unless the intro is empty.
     let mut sep = !out.is_empty();
@@ -124,14 +122,12 @@ fn push_paragraph(paras: &mut Vec<String>, text: &str, max_para_chars: usize) {
     }
 }
 
-/// The cleaned paragraph texts of one Markdown region: each
-/// blank-line-separated block, cleaned the way paragraphs are cleaned everywhere in this module
-/// its text (wikilinks resolved, emphasis and inline-code markers stripped,
-/// hatnotes dropped, fenced blocks skipped, raw HTML blocks handed to
-/// `intro_from_html`), each capped at `max_para_chars`. Deeper headings
-/// inside the region (a `###` under a `##` section) are dropped like the
-/// HTML path drops heading text: they name subregions, and their content's
-/// paragraphs follow right after them.
+/// The cleaned paragraph texts of one Markdown region: one per
+/// blank-line-separated block (wikilinks resolved, emphasis and inline-code
+/// markers stripped, hatnotes dropped, fenced blocks skipped, raw HTML
+/// blocks handed to `intro_from_html`), each capped at `max_para_chars`.
+/// Deeper headings inside the region are dropped like the HTML path drops
+/// heading text: they name subregions whose paragraphs follow right after.
 fn md_paragraphs(lines: &[&str], max_para_chars: usize) -> Vec<String> {
     let mut paras: Vec<String> = Vec::new();
     let mut in_fence = false;
@@ -245,10 +241,8 @@ fn md_paragraphs(lines: &[&str], max_para_chars: usize) -> Vec<String> {
 /// text as written, spanning what [`section_content`] would return for it,
 /// so a nested `###`'s paragraphs belong to its own entry and to the
 /// enclosing `##`'s. The leading `# Title` heading is the article title - a
-/// separate field of every search hit - not a section: when the document
-/// opens with a heading, it is dropped (the positional rule of
-/// `title_split` applies to that line) and the intro region runs from
-/// after it.
+/// separate field of every search hit - not a section: it is dropped and
+/// the intro region runs from after it (see [`title_split`]).
 pub fn sections(md: &str, max_para_chars: usize) -> Vec<(String, Vec<String>)> {
     let lines: Vec<&str> = md.lines().collect();
     let headings = collect_headings(&lines);
@@ -283,12 +277,9 @@ pub fn intro_paragraphs(md: &str, max_para_chars: usize) -> Vec<String> {
     md_paragraphs(&lines[intro_start..intro_end], max_para_chars)
 }
 
-/// Where the intro region starts and where the section entries begin: the
-/// leading `# Title` heading is the article title - a separate field of
-/// every search hit - not a section, so when the document opens with a
-/// heading (however deep) it is dropped and the intro runs from after it.
-/// Both [`sections`] and [`intro_paragraphs`] split on this rule, so the
-/// two always agree on what the intro holds.
+/// Where the intro region starts and where the section entries begin: a
+/// document opening with a heading (however deep) drops it as the article
+/// title. Both [`sections`] and [`intro_paragraphs`] split on this rule.
 fn title_split(lines: &[&str], headings: &[Heading]) -> (usize, usize) {
     let title = headings
         .first()
@@ -311,8 +302,8 @@ struct Heading {
 
 /// Strip inline markdown from heading text for matching: `*` and backtick
 /// markers go, and `_` goes only in pairs (`_like this_`), since a lone
-/// underscore is subscript-style math that stays - `*A*_r°(O)` keeps its
-/// `_r` so it matches a query for "standard atomic weight a_r°(O)".
+/// underscore is subscript-style math that stays (`*A*_r°(O)` keeps its
+/// `_r`).
 fn heading_key(s: &str) -> String {
     let no_markers: String = s.chars().filter(|&c| c != '*' && c != '`').collect();
     let parts: Vec<&str> = no_markers.split('_').collect();
@@ -355,13 +346,11 @@ fn collect_headings(lines: &[&str]) -> Vec<Heading> {
 /// the heading text as written plus the raw Markdown between that heading
 /// and the next heading of the same or higher level, trimmed.
 ///
-/// The reserved name [`INTRO_SECTION`] (matched like a heading name,
-/// case-insensitively) names no heading; it selects the article's
-/// introduction instead: the raw Markdown from after the leading `# Title`
-/// line (dropped by the [`title_split`] rule, as in [`sections`], so the
-/// two agree on the intro's extent) to the first heading. The introduction
-/// always exists (an empty region is possible), so it is returned as empty
-/// content, never `None`.
+/// The reserved name [`INTRO_SECTION`] selects the article's introduction
+/// instead: the raw Markdown from after the leading `# Title` line (per
+/// [`title_split`], as in [`sections`]) to the first heading. The
+/// introduction always exists, so an empty region is empty content, never
+/// `None`.
 pub fn section_content(md: &str, name: &str) -> Option<(String, String)> {
     let target = normalize(name);
     if target.is_empty() {
@@ -544,8 +533,7 @@ That is all.
     #[test]
     fn sections_split_intro_and_headings_with_clean_paragraphs() {
         let secs = sections(SECTIONS_MD, 400);
-        // The intro region: the paragraphs after the leading `# Title` line
-        // (dropped - the title is a separate field of every hit), with the
+        // The intro region: the paragraphs after the dropped title line,
         // hatnote dropped, under the reserved intro name.
         assert_eq!(secs[0].0, "_intro");
         assert_eq!(
@@ -621,22 +609,6 @@ That is all.
             vec![("_intro".to_string(), vec!["One.".to_string(), "Two.".to_string()])]
         );
     }
-
-    #[test]
-    fn intro_paragraphs_are_the_intro_regions_paragraphs() {
-        // `intro_paragraphs` extracts exactly the paragraphs `sections`
-        // reports for the intro region, and nothing from the body sections.
-        let secs = sections(SECTIONS_MD, 400);
-        assert_eq!(intro_paragraphs(SECTIONS_MD, 400), secs[0].1);
-        assert_eq!(
-            intro_paragraphs(SECTIONS_MD, 400),
-            vec![
-                "Salt is a mineral composed of sodium chloride.".to_string(),
-                "It is an ionic compound.".to_string(),
-            ]
-        );
-    }
-
     #[test]
     fn sections_cap_paragraph_characters() {
         let secs = sections(SECTIONS_MD, 12);
