@@ -489,31 +489,23 @@ pub fn search(library: &ZimLibrary, query: &str) -> Result<SearchResults, ToolEr
 /// region scoring at least `min_frac` of the article's best region score is
 /// reported, in document order. Regions matching nothing score 0 and never
 /// qualify. A best score of 0 means no region matched any query word:
-/// nothing is reported. When scores exist but none clears the bar, the
-/// single best-scoring region is still reported - the least-bad fallback
-/// that keeps a hit that matched from losing its sections to a too-strict
-/// threshold.
+/// nothing is reported. (For any `min_frac <= 1` the best region itself
+/// always clears the bar, so something is reported whenever any region
+/// matched.)
 fn scored_sections(names: &[String], scores: &[f64], min_frac: f64) -> Option<Vec<String>> {
     let best = scores.iter().cloned().fold(0.0, f64::max);
     if best <= 0.0 {
         return None;
     }
     let threshold = best * min_frac;
-    let kept: Vec<String> = names
-        .iter()
-        .zip(scores)
-        .filter(|(_, score)| **score >= threshold)
-        .map(|(name, _)| name.clone())
-        .collect();
-    if !kept.is_empty() {
-        return Some(kept);
-    }
-    let (best_index, _) = scores
-        .iter()
-        .enumerate()
-        .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
-        .expect("best > 0 requires at least one score");
-    Some(vec![names[best_index].clone()])
+    Some(
+        names
+            .iter()
+            .zip(scores)
+            .filter(|(_, score)| **score >= threshold)
+            .map(|(name, _)| name.clone())
+            .collect(),
+    )
 }
 
 /// A Xapian failure while scoring one hit's sections, with the step named.
@@ -1735,7 +1727,7 @@ Meltwater streams out of the ice.
     }
 
     #[test]
-    fn scored_sections_threshold_and_least_bad_fallback() {
+    fn scored_sections_threshold() {
         let names =
             ["_intro".to_string(), "History".to_string(), "Trivia".to_string()];
         // The on-topic region leads; the grazing region sits below the 0.4
@@ -1746,18 +1738,18 @@ Meltwater streams out of the ice.
             scored_sections(&names, &scores, SECTION_MIN_SCORE_FRAC),
             Some(vec!["_intro".to_string(), "History".to_string()])
         );
-        // No region matched any query term: no sections, not even a
-        // least-bad pick.
+        // No region matched any query term: no sections.
         assert_eq!(
             scored_sections(&names, &[0.0, 0.0, 0.0], SECTION_MIN_SCORE_FRAC),
             None
         );
         assert_eq!(scored_sections(&names, &[], SECTION_MIN_SCORE_FRAC), None);
-        // Least-bad fallback: scores exist but none clears the bar (a
-        // fraction above 1.0 - unreachable with the 0.4 constant, which the
-        // best region always clears, but the guarantee must hold anyway):
-        // the single best-scoring region is reported.
-        assert_eq!(scored_sections(&names, &[0.1, 0.9, 0.2], 1.2), Some(vec!["History".to_string()]));
+        // min_frac > 1 could empty the set, but the constant is 0.4; the
+        // best region always clears any bar at or below 1.0.
+        assert_eq!(
+            scored_sections(&names, &[0.1, 0.9, 0.2], 1.0),
+            Some(vec!["History".to_string()])
+        );
     }
 
     #[test]
