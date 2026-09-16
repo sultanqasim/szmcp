@@ -17,8 +17,10 @@ use xapian2::{
 
 /// Number of results `zim_search` returns in total (across all archives).
 const SEARCH_LIMIT: u32 = 20;
-/// Maximum characters of the `preview` reported per search hit.
-const INTRO_CHARS: usize = 300;
+/// Maximum characters of the `preview` reported per search hit. A longer
+/// preview is cut at the last word boundary at or before the cap (a single
+/// word longer than the cap takes the hard cut) - see [`preview_truncate`].
+const INTRO_CHARS: usize = 360;
 /// Raw bytes read of an article to locate its matches (regions and
 /// paragraphs). For compressed clusters the whole cluster decompresses anyway.
 const HIT_READ_BYTES: u64 = 1024 * 1024;
@@ -635,11 +637,31 @@ fn sentences(paragraph: &str) -> Vec<&str> {
     out.into_iter().filter(|s| !s.is_empty()).collect()
 }
 
+/// Truncate a preview to at most [`INTRO_CHARS`] characters, ending on a
+/// complete word: the text up to the cap, backed up to the last whitespace
+/// boundary so the trailing partial word (and any trailing whitespace) is
+/// dropped - a preview cut mid-word reads as broken. Text within the cap
+/// passes through unchanged; a single word longer than the cap (no
+/// whitespace inside it) falls back to the hard cut at the cap.
+fn preview_truncate(s: &str) -> String {
+    if s.chars().count() <= INTRO_CHARS {
+        return s.to_string();
+    }
+    let head: String = s.chars().take(INTRO_CHARS).collect();
+    match head.rfind(char::is_whitespace) {
+        // Byte index of the last whitespace in `head`: a char boundary, so
+        // the slice is safe, and `trim_end` drops a run of whitespace.
+        Some(bound) => head[..bound].trim_end().to_string(),
+        None => head,
+    }
+}
+
 /// The `preview`/`sections` pair of one search hit, from the article's raw
 /// text (`is_markdown` picks the Markdown or the HTML splitter). The
-/// preview is the article's lead - the first intro paragraph, truncated to
-/// `INTRO_CHARS` - no matter where in the article the query matched; a
-/// title match keeps the intro's first sentence instead. The `sections` of
+/// preview is the article's lead - the first intro paragraph, truncated at
+/// the last word boundary at or before `INTRO_CHARS` ([`preview_truncate`])
+/// - no matter where in the article the query matched; a title match keeps
+/// the intro's first sentence, truncated the same way. The `sections` of
 /// a full-text hit are BM25-scored: the article's regions (`_intro` first,
 /// then one region per heading in document order) go into a temporary
 /// in-memory Xapian index ([`region_scores`]) that the hit's own full-text
@@ -667,7 +689,7 @@ fn hit_preview(
     };
     let lead = || {
         intro.first()
-            .map(|p| p.chars().take(INTRO_CHARS).collect())
+            .map(|p| preview_truncate(p))
             .unwrap_or_default()
     };
     if title_match {
@@ -676,7 +698,7 @@ fn hit_preview(
             .and_then(|p| {
                 sentences(p)
                     .first()
-                    .map(|s| s.chars().take(INTRO_CHARS).collect::<String>())
+                    .map(|s| preview_truncate(s))
             })
             .unwrap_or_default();
         return Ok((first, None));
@@ -1837,6 +1859,47 @@ Scientists measure the flow from observatories.
             ),
             None
         );
+    }
+
+    #[test]
+    fn preview_truncation_ends_on_a_complete_word() {
+        // Within the cap the text passes through unchanged.
+        let short = "A cherry is the fruit of trees of the genus Prunus.";
+        assert_eq!(preview_truncate(short), short);
+
+        // A lead whose cap falls INSIDE a word: the preview ends at the
+        // last complete word before INTRO_CHARS, not mid-word. 29 repeats
+        // of a 12-character unit put the cap 12 characters into the 15-char
+        // word that follows, so the fixed cut this replaces chopped it.
+        let paragraph = format!("{}{}", "lorem ipsum ".repeat(29), "wordthatislong! now more text");
+        assert!(paragraph.chars().count() > INTRO_CHARS);
+        let hard_cut: String = paragraph.chars().take(INTRO_CHARS).collect();
+        // The word straddles the cap: the old fixed cut ended mid-word.
+        assert!(!hard_cut.ends_with(char::is_whitespace));
+        let preview = preview_truncate(&paragraph);
+        assert!(preview.chars().count() <= INTRO_CHARS);
+        assert!(!preview.ends_with(char::is_whitespace), "{preview:?}");
+        assert!(paragraph.starts_with(&preview), "{preview:?}");
+        assert!(preview.ends_with("ipsum"), "{preview:?}");
+        // The cut landed on the whitespace before the straddling word.
+        assert!(
+            paragraph[preview.len()..].starts_with(char::is_whitespace),
+            "{preview:?}"
+        );
+
+        // One giant word with no whitespace within the cap: the hard cut.
+        let giant = "x".repeat(INTRO_CHARS + 40);
+        assert_eq!(preview_truncate(&giant), "x".repeat(INTRO_CHARS));
+
+        // The same paragraph as a fulltext hit's lead: the preview is the
+        // lead truncated at the word boundary, and only the lead (no
+        // sections) is reported without a full-text query.
+        let mut stem = Stemmer::new("en").unwrap();
+        let article = format!("<html><body><h1>T</h1><p>{paragraph}</p></body></html>");
+        let (lead_preview, sections) =
+            hit_preview(&article, &[], &mut stem, None, false, false).unwrap();
+        assert_eq!(sections, None);
+        assert_eq!(lead_preview, preview_truncate(&paragraph));
     }
 
     #[test]
