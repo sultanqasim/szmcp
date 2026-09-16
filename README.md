@@ -1,10 +1,10 @@
 # szmcp — Sultan's ZIM MCP
 
 An [MCP](https://modelcontextprotocol.io) server and CLI that serve content
-from [Kiwix ZIM files](https://www.kiwix.org/). The ZIM articles in a
-directory are exposed through three tools, either as an MCP server over the
-streamable HTTP transport (with CORS headers so it can be used from
-browsers) or as one-shot CLI subcommands.
+from [Kiwix ZIM files](https://www.kiwix.org/). The ZIM articles are exposed
+through a small set of tools, either as an MCP server over the streamable
+HTTP transport (with CORS headers so it can be used from browsers) or as
+one-shot CLI subcommands.
 
 ## Why I made this
 
@@ -58,34 +58,49 @@ Such files are also more space efficient on disk. I made a Python
 
 ## Tools
 
-- **`zim_search`** — search across all ZIM files in three tiers: an exact
+The tool set is decided by how the server was launched, not by the directory
+contents: `serve` with a single ZIM file runs in **single mode**, with a
+folder — holding any number of ZIM files, from none on up — in **directory
+mode**.
+
+- **`zim_search`** — search across the ZIM files in three tiers: an exact
   title/URL match comes first (a matching redirect reports the article it
   points to), then articles whose title contains every query word, then
   full-text matches ranked by BM25 relevance over all query words — partial
-  matches still return. Each result has the ZIM file name (relative to the ZIM
-  directory), the article path, the title, and `preview` — the article's first
-  intro sentence when the query matches the title, otherwise
-  the sentence with the most query matches (followed by the rest of its
-  paragraph) together with `sections` (the matching regions' names, the
-  intro listed as `_intro`). `sections` is omitted when the query matches
-  the title or the first intro paragraph. The same article is reported once
-  even when several spellings of it match. Deduplication is within an
-  archive only: the same title in different archives is reported once per
-  archive, since different archives can hold different articles under one
-  title.
-  Use `zim` + `path` with `zim_get`/`zim_get_section`.
+  matches still return. Each result has the ZIM file name (relative to the
+  ZIM directory — this `zim` field is reported in both modes), the article
+  path, the title, and `preview` — the article's first intro sentence when
+  the query matches the title, otherwise the sentence with the most query
+  matches (followed by the rest of its paragraph) together with `sections`
+  (the matching regions' names, the intro listed as `_intro`). `sections` is
+  omitted when the query matches the title or the first intro paragraph. The
+  same article is reported once even when several spellings of it match.
+  Deduplication is within an archive only: the same title in different
+  archives is reported once per archive, since different archives can hold
+  different articles under one title. In single mode the tool takes only the
+  query. In directory mode an optional `zim` argument restricts the search
+  to one file; without it all ZIM files are searched as one ranked list.
 - **`zim_get`** — get the full content of an article/page/object. Arguments:
-  the ZIM file name and the article path — or an article title such as
-  `"Beaconsfield, Quebec"`, converted to its `C/` path (Wikipedia ZIMs);
-  a failed lookup reports the converted path, so the exact path from search
-  results can be retried. Returns the title, final path (after
-  redirects), MIME type, and all of the content (UTF-8 text, or base64 for
-  binary objects).
+  the article path — or an article title such as `"Beaconsfield, Quebec"`,
+  converted to its `C/` path (Wikipedia ZIMs); a failed lookup reports the
+  converted path, so the exact path from search results can be retried.
+  Returns the title, final path (after redirects), MIME type, and all of the
+  content (UTF-8 text, or base64 for binary objects). In single mode that is
+  the whole argument list. In directory mode a `zim` argument is also
+  required: the ZIM file name relative to the ZIM directory, as `zim_list`
+  reports it.
 - **`zim_get_section`** — get a single section of an article, identified by
   its heading text (e.g. `"History"`), or the special name `_intro` for the
   introduction (the region before the first heading). The article is
-  addressed by its path or its title, as in `zim_get`. Returns the page
-  title, the section name, and the section content.
+  addressed by its path or its title, as in `zim_get` (plus `zim` in
+  directory mode). Returns the page title, the section name, and the section
+  content.
+- **`zim_list`** (directory mode only) — list the loaded ZIM files as
+  `{"files": ["file1.zim", "xyx/file3.zim"]}`, names relative to the ZIM
+  directory.
+
+A `zim` argument must name a file inside the ZIM directory: `..` components
+and absolute paths are refused, while symlinks are fine.
 
 ## HTML and Markdown archives
 
@@ -122,7 +137,9 @@ szmcp get_section /path/to/file.zim C/SomeArticle "History"
 
 - `serve` runs the MCP server. The endpoint is served at the root path
   (`http://127.0.0.1:3001`); `--bind` sets the bind address (default
-  `127.0.0.1`), `-p`/`--port` the port (default `3001`).
+  `127.0.0.1`), `-p`/`--port` the port (default `3001`). Whether the
+  argument is a single ZIM file or a folder decides the tool set (single
+  vs. directory mode, see Tools).
 - `search`, `get` and `get_section` run the matching tool once and print its
   response JSON to stdout — the same JSON the MCP tool returns, without the
   MCP wrapper. `get` and `get_section` take the ZIM file itself — the archive
