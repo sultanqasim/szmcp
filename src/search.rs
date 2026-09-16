@@ -33,6 +33,10 @@ const PARA_MATCH_CHARS: usize = 2000;
 /// rare words, so grazing regions drop out instead of flooding the report,
 /// while every region with real substance survives.
 const SECTION_MIN_SCORE_FRAC: f64 = 0.4;
+
+/// Most of the article's regions qualifying for the `sections` list means the
+/// whole article is relevant: report no list rather than a near-complete one.
+const SECTION_MAX_COVERAGE: f64 = 0.4;
 /// One search result.
 #[derive(Serialize, JsonSchema, Debug)]
 pub struct SearchHit {
@@ -491,21 +495,30 @@ pub fn search(library: &ZimLibrary, query: &str) -> Result<SearchResults, ToolEr
 /// qualify. A best score of 0 means no region matched any query word:
 /// nothing is reported. (For any `min_frac <= 1` the best region itself
 /// always clears the bar, so something is reported whenever any region
-/// matched.)
-fn scored_sections(names: &[String], scores: &[f64], min_frac: f64) -> Option<Vec<String>> {
+/// matched.) When the kept set covers most of the article's regions
+/// (`max_coverage` of them, counting `_intro`), the whole article is
+/// likely relevant and no list is worth reporting.
+fn scored_sections(
+    names: &[String],
+    scores: &[f64],
+    min_frac: f64,
+    max_coverage: f64,
+) -> Option<Vec<String>> {
     let best = scores.iter().cloned().fold(0.0, f64::max);
     if best <= 0.0 {
         return None;
     }
     let threshold = best * min_frac;
-    Some(
-        names
-            .iter()
-            .zip(scores)
-            .filter(|(_, score)| **score >= threshold)
-            .map(|(name, _)| name.clone())
-            .collect(),
-    )
+    let kept: Vec<String> = names
+        .iter()
+        .zip(scores)
+        .filter(|(_, score)| **score >= threshold)
+        .map(|(name, _)| name.clone())
+        .collect();
+    if kept.len() as f64 > max_coverage * names.len() as f64 {
+        return None;
+    }
+    Some(kept)
 }
 
 /// A Xapian failure while scoring one hit's sections, with the step named.
@@ -637,9 +650,11 @@ fn sentences(paragraph: &str) -> Vec<&str> {
 /// [`SECTION_MIN_SCORE_FRAC`] of the article's best region are reported in
 /// document order - the intro and body sections compete on equal BM25
 /// terms, so a region that merely grazes a common query word drops out
-/// while the region carrying the query's substance wins. No region matching
-/// any query word reports no sections; empty regions give an empty preview,
-/// never a panic.
+/// while the region carrying the query's substance wins. When more than
+/// [`SECTION_MAX_COVERAGE`] of the regions qualify, the whole article is
+/// likely relevant and no list is reported. No region matching any query
+/// word reports no sections; empty regions give an empty preview, never a
+/// panic.
 fn hit_preview(
     article: &str,
     terms: &[String],
@@ -686,7 +701,7 @@ fn hit_preview(
     }
     let scores = region_scores(&secs, terms, stem, query)?;
     let names: Vec<String> = secs.iter().map(|(name, _)| name.clone()).collect();
-    Ok((lead(), scored_sections(&names, &scores, SECTION_MIN_SCORE_FRAC)))
+    Ok((lead(), scored_sections(&names, &scores, SECTION_MIN_SCORE_FRAC, SECTION_MAX_COVERAGE)))
 }
 
 // ---------------------------------------------------------------------------
@@ -724,6 +739,10 @@ pub(crate) mod tests {
         <h3>Domestication</h3><p>Wild apples grew in Kazakhstan.</p>\
         <h2 id=\"Computers\">Computers</h2>\
         <p>Computing devices also go by that name.</p>\
+        <h2>Cultivation</h2>\
+        <p>Orchards grow the fruit in temperate climates.</p>\
+        <h2>See also</h2>\
+        <p>Other rosaceae genera are described elsewhere.</p>\
         </body></html>";
 
     const BANANA_HTML: &str = "<html><body><h1>Banana</h1>\
@@ -776,11 +795,17 @@ pub(crate) mod tests {
     /// Articles whose query matches a mid-paragraph sentence of a body
     /// region: the preview is still the intro start, while the matched
     /// region is reported as `sections`. The Volcano lead does not cover
-    /// its query, so the lead fast path does not fire.
+    /// its query, so the lead fast path does not fire. Filler sections in
+    /// both fixtures keep the matching region a minority under the
+    /// coverage cap.
     const VOLCANO_HTML: &str = "<html><body><h1>Volcano</h1>\
         <p>Volcanoes are openings in the crust.</p>\
         <p>Molten rock rises from chambers below. Eruptions reshape the \
         land. Ash clouds can ground aircraft. Farmers fear the fallout.</p>\
+        <h2>Formation</h2>\
+        <p>Magma accumulates in underground chambers.</p>\
+        <h2>Hazards</h2>\
+        <p>Eruptions endanger nearby settlements.</p>\
         </body></html>";
 
     const GLACIER_MD: &str = "\
@@ -792,6 +817,14 @@ A glacier is a body of dense ice.
 
 Glaciers move under their own weight. The flow is slower than a river. \
 Meltwater streams out of the ice.
+
+## Mass balance
+
+Snowfall accumulates faster than ablation in the upper reaches.
+
+## Study
+
+Scientists measure the flow from observatories.
 ";
 
     /// Run a search through the tool's server: the whole pipeline behind
@@ -1025,9 +1058,10 @@ Meltwater streams out of the ice.
             "La Révolution française éclate en 1789. La monarchie est renversée et la république proclamée."
         );
         // BM25 over the section index scores the intro region against the
-        // query (the lead's terms live there too), so the hit reports it -
-        // the old lead-covers-everything gate is gone.
-        assert_eq!(hits[0].sections, Some(vec!["_intro".to_string()]));
+        // query (the lead's terms live there too), but the intro is the
+        // article's only region: the kept set covers the whole article, so
+        // the coverage cap reports no list.
+        assert_eq!(hits[0].sections, None);
     }
 
     #[test]
@@ -1203,7 +1237,10 @@ Meltwater streams out of the ice.
         // The full-text-only matches follow, with full-text hit semantics.
         assert_eq!(hits[1].path, "C/Weather", "{hits:?}");
         assert_eq!(hits[1].title, "Weather");
-        assert_eq!(hits[1].sections, Some(vec!["_intro".to_string()]));
+        // Weather's only region is its intro and it matches the query, so
+        // the kept set covers the whole article and the coverage cap
+        // suppresses the list.
+        assert_eq!(hits[1].sections, None);
 
         // No usable terms: the title tier's AND over words absent from the
         // title index matches nothing and the full-text tier matches
@@ -1268,11 +1305,13 @@ Meltwater streams out of the ice.
 
         // A partial title match is NOT promoted to the title tier: no title
         // contains all three query words, so every hit comes from the
-        // full-text tier with full-text semantics (sections reported).
+        // full-text tier with full-text semantics (the full lead as the
+        // preview). Each article's only region is its intro and it matches,
+        // so the coverage cap suppresses the section list.
         let hits = search(&server, "kansas city new");
         assert!(hits.len() >= 2, "{hits:?}");
         for hit in &hits {
-            assert!(hit.sections.is_some(), "{hit:?}");
+            assert!(hit.sections.is_none(), "{hit:?}");
         }
         // The city articles are still reachable - through full text.
         let pos = |t: &str| hits.iter().position(|h| h.title == t);
@@ -1552,13 +1591,14 @@ Meltwater streams out of the ice.
         assert_eq!(hits[0].path, "C/Atmosphere", "{hits:?}");
         assert_eq!(hits[1].path, "C/Nitrogen", "{hits:?}");
         // The Atmosphere lead covers the whole query ("The atmosphere is
-        // mostly nitrogen and oxygen.") in its first paragraph: BM25 over
-        // the section index scores the intro region (its only region) and
-        // reports it as _intro. The Nitrogen lead only covers "nitrogen" -
-        // also scored and reported as the region _intro.
-        assert_eq!(hits[0].sections, Some(vec!["_intro".to_string()]), "{:?}", hits[0]);
+        // mostly nitrogen and oxygen.") in its first paragraph, and the
+        // Nitrogen lead covers "nitrogen": BM25 over the section index
+        // scores the intro region of each - but each article's ONLY region
+        // is its intro, so the kept set covers the whole article and the
+        // coverage cap suppresses the list for both hits.
+        assert_eq!(hits[0].sections, None, "{:?}", hits[0]);
         assert_eq!(hits[0].preview, "The atmosphere is mostly nitrogen and oxygen.");
-        assert_eq!(hits[1].sections, Some(vec!["_intro".to_string()]), "{:?}", hits[1]);
+        assert_eq!(hits[1].sections, None, "{:?}", hits[1]);
         assert_eq!(hits[1].preview, "Nitrogen is a colorless, odorless gas.");
     }
     #[test]
@@ -1573,7 +1613,9 @@ Meltwater streams out of the ice.
         let hit = &hits[0];
         assert_eq!(hit.path, "C/Apple");
         // The paragraph sits under History, whose range includes the nested
-        // Domestication heading: both sections report the match.
+        // Domestication heading: both sections report the match. (The filler
+        // sections in APPLE_HTML keep the article at six regions, so the two
+        // matching ones stay a minority under the coverage cap.)
         assert_eq!(
             hit.sections,
             Some(vec!["History".to_string(), "Domestication".to_string()]),
@@ -1695,6 +1737,13 @@ Meltwater streams out of the ice.
             centuries.</p>\
             <h2>See also</h2>\
             <p>Salt shakers are kitchen tools.</p>\
+            <h2>Geography</h2>\
+            <p>The province lies between two rivers, and its harbors trade \
+            in fish.</p>\
+            <h2>Demographics</h2>\
+            <p>Most of the population lives in coastal towns.</p>\
+            <h2>References</h2>\
+            <p>Printed surveys of the region appear every decade.</p>\
             </body></html>".as_bytes();
         let content = [TestEntry {
             namespace: b'C',
@@ -1715,7 +1764,9 @@ Meltwater streams out of the ice.
         assert_eq!(hit.path, "C/Salt_Mining_Industry");
         // The intro (both words) and the on-target Overview region are
         // reported, in document order; "See also" - one lone "salt" - does
-        // not clear the bar.
+        // not clear the bar. The three filler sections carry no query word
+        // and keep the article at six regions, so the two on-target ones
+        // stay a minority under the coverage cap.
         assert_eq!(
             hit.sections,
             Some(vec!["_intro".to_string(), "Overview".to_string()]),
@@ -1728,27 +1779,66 @@ Meltwater streams out of the ice.
 
     #[test]
     fn scored_sections_threshold() {
-        let names =
-            ["_intro".to_string(), "History".to_string(), "Trivia".to_string()];
-        // The on-topic region leads; the grazing region sits below the 0.4
+        let names = [
+            "_intro".to_string(),
+            "History".to_string(),
+            "Trivia".to_string(),
+            "Geography".to_string(),
+            "See also".to_string(),
+        ];
+        // The on-topic regions lead; the grazing region sits below the 0.4
         // bar and is dropped, while the reported order stays document order
-        // (not score order).
-        let scores = [0.674, 0.837, 0.153];
+        // (not score order). Two of the five regions clear the bar - exactly
+        // the 0.4 coverage cap, so the list is still reported.
+        let scores = [0.674, 0.837, 0.153, 0.0, 0.1];
         assert_eq!(
-            scored_sections(&names, &scores, SECTION_MIN_SCORE_FRAC),
+            scored_sections(&names, &scores, SECTION_MIN_SCORE_FRAC, SECTION_MAX_COVERAGE),
             Some(vec!["_intro".to_string(), "History".to_string()])
+        );
+        // The same shape over three regions: two of three clear the bar -
+        // 0.667 coverage, past the cap - so the article reads as wholly
+        // relevant and no list is reported.
+        let names3 = ["_intro".to_string(), "History".to_string(), "Trivia".to_string()];
+        assert_eq!(
+            scored_sections(
+                &names3,
+                &[0.674, 0.837, 0.153],
+                SECTION_MIN_SCORE_FRAC,
+                SECTION_MAX_COVERAGE
+            ),
+            None
         );
         // No region matched any query term: no sections.
         assert_eq!(
-            scored_sections(&names, &[0.0, 0.0, 0.0], SECTION_MIN_SCORE_FRAC),
+            scored_sections(
+                &names,
+                &[0.0, 0.0, 0.0, 0.0, 0.0],
+                SECTION_MIN_SCORE_FRAC,
+                SECTION_MAX_COVERAGE
+            ),
             None
         );
-        assert_eq!(scored_sections(&names, &[], SECTION_MIN_SCORE_FRAC), None);
+        assert_eq!(
+            scored_sections(&names, &[], SECTION_MIN_SCORE_FRAC, SECTION_MAX_COVERAGE),
+            None
+        );
         // min_frac > 1 could empty the set, but the constant is 0.4; the
         // best region always clears any bar at or below 1.0.
         assert_eq!(
-            scored_sections(&names, &[0.1, 0.9, 0.2], 1.0),
+            scored_sections(&names, &[0.1, 0.9, 0.2, 0.3, 0.1], 1.0, SECTION_MAX_COVERAGE),
             Some(vec!["History".to_string()])
+        );
+        // Too many regions qualify: the whole article is relevant, so no
+        // list is worth reporting (here 3 of 5 clear the bar - 0.6 coverage,
+        // past the cap).
+        assert_eq!(
+            scored_sections(
+                &names,
+                &[0.9, 0.8, 0.7, 0.1, 0.0],
+                SECTION_MIN_SCORE_FRAC,
+                SECTION_MAX_COVERAGE
+            ),
+            None
         );
     }
 
@@ -1831,8 +1921,9 @@ Meltwater streams out of the ice.
         assert_eq!(hits[2].path, "C/Pie_1", "{hits:?}");
         assert_eq!(hits[3].path, "C/Pie_2", "{hits:?}");
         // Neither hit's lead covers both terms; the intro matches "cherry"
-        // and is reported as the region _intro.
-        assert_eq!(hits[0].sections, Some(vec!["_intro".to_string()]));
+        // but is the article's only region, so the kept set covers the
+        // whole article and the coverage cap suppresses the list.
+        assert_eq!(hits[0].sections, None);
         assert!(hits[0].preview.contains("cherry is the fruit"), "{:?}", hits[0].preview);
     }    #[test]
     fn e2e_search_interleaves_archives_and_dedupes() {
@@ -1884,7 +1975,9 @@ Meltwater streams out of the ice.
 A banana is a tall herbaceous plant.
 ";
 
-    /// An article in the shape wikizim_parser emits (`text/markdown`).
+    /// An article in the shape wikizim_parser emits (`text/markdown`); the
+    /// filler sections keep the History/India matches a minority under the
+    /// coverage cap.
     const ZINC_MD: &str = "\
 # Zinc
 
@@ -1899,6 +1992,18 @@ Zinc smelting is documented in ancient times.
 ### India
 
 Ancient India smelted zinc early.
+
+## Occurrence
+
+The element occurs in several minerals.
+
+## Uses
+
+Brass alloys and batteries consume most of the supply.
+
+## See also
+
+Other transition metals are described elsewhere.
 ";
 
     #[test]
@@ -1967,7 +2072,9 @@ Ancient India smelted zinc early.
 
         // A query matching only a body section reports the matched sections
         // (nested one included); the preview stays the article's lead (the
-        // intro holds no match, so _intro is absent).
+        // intro holds no match, so _intro is absent). The filler sections
+        // in ZINC_MD keep the article at six regions, so the two matching
+        // ones stay a minority under the coverage cap.
         let hits = search(&server, "smelting");
         assert_eq!(hits.len(), 1);
         assert_eq!(
