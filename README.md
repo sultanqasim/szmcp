@@ -28,21 +28,23 @@ portable and easily searchable ZIM files are a good starting point.
 
 One package I found that provides an MCP server for browsing ZIM files is
 [openzim-mcp](https://github.com/cameronrye/openzim-mcp). I tried it out,
-but found that even with its new "simplified" 8-tool toolset, small local
-LLMs tend to struggle to properly drive it, and it tends to waste a lot of
-context, making local LLMs slow. It also had a lot of functionality that's
-of little use in practice. Other small basic ZIM MCP servers also exist,
-but the ones I found seemed immature, unpolished, and lacking in functionality.
+but found it to be overly complicated and bloated with features of limited
+practical value (at least for my use cases), and its one-tool simplified mode
+was near-useless with small models struggling to use it more than its advanced
+tool set. I also found its complexity made it very context inefficient for
+simple queries, and thus very slow on ordinary computers with slow prompt
+processing. Other small basic ZIM MCP servers also exist, but the ones I found
+seemed immature, unpolished, and lacking in functionality.
 
 My goal was to build a ZIM MCP server that provides just the functionality
 one really needs, which is easy to use (for LLMs and humans), and which is
 context efficient, making usage with small local LLMs on not overly powerful
 computers practical.
 
-This project is almost entirely and unashamedly vibe coded. I made it with
-GLM 5.3 Flash mostly. Even this README was all LLM generated, aside from this
-one section. I won't pretend this is some masterpiece, but it does the job and
-seems solid. You can connect it to the [llama.cpp](https://github.com/ggml-org/llama.cpp)
+This project is unashamedly almost entirely vibe coded. I made it with GLM 5.3
+Flash mostly. Even this README was all LLM generated, aside from this one section.
+I won't pretend this is some masterpiece, but it does the job and seems solid.
+You can connect it to the [llama.cpp](https://github.com/ggml-org/llama.cpp)
 llama-server web UI's built in agentic loop, or connect it to your own agent
 of choice. You can also just use the tools it exposes from the command line
 interface to manually explore ZIM files.
