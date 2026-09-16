@@ -929,7 +929,10 @@ pub struct ZimLibrary {
 
 impl ZimLibrary {
     /// Recursively scan `root` for ZIM files and open them. Files that fail
-    /// to open are skipped with a warning.
+    /// to open are skipped with a warning; a directory holding none scans to
+    /// an empty library - the pipelines report their own per-call errors
+    /// (search's "no ZIM files with a Xapian full-text index"), so an empty
+    /// directory is not fatal at scan time.
     pub fn scan(root: &Path) -> io::Result<ZimLibrary> {
         if !root.is_dir() {
             return Err(io::Error::new(ErrorKind::NotFound, format!("not a directory: {}", root.display())));
@@ -944,12 +947,6 @@ impl ZimLibrary {
                 Ok(zim) => archives.push(Arc::new(Archive::new(name, zim))),
                 Err(e) => eprintln!("szmcp: skipping {}: {e}", name),
             }
-        }
-        if archives.is_empty() {
-            return Err(io::Error::new(
-                ErrorKind::NotFound,
-                format!("no ZIM files could be loaded from {}", root.display()),
-            ));
         }
         Ok(ZimLibrary { root: root.to_path_buf(), archives })
     }
@@ -1523,5 +1520,15 @@ pub(crate) mod testutil {
         assert!(lib.archive("/etc/a.zim").is_none());
         assert!(lib.archive("").is_none());
         assert!(lib.archive("nope.zim").is_none());
+    }
+
+    #[test]
+    fn scan_of_empty_directory_is_ok_and_empty() {
+        // A scanned directory may hold zero ZIM files: the scan succeeds
+        // with an empty library, and the pipelines report their own per-call
+        // errors for it (only `single` stays strict - it names one file).
+        let dir = tempfile::tempdir().unwrap();
+        let lib = ZimLibrary::scan(dir.path()).unwrap();
+        assert!(lib.archives.is_empty());
     }
 }
