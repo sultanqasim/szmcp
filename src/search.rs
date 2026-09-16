@@ -1,8 +1,7 @@
 //! The search pipeline behind the `zim_search` tool: three simple tiers
-//! (exact title/URL probe, all-words title match, full-text OR over the
-//! words that are not the archive's background vocabulary), ranked against
-//! the ZIM embedded Xapian indexes, merged across archives, and reported
-//! with per-hit previews.
+//! (exact title/URL probe, all-words title match, full-text OR over all
+//! the query words), ranked against the ZIM embedded Xapian indexes,
+//! merged across archives, and reported with per-hit previews.
 
 use crate::html;
 use crate::markdown;
@@ -28,37 +27,6 @@ const HIT_READ_BYTES: u64 = 1024 * 1024;
 /// paragraphs keep matching far into their text. A paragraph chosen for
 /// reporting is truncated to `INTRO_CHARS` separately.
 const PARA_MATCH_CHARS: usize = 2000;
-/// A fulltext query word whose document frequency exceeds this fraction of
-/// the archive's documents is dropped from the FULLTEXT query (and only
-/// from it - the title tier keeps every word, and hit previews score every
-/// query term).
-///
-/// A word appearing in more than 8% of the archive's documents is
-/// background vocabulary, not a query discriminator - English "the" (59% of
-/// the md1m fulltext index), "of" (63%), "and" (56%); French "de" (79% of
-/// fr.zim), "la" (74%), "un" (71%) - and so is everything mid-frequency
-/// (EN "work" 25%, FR "faire" 44%): a BM25 OR cannot rank by such words
-/// anyway. It cannot separate the wanted articles
-/// from the
-/// rest, and BM25 - whose IDF already down-weights it - still floods the
-/// query with its huge postlist. This is the language-agnostic replacement
-/// for a stopword list: no hand-picked list works across languages, while
-/// the >8% document-frequency rule is computed from the archive itself and
-/// drops exactly the background vocabulary of whatever language(s) the
-/// archive is written in (measured on the benchmarks: EN the/of/and at
-/// 59/63/56% of md1m, FR de/la/un/du at 71-79% of fr.zim, but also
-/// mid-frequency words like EN "work" 25% or FR "faire" 44% that contribute
-/// no discrimination to a BM25 OR). 0.08 (69a6c2c set 0.1) is measured, not
-/// guessed: on the EN top-1M corpus (1,774,450 docs) the 8% line drops the
-/// last flood words - "how" (9.8% of the archive), "engin" (8.2%) - whose
-/// ~150k-doc postlists flooded the BM25 OR at 0.1, while it keeps the
-/// mid-frequency discriminators ("data" 6.4%, "roman" 6.5%) that make the
-/// cleaned rare bands rank the right articles (benchmark stage 9 measured
-/// 0.08 as the maximum of the sweep around it; 0.05 and 0.03 measured lower
-/// or equal). The title tier keeps every word -
-/// the filter is fulltext-only (see [`fulltext_query`]).
-const FT_WORD_MAX_DF_FRAC: f64 = 0.08;
-
 /// One search result.
 #[derive(Serialize, JsonSchema, Debug)]
 pub struct SearchHit {
@@ -187,18 +155,13 @@ impl Stemmer {
 }
 
 /// One archive's view of a query (see [`search`]): the archive's stemmer,
-/// the query's words stemmed with it, and the resolved stemmer language.
-/// All of it depends on the archive's language - libzim builds each
-/// archive's embedded index with the stemmer chosen from the archive's
-/// `Language` metadata, so querying a French archive with an English
-/// stemmer finds nothing (and vice versa). The fulltext query is built per
-/// archive too ([`fulltext_query`], inside the search's pool closure): the
-/// words it keeps are decided by the archive's own document frequencies.
+/// the query's words stemmed with it, and the archive-language parse of
+/// the query. All of it depends on the archive's language - libzim builds
+/// each archive's embedded index with the stemmer chosen from the
+/// archive's `Language` metadata, so querying a French archive with an
+/// English stemmer finds nothing (and vice versa).
 struct ArchiveQuery {
     stemmer: Stemmer,
-    /// The archive's resolved stemmer language (see `build`): the stemmer
-    /// was created with it, and so is the fulltext query's parser.
-    language: String,
     /// Folded stems of the query's words (deduped, first-occurrence
     /// order): the hit previews' paragraph matching, scored against the
     /// archive's full-text vocabulary.
@@ -211,18 +174,16 @@ struct ArchiveQuery {
     /// TermGenerator. The words are already lowercase (the fold
     /// lowercases; see `search`).
     title_text: String,
-    /// The folded query's whitespace tokens, as written (see `search`):
-    /// the fulltext query is parsed from the KEPT ones (see
-    /// [`FT_WORD_MAX_DF_FRAC`], [`fulltext_query`]). Tokens, not the title
-    /// tier's per-word split (`title_text`), because these reach the
-    /// parser as written and the fulltext index is stemmed (`STEM_ALL`) -
-    /// "notre-dame" must reach it whole so the parser's own
-    /// tokenization/stemming applies to its parts.
-    ft_words: Vec<String>,
-    /// The stems of `ft_words`' alphanumeric-only forms, same order: the
-    /// df filter's lookup keys (the index's terms are folded Porter2
-    /// stems of such forms).
-    ft_stems: Vec<String>,
+    /// The fulltext tier's parsed query ([`fulltext_query`]): EVERY one of
+    /// the folded query's whitespace tokens (see `search`), parsed by the
+    /// archive-language QueryParser. Tokens, not the title tier's per-word
+    /// split (`title_text`), because these reach the parser as written and
+    /// the fulltext index is stemmed (`STEM_ALL`) - "notre-dame" must
+    /// reach it whole so the parser's own tokenization/stemming applies to
+    /// its parts. `None` when the query has no tokens at all (an
+    /// all-punctuation query): the caller skips the band, as
+    /// [`title_query`]'s `None` skips the title band.
+    ft_query: Option<Query>,
 }
 
 impl ArchiveQuery {
@@ -251,96 +212,35 @@ impl ArchiveQuery {
                 terms.push(stemmed);
             }
         }
-        // The fulltext tier's filterable words: the folded query's tokens
-        // as written, each paired with the stem of its alphanumeric-only
-        // form - the df filter's lookup key (see `fulltext_query`). The
-        // bare form is deliberately FUSED (non-alphanumeric characters
-        // stripped, not split): it is not meant to be a term of the index
-        // but a conservative key. A fused hyphenated compound like
-        // "notre-dame" -> "notredame" is a word no document text contains
-        // (the indexer splits on non-alphanumeric characters, exactly like
-        // the title tier's QueryParser parse), so its df measures 0 and
-        // the filter always keeps the token - hyphenated compounds are
-        // discriminative, and the QueryParser splits the token as written
-        // anyway. The pathological
-        // shape is a fused form colliding with a common standalone word
-        // ("u.s." -> "us", the df of the ordinary word "us"): such a token
-        // can be dropped from the FULLTEXT query though its parts are rare
-        // - accepted, as the loss is one OR term (the title tier still
-        // carries every split word, and BM25 ranks whatever remains). A
-        // punctuation-only token ("-", "!" ... after the fold) has no
-        // alphanumeric form; its empty stem matches nothing, df 0, and the
-        // token is kept - the parser sees it, as it did before the filter
-        // existed.
-        let mut ft_words: Vec<String> = Vec::new();
-        let mut ft_stems: Vec<String> = Vec::new();
-        for token in query.split_whitespace() {
-            let bare: String = token
-                .chars()
-                .filter(|c| c.is_alphanumeric())
-                .collect::<String>()
-                .to_lowercase();
-            let stem = if bare.is_empty() {
-                String::new()
-            } else {
-                stemmer.stem_folded(&bare).to_string()
-            };
-            ft_words.push(token.to_string());
-            ft_stems.push(stem);
-        }
-        Ok(Self { stemmer, language, terms, title_text, ft_words, ft_stems })
+        // The fulltext tier parses EVERY token of the folded query, as
+        // written (see `fulltext_query`): a punctuation-only token ("-",
+        // "!" ... after the fold) reaches the parser too, as it always
+        // did.
+        let ft_words: Vec<String> = query.split_whitespace().map(str::to_string).collect();
+        let ft_query = fulltext_query(&ft_words, &language)?;
+        Ok(Self { stemmer, terms, title_text, ft_query })
     }
 }
 
 /// The fulltext query of one archive: `words` (the folded query's
-/// whitespace tokens, as written) minus background vocabulary, joined by
-/// single spaces and parsed by the QueryParser exactly as the whole query
-/// was parsed before the filter existed (the archive-language stemmer,
-/// `STEM_ALL`, default op OR).
+/// whitespace tokens, as written) joined by single spaces and parsed by
+/// the QueryParser (the archive-language stemmer, `STEM_ALL`, default op
+/// OR) - a plain BM25 OR over ALL the query words, whose IDF already
+/// down-weights the merely common ones. The query is per archive only
+/// because the parser's stemmer language is (see [`ArchiveQuery`]).
 ///
-/// A word whose document frequency in THIS archive's fulltext index is more
-/// than `ft_max_df` of the archive's document count is dropped: a word
-/// occurring in more than that fraction of the documents is background
-/// vocabulary ("the", French "de" - but also mid-frequency words like EN
-/// "work" 25% or FR "faire" 44%), not a query discriminator. Production
-/// passes [`FT_WORD_MAX_DF_FRAC`]; the tests pass explicit fractions (or
-/// infinity - never drop). The
-/// dfs come off the archive's own
-/// fulltext handle (`Database::doc_count` + `Database::termfreq` on the
-/// STEMS in `stems` - the index's terms are folded Porter2 stems), so the
-/// kept set differs per archive: the query is per archive in a second way
-/// (the stemmer language was the first). That is also why the parse happens
-/// here, inside `search`'s pool closure, instead of in
-/// `ArchiveQuery::build` - the handle exists only there.
+/// Returns `None` when there are no words to parse (an all-punctuation
+/// query): the caller skips the fulltext band, and the exact/title tiers
+/// serve the results.
 ///
-/// Returns `None` when EVERY word is dropped (the query "the" against an
-/// archive where "the" is 59% of the documents): the caller skips the
-/// fulltext band, and the exact/title tiers serve the results.
-///
-/// What is lost: the raw query's boolean syntax. The kept words are
-/// lowercased query words, so AND/OR/NOT/parentheses reach the parser as
-/// ordinary words - and the ultra-common operator words are usually dropped
-/// by the 10% rule anyway. (Uppercase operators had already lost their case
-/// to the accent fold - Xapian's operator keywords are case-sensitive, so
-/// "AND" has been an ordinary word on this tier since c8fb6d4; the filter
-/// only adds the drop.) Quotes were already stripped (see `search`).
-fn fulltext_query(
-    words: &[String],
-    stems: &[String],
-    language: &str,
-    fulltext: &xapian2::Database,
-    ft_max_df: f64,
-) -> Result<Option<Query>, ToolError> {
-    let doc_count = fulltext.doc_count();
-    let kept: Vec<&str> = words
-        .iter()
-        .zip(stems)
-        // Not MORE than the fraction of the archive: kept. Exactly at the
-        // threshold can still discriminate.
-        .filter(|(_, stem)| fulltext.termfreq(stem) as f64 <= ft_max_df * doc_count as f64)
-        .map(|(word, _)| word.as_str())
-        .collect();
-    if kept.is_empty() {
+/// What is lost: the raw query's boolean syntax. The words are lowercased
+/// query words, so AND/OR/NOT/parentheses reach the parser as ordinary
+/// words. (Uppercase operators had already lost their case to the accent
+/// fold - Xapian's operator keywords are case-sensitive, so "AND" has been
+/// an ordinary word on this tier since c8fb6d4.) Quotes were already
+/// stripped (see `search`).
+fn fulltext_query(words: &[String], language: &str) -> Result<Option<Query>, ToolError> {
+    if words.is_empty() {
         return Ok(None);
     }
     // openZIM's full-text indexes contain unprefixed, accent-folded
@@ -355,7 +255,7 @@ fn fulltext_query(
     qp.set_stemming_strategy(StemStrategy::All)?;
     qp.set_default_op(Operator::Or)?;
     let xquery = qp
-        .parse_query(&kept.join(" "))
+        .parse_query(&words.join(" "))
         .map_err(|e| ToolError::InvalidArgument(format!("failed to parse query: {e}")))?;
     Ok(Some(xquery))
 }
@@ -374,24 +274,6 @@ fn path_title(path: &str) -> String {
 /// Search all articles in all ZIM files of the library - the pipeline behind
 /// the `zim_search` tool: ranked hits, best first.
 pub fn search(library: &ZimLibrary, query: &str) -> Result<SearchResults, ToolError> {
-    search_with(library, query, FT_WORD_MAX_DF_FRAC)
-}
-
-/// [`search`] with the fulltext word-drop threshold passed EXPLICITLY
-/// instead of read from [`FT_WORD_MAX_DF_FRAC`]: the test/internal entry
-/// point that keeps the test suite independent of the production constant.
-/// The e2e fixtures are natural small archives whose query words sit at high
-/// document frequencies; the tests call this with `f64::INFINITY` (no word
-/// is ever dropped) - or with a chosen fraction when the
-/// background-vocabulary drop itself is the behavior under test. Production
-/// policy (the value of [`FT_WORD_MAX_DF_FRAC`]) stays with `search`, is
-/// verified by the benchmarks, and is unit-tested by the white-box gate
-/// test with explicit fractions - no fixture is tuned to it.
-pub(crate) fn search_with(
-    library: &ZimLibrary,
-    query: &str,
-    ft_max_df: f64,
-) -> Result<SearchResults, ToolError> {
     if query.trim().is_empty() {
         return Err(ToolError::InvalidArgument("query must not be empty".into()));
     }
@@ -404,12 +286,11 @@ pub(crate) fn search_with(
     // quote-stripped query, and the SAME folded string serves every tier:
     // `ArchiveQuery::build` tokenizes both tiers' words from it, so
     // accented words reach Xapian's stemmer in the index's folded form
-    // ("révolution" -> "revolution"). The full-text tier parses the KEPT
-    // words per archive (see `fulltext_query`) - background vocabulary is
-    // an archive-local judgment, made on the archive's own document
-    // frequencies inside the pool closure below. The exact title/URL probe
-    // still gets the raw query - article paths and directory titles carry
-    // their accents ("C/Université").
+    // ("révolution" -> "revolution"). The full-text tier parses the same
+    // tokens per archive (see `fulltext_query`): the parser's stemmer is
+    // the archive's language. The exact title/URL probe still gets the raw
+    // query - article paths and directory titles carry their accents
+    // ("C/Université").
     let folded_query = fold_accents(&query.replace('"', " "));
 
     // Which tier produced a hit. Exact and title-tier hits are title
@@ -467,13 +348,11 @@ pub(crate) fn search_with(
     // queries are the one-word AND. The band is skipped for archives
     // without a title index and queries with no usable words.
     //
-    // Tier 3 - the full-text tier is the parsed query over the KEPT words:
-    // plain BM25 OR, after words matching more than 10% of the archive's
-    // documents were dropped as background vocabulary (`FT_WORD_MAX_DF_FRAC`,
-    // `fulltext_query` - the language-agnostic replacement for a stopword
-    // list). BM25's IDF still down-weights the merely common words, and no
-    // all-words AND branch is layered on top (both deleted in e98568c - the
-    // hand-rolled AND double-counted every document that matched it).
+    // Tier 3 - the full-text tier is the parsed query over ALL the query
+    // words: plain BM25 OR (`fulltext_query`). BM25's IDF still
+    // down-weights the merely common words, and no all-words AND branch is
+    // layered on top (deleted in e98568c - the hand-rolled AND
+    // double-counted every document that matched it).
     let mut title_lists: Vec<(&Arc<Archive>, Vec<(String, String)>)> = Vec::new();
     // Full-text tier: (weight, path, title from the index).
     let mut per_archive: Vec<(&Arc<Archive>, Vec<(f64, String, String)>)> = Vec::new();
@@ -514,20 +393,15 @@ pub(crate) fn search_with(
                 }
             }
 
-            // The full-text tier: plain BM25 over the parsed query, built
-            // HERE inside the pool closure because the background-vocabulary
-            // filter reads the archive's own fulltext index (document
-            // frequencies - see `fulltext_query`). `None` - every query word
-            // is background vocabulary on THIS archive ("the" at 59% of
-            // md1m) - skips the band: the exact/title tiers still serve
-            // results.
-            let Some(xquery) =
-                fulltext_query(&query_state.ft_words, &query_state.ft_stems, &query_state.language, &h.fulltext, ft_max_df)?
-            else {
+            // The full-text tier: plain BM25 over the parsed query (see
+            // `fulltext_query`, built with `ArchiveQuery::build`). `None` -
+            // the query has no words at all - skips the band: the
+            // exact/title tiers still serve results.
+            let Some(xquery) = &query_state.ft_query else {
                 return Ok((title_list, Vec::new()));
             };
             let mut enquire = Enquire::new(&h.fulltext)?;
-            enquire.set_query(&xquery)?;
+            enquire.set_query(xquery)?;
             enquire.set_sort_by_relevance();
             let mset = enquire.get_mset(0, SEARCH_LIMIT, 0)?;
             let mut list = Vec::with_capacity(mset.size() as usize);
@@ -949,22 +823,12 @@ Glaciers move under their own weight. The flow is slower than a river. \
 Meltwater streams out of the ice.
 ";
 
-    /// Run a search through the threshold-agnostic entry point: `search_with`
-    /// with the fulltext word-drop threshold at INFINITY - no word is ever
-    /// dropped, so no fixture needs its query words' document frequencies
-    /// kept under the production constant (every fixture below is its
-    /// natural small shape). The tool layer itself (`ZimSearchTool`) is
-    /// exercised where the threshold cannot matter: the empty-query
-    /// validation test below.
+    /// Run a search through the tool's server: the whole pipeline behind
+    /// `zim_search`, hits in rank order. The tool layer itself
+    /// (`ZimSearchTool`) is exercised by the empty-query validation test
+    /// below.
     fn search(server: &ZimMcpServer, query: &str) -> Vec<SearchHit> {
-        search_ft(server, query, f64::INFINITY)
-    }
-
-    /// [`search`] with an EXPLICIT fulltext word-drop threshold (see
-    /// `search_with`): the drop-path e2e passes a chosen fraction, the
-    /// generic helper passes INFINITY.
-    fn search_ft(server: &ZimMcpServer, query: &str, ft_max_df: f64) -> Vec<SearchHit> {
-        search_with(&server.library, query, ft_max_df).unwrap().results
+        super::search(&server.library, query).unwrap().results
     }
 
     /// Build a single-file glass Xapian index, the way openZIM does: the
@@ -1244,190 +1108,6 @@ Meltwater streams out of the ice.
             "La Révolution française éclate en 1789. La monarchie est renversée et la république proclamée."
         );
         assert_eq!(hits[0].sections, None);
-    }
-
-    /// The fulltext tier's background-vocabulary filter ([`fulltext_query`]),
-    /// white-box with EXPLICIT fractions: a word in MORE than the given
-    /// fraction of the archive's documents is dropped from the parsed
-    /// fulltext query, a word at exactly the fraction is kept (the boundary
-    /// is "not MORE than"), and a query of ONLY background words yields
-    /// `None` (the caller skips the band; exact/title still serve results).
-    /// The production fraction (0.08) is among the cases - read as a literal
-    /// here, never from [`FT_WORD_MAX_DF_FRAC`], so the gate logic stays
-    /// tested whatever the constant becomes. Fixture via the raw
-    /// `WritableDatabase` (the same shape `make_index` builds): 10 documents,
-    /// "commonword" in 6 (60%), "halfword" in 5 (50%), "middling" in 2 (20%),
-    /// "rarea"/"rareb" in one each (10%). The terms are the STEMS - what the
-    /// filter looks up (the index's terms are folded Porter2 stems) and what
-    /// the STEM_ALL parser produces.
-    #[test]
-    fn fulltext_query_drops_words_over_the_given_fraction() {
-        let mut stemmer = Stemmer::new(&resolve_stem_language("en")).unwrap();
-        let s_common = stemmer.stem_folded("commonword").to_string();
-        let s_half = stemmer.stem_folded("halfword").to_string();
-        let s_rarea = stemmer.stem_folded("rarea").to_string();
-        let s_rareb = stemmer.stem_folded("rareb").to_string();
-        let s_middling = stemmer.stem_folded("middling").to_string();
-        let dir = tempfile::tempdir().unwrap();
-        let db_dir = dir.path().join("db");
-        {
-            let mut wdb = WritableDatabase::create(&db_dir).unwrap();
-            for i in 0..10 {
-                let mut doc = Document::new().unwrap();
-                doc.set_data(format!("C/D{i}")).unwrap();
-                if i < 6 {
-                    doc.add_term(&s_common, 1).unwrap();
-                }
-                if i < 5 {
-                    doc.add_term(&s_half, 1).unwrap();
-                }
-                if i == 6 {
-                    doc.add_term(&s_rarea, 1).unwrap();
-                }
-                if i == 7 {
-                    doc.add_term(&s_rareb, 1).unwrap();
-                }
-                if i >= 8 {
-                    doc.add_term(&s_middling, 1).unwrap();
-                }
-                wdb.add_document(&doc).unwrap();
-            }
-            wdb.commit().unwrap();
-        }
-        let db = xapian2::Database::open(&db_dir).unwrap();
-        assert_eq!(db.doc_count(), 10);
-
-        // Run a built query and return the matched documents' paths, sorted.
-        let matches = |q: &Query| -> Vec<String> {
-            let mut enquire = Enquire::new(&db).unwrap();
-            enquire.set_query(q).unwrap();
-            enquire.set_sort_by_relevance();
-            let mset = enquire.get_mset(0, 10, 0).unwrap();
-            let mut out = Vec::new();
-            for j in 0..mset.size() {
-                out.push(mset.document(j).unwrap().data_str().unwrap());
-            }
-            out.sort();
-            out
-        };
-        let words = |ws: &[&str]| ws.iter().map(|w| w.to_string()).collect::<Vec<String>>();
-        let query = |ws: &[&str], stems: &[String], ft_max_df: f64| {
-            fulltext_query(&words(ws), stems, "en", &db, ft_max_df)
-        };
-
-        // The PRODUCTION fraction 0.08 on this 10-document fixture: every
-        // indexed word (10%-60%) is over it, so even the single rare word is
-        // dropped - and a query of ONLY dropped words yields no fulltext
-        // query at all (the band is skipped; exact/title still serve).
-        let q = query(&["commonword", "rarea"], &[s_common.clone(), s_rarea.clone()], 0.08)
-            .unwrap();
-        assert!(q.is_none());
-        let q = query(&["rarea"], &[s_rarea.clone()], 0.08).unwrap();
-        assert!(q.is_none());
-
-        // Exactly AT the fraction is kept (the boundary is "not MORE than"):
-        // "rarea" sits in 10% of the documents, threshold 0.1. The 60% word
-        // is dropped, so the parsed query matches ONLY the rarea document
-        // (the unfiltered OR would match 7).
-        let q = query(&["commonword", "rarea"], &[s_common.clone(), s_rarea.clone()], 0.1)
-            .unwrap()
-            .unwrap();
-        assert_eq!(matches(&q), vec!["C/D6"]);
-
-        // Just OVER the fraction is dropped: "halfword" sits in 50% of the
-        // documents, threshold 0.49 (under the first 0.5 constant this was
-        // the kept boundary case) - all words dropped, no query.
-        let q = query(&["halfword"], &[s_half.clone()], 0.49).unwrap();
-        assert!(q.is_none());
-
-        // At 0.5 exactly, "halfword" is kept while the 60% word stays
-        // dropped: the parsed OR matches the halfword documents only.
-        let q = query(&["commonword", "halfword"], &[s_common.clone(), s_half.clone()], 0.5)
-            .unwrap()
-            .unwrap();
-        assert_eq!(matches(&q), vec!["C/D0", "C/D1", "C/D2", "C/D3", "C/D4"]);
-
-        // 20% with threshold 0.1: just over, dropped - while both 10% words
-        // stay (exactly at) and the parsed OR matches only their documents.
-        let q = query(
-            &["middling", "rarea", "rareb"],
-            &[s_middling.clone(), s_rarea.clone(), s_rareb.clone()],
-            0.1,
-        )
-        .unwrap()
-        .unwrap();
-        assert_eq!(matches(&q), vec!["C/D6", "C/D7"]);
-
-        // Both rare words kept: the OR matches both.
-        let q = query(&["rarea", "rareb"], &[s_rarea.clone(), s_rareb.clone()], 0.1)
-            .unwrap()
-            .unwrap();
-        assert_eq!(matches(&q), vec!["C/D6", "C/D7"]);
-
-        // EVERY word is background vocabulary: no fulltext query at all.
-        let q = query(&["commonword"], &[s_common.clone()], 0.1).unwrap();
-        assert!(q.is_none());
-    }
-
-    /// The ONE e2e covering the background-vocabulary drop through the whole
-    /// search flow, threshold-INSENSITIVELY: one term sits in EVERY document
-    /// of the fixture (df = 100%, over any threshold below 1.0) and the
-    /// search runs with an EXPLICIT fraction (0.5), so this test survives
-    /// any future change of [`FT_WORD_MAX_DF_FRAC`]. The all-document word
-    /// is dropped and the results are driven by the rare words alone: each
-    /// "ubiquitous <rare>" query matches only its rare-word document, and
-    /// the ubiquitous word alone empties the band (no hits, no error - the
-    /// exact tier has nothing to serve on this fixture either).
-    #[test]
-    fn e2e_search_drops_all_document_word_by_explicit_threshold() {
-        let dir = tempfile::tempdir().unwrap();
-        // The index carries the STEMS the query parser produces (computed
-        // here the way make_index callers precompute them).
-        let mut stemmer = Stemmer::new(&resolve_stem_language("en")).unwrap();
-        let everywhere = stemmer.stem_folded("ubiquitous").to_string();
-        let alpha = stemmer.stem_folded("alpha").to_string();
-        let beta = stemmer.stem_folded("beta").to_string();
-        let gamma = stemmer.stem_folded("gamma").to_string();
-        let alpha_terms = format!("{everywhere} {alpha} first");
-        let beta_terms = format!("{everywhere} {beta} second");
-        let gamma_terms = format!("{everywhere} {gamma} third");
-        let index = make_index(&[
-            ("C/Alpha", alpha_terms.as_str(), "Alpha"),
-            ("C/Beta", beta_terms.as_str(), "Beta"),
-            ("C/Gamma", gamma_terms.as_str(), "Gamma"),
-        ]);
-        let html: &'static [u8] = b"<html><body><h1>Word</h1><p>Body text.</p></body></html>";
-        let content = [
-            TestEntry { namespace: b'C', url: "Alpha", title: "Alpha", mime: 0, body: html },
-            TestEntry { namespace: b'C', url: "Beta", title: "Beta", mime: 0, body: html },
-            TestEntry { namespace: b'C', url: "Gamma", title: "Gamma", mime: 0, body: html },
-        ];
-        let bytes = build_archive(&["text/html"], &content, &[], 0, Some(&index));
-        std::fs::write(dir.path().join("test.zim"), &bytes).unwrap();
-        let library = Arc::new(ZimLibrary::scan(dir.path()).unwrap());
-        assert!(library.archives[0].searchable());
-        let server = ZimMcpServer::new(library);
-
-        // "ubiquitous" is in EVERY document (df 100% > 0.5): dropped. Each
-        // rare word is kept and drives the results: exactly its own
-        // document comes back (the dropped word matches nothing, and the
-        // unfiltered OR would have matched all three).
-        let hits = search_ft(&server, "ubiquitous alpha", 0.5);
-        assert_eq!(hits.len(), 1, "{hits:?}");
-        assert_eq!(hits[0].path, "C/Alpha");
-        let hits = search_ft(&server, "ubiquitous gamma", 0.5);
-        assert_eq!(hits.len(), 1, "{hits:?}");
-        assert_eq!(hits[0].path, "C/Gamma");
-
-        // Every word dropped ("ubiquitous" alone): the fulltext band is
-        // skipped - empty results, no error.
-        let hits = search_ft(&server, "ubiquitous", 0.5);
-        assert!(hits.is_empty(), "{hits:?}");
-
-        // With no dropping (INFINITY) the same query matches all three
-        // documents - the drop is what the threshold does.
-        let hits = search_ft(&server, "ubiquitous alpha", f64::INFINITY);
-        assert_eq!(hits.len(), 3, "{hits:?}");
     }
 
     #[test]
@@ -2184,8 +1864,8 @@ Meltwater streams out of the ice.
         // document that matched it) for this; BM25 does it alone.
         let dir = tempfile::tempdir().unwrap();
         // The repeated "filler" term pads document LENGTH (BM25 length
-        // normalization), not df: it is no query word, so the drop threshold
-        // is irrelevant to it.
+        // normalization); it is no query word, so it plays no part in the
+        // query's OR.
         let cherry_terms = format!("{}{}", "cherri ".repeat(30), "filler ".repeat(400));
         let pie_terms = format!("{}{}", "pie ".repeat(30), "filler ".repeat(400));
         let index = make_index(
