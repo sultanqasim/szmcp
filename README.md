@@ -69,7 +69,10 @@ Such files are also more space efficient on disk. I made a Python
   paragraph) together with `sections` (the matching regions' names, the
   intro listed as `_intro`). `sections` is omitted when the query matches
   the title or the first intro paragraph. The same article is reported once
-  even when several spellings of it match.
+  even when several spellings of it match. Deduplication is within an
+  archive only: the same title in different archives is reported once per
+  archive, since different archives can hold different articles under one
+  title.
   Use `zim` + `path` with `zim_get`/`zim_get_section`.
 - **`zim_get`** — get the full content of an article/page/object. Arguments:
   the ZIM file name and the article path — or an article title such as

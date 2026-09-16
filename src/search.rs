@@ -408,15 +408,16 @@ pub fn search(library: &ZimLibrary, query: &str) -> Result<SearchResults, ToolEr
 
     // Resolve every candidate to its terminal entry before dedupe, then
     // dedupe on that identity: the same article must never appear twice no
-    // matter how many tiers and redirect spellings reach it. Within one
-    // archive the identity is the terminal path (title-index redirect
-    // documents carry their OWN title in value slot 0, so keying on the
-    // index title reported one article under several titles); across
-    // archives, the same article published twice (HTML and Markdown
-    // editions) shares a title but not a path. The reported title is the
-    // terminal entry's directory title, else the index title, else derived
-    // from the terminal path. Resolution failures keep the raw path.
-    let mut seen_titles = std::collections::HashSet::new();
+    // matter how many tiers and redirect spellings reach it. The identity
+    // is the archive together with the terminal path: within one archive
+    // the terminal path is the article (title-index redirect documents
+    // carry their OWN title in value slot 0, and several redirect
+    // spellings collapse onto one terminal path). Titles never dedupe
+    // across archives: different archives may hold different articles
+    // under the same title, so each archive's copy is reported on its
+    // own. The reported title is the terminal entry's directory title,
+    // else the index title, else derived from the terminal path.
+    // Resolution failures keep the raw path.
     let mut seen_paths = std::collections::HashSet::new();
     merged = merged
         .into_iter()
@@ -430,10 +431,6 @@ pub fn search(library: &ZimLibrary, query: &str) -> Result<SearchResults, ToolEr
             } else {
                 path_title(&path)
             };
-            let title_key = if title.is_empty() { path.clone() } else { title.clone() };
-            if !seen_titles.insert(html::normalize(&title_key)) {
-                return None;
-            }
             if !seen_paths.insert((Arc::as_ptr(arc) as usize, path.clone())) {
                 return None;
             }
@@ -1982,7 +1979,7 @@ Scientists measure the flow from observatories.
         assert_eq!(hits[0].sections, None);
         assert!(hits[0].preview.contains("cherry is the fruit"), "{:?}", hits[0].preview);
     }    #[test]
-    fn e2e_search_interleaves_archives_and_dedupes() {
+    fn e2e_search_interleaves_archives_and_dedupes_within_archives() {
         let dir = tempfile::tempdir().unwrap();
         // Two archives; both carry an "Apple" article (same article, as in an
         // HTML and a Markdown edition of the same ZIM), plus one exclusive
@@ -2012,11 +2009,13 @@ Scientists measure the flow from observatories.
         assert_eq!(library.archives.len(), 2);
         let server = ZimMcpServer::new(library);
 
-        // The article present in both archives is reported exactly once.
+        // The same title in both archives is NOT deduped across archives:
+        // different archives may hold different articles under one title,
+        // so each archive's copy is reported (library order first).
         let hits = search(&server, "apple");
-        assert_eq!(hits.len(), 1, "{hits:?}");
-        assert_eq!(hits[0].zim, "a.zim");
-        assert_eq!(hits[0].path, "C/Apple");
+        assert_eq!(hits.len(), 2, "{hits:?}");
+        assert_eq!((hits[0].zim.as_str(), hits[0].path.as_str()), ("a.zim", "C/Apple"));
+        assert_eq!((hits[1].zim.as_str(), hits[1].path.as_str()), ("b.zim", "C/Apple"));
 
         // Distinct matches interleave: the best match of each archive first.
         let hits = search(&server, "banana cherry");
