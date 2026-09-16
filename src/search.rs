@@ -11,7 +11,8 @@ use schemars::JsonSchema;
 use serde::Serialize;
 use std::sync::Arc;
 use xapian2::{
-    resolve_stem_language, Enquire, Operator, Query, QueryParser, Stem, StemStrategy,
+    resolve_stem_language, Document, Enquire, Operator, Query, QueryParser, Stem, StemStrategy,
+    WritableDatabase,
 };
 
 /// Number of results `zim_search` returns in total (across all archives).
@@ -24,6 +25,14 @@ const HIT_READ_BYTES: u64 = 1024 * 1024;
 /// Cap on one paragraph's characters while scanning it for matches; a
 /// paragraph chosen for reporting is truncated to `INTRO_CHARS` separately.
 const PARA_MATCH_CHARS: usize = 2000;
+/// Relative BM25 threshold for the `sections` of a fulltext hit: a region
+/// is reported when its BM25 score for the hit's full-text query is at
+/// least this fraction of the article's best-scoring region. 0.4 keeps
+/// every region within 2.5x of the leader - a region that merely grazes one
+/// common query word scores far below that next to the region carrying the
+/// rare words, so grazing regions drop out instead of flooding the report,
+/// while every region with real substance survives.
+const SECTION_MIN_SCORE_FRAC: f64 = 0.4;
 /// One search result.
 #[derive(Serialize, JsonSchema, Debug)]
 pub struct SearchHit {
@@ -38,8 +47,9 @@ pub struct SearchHit {
     /// above
     pub preview: String,
     /// Regions holding query matches (`_intro` first when it matched, then
-    /// sections in document order); absent when the query matches the title
-    /// or the first intro paragraph
+    /// sections in document order), BM25-ranked against the query with the
+    /// best-scoring regions kept; absent when the query matches the title
+    /// or no region matches any query word
     #[serde(skip_serializing_if = "Option::is_none")]
     pub sections: Option<Vec<String>>,
 }
@@ -142,7 +152,8 @@ impl Stemmer {
 struct ArchiveQuery {
     stemmer: Stemmer,
     /// Folded stems of the query's words (deduped, first-occurrence order):
-    /// drive the hit previews' paragraph matching.
+    /// the terms the per-hit section index receives the within-region
+    /// frequencies of.
     terms: Vec<String>,
     /// The title tier's query text: the folded query with every
     /// non-alphanumeric character mapped to a space, so the QueryParser
@@ -153,8 +164,9 @@ struct ArchiveQuery {
     /// The fulltext tier's parsed query ([`fulltext_query`]): every
     /// whitespace token of the folded query, as written - tokens, not
     /// `title_text`'s per-word split, because the fulltext index is stemmed
-    /// (`STEM_ALL`) and "notre-dame" must reach the parser whole. `None`
-    /// for an all-punctuation query: the caller skips the band.
+    /// (`STEM_ALL`) and "notre-dame" must reach the parser whole. Also the
+    /// query scored against each fulltext hit's section index. `None` for
+    /// an all-punctuation query: the caller skips the band.
     ft_query: Option<Query>,
 }
 
@@ -444,8 +456,9 @@ pub fn search(library: &ZimLibrary, query: &str) -> Result<SearchResults, ToolEr
         // Markdown editions carry plain Markdown, not HTML: pick the matching
         // splitter so the paragraphs and section names are free of markup.
         let is_markdown = mime.as_deref().is_some_and(|m| m.contains("markdown"));
-        // Paragraph matching uses the hit's archive stemmer and terms (the
-        // archive is always from the library, so the lookup cannot fail).
+        // Section scoring runs the hit archive's own full-text query and its
+        // stemmer (the archive is always from the library, so the lookup
+        // cannot fail).
         let qi = library
             .archives
             .iter()
@@ -455,10 +468,11 @@ pub fn search(library: &ZimLibrary, query: &str) -> Result<SearchResults, ToolEr
         let (preview, sections) = hit_preview(
             &article,
             &query_state.terms,
-            title_match,
             &mut query_state.stemmer,
+            query_state.ft_query.as_ref(),
+            title_match,
             is_markdown,
-        );
+        )?;
         hits.push(SearchHit {
             zim: arc.name.clone(),
             path: path.clone(),
@@ -470,35 +484,133 @@ pub fn search(library: &ZimLibrary, query: &str) -> Result<SearchResults, ToolEr
     Ok(SearchResults { results: hits })
 }
 
-/// How many of `text`'s word occurrences are query terms (stemmed the same
-/// way the index and the query are; every query term counts, as in BM25).
-fn para_matches(text: &str, terms: &[String], stem: &mut Stemmer) -> usize {
-    text.split(|c: char| !c.is_alphanumeric())
-        .filter(|w| !w.is_empty())
-        .filter(|w| terms.iter().any(|t| t == stem.stem(w)))
-        .count()
+/// The `sections` selection from the regions' BM25 scores (`names` and
+/// `scores` are parallel vectors in document order, `_intro` first): every
+/// region scoring at least `min_frac` of the article's best region score is
+/// reported, in document order. Regions matching nothing score 0 and never
+/// qualify. A best score of 0 means no region matched any query word:
+/// nothing is reported. When scores exist but none clears the bar, the
+/// single best-scoring region is still reported - the least-bad fallback
+/// that keeps a hit that matched from losing its sections to a too-strict
+/// threshold.
+fn scored_sections(names: &[String], scores: &[f64], min_frac: f64) -> Option<Vec<String>> {
+    let best = scores.iter().cloned().fold(0.0, f64::max);
+    if best <= 0.0 {
+        return None;
+    }
+    let threshold = best * min_frac;
+    let kept: Vec<String> = names
+        .iter()
+        .zip(scores)
+        .filter(|(_, score)| **score >= threshold)
+        .map(|(name, _)| name.clone())
+        .collect();
+    if !kept.is_empty() {
+        return Some(kept);
+    }
+    let (best_index, _) = scores
+        .iter()
+        .enumerate()
+        .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
+        .expect("best > 0 requires at least one score");
+    Some(vec![names[best_index].clone()])
 }
 
-/// Whether every query term occurs (stemmed) somewhere in `text`'s words.
-fn covers_all_terms(text: &str, terms: &[String], stem: &mut Stemmer) -> bool {
-    let mut covered = vec![false; terms.len()];
-    let mut left = terms.len();
-    for word in text.split(|c: char| !c.is_alphanumeric()) {
-        if word.is_empty() {
-            continue;
-        }
-        let stemmed = stem.stem(word);
-        for (k, term) in terms.iter().enumerate() {
-            if !covered[k] && term.as_str() == stemmed {
-                covered[k] = true;
-                left -= 1;
-                if left == 0 {
-                    return true;
+/// A Xapian failure while scoring one hit's sections, with the step named.
+fn section_error(e: xapian2::Error, what: &str) -> ToolError {
+    ToolError::Internal(format!("failed to score sections ({what}): {}", e.msg()))
+}
+
+/// The padding term of a section-index document: it carries the wdf of the
+/// region's words that are not query terms, so the document's length (the
+/// wdf sum of its termlist) matches a full index of the region text. The
+/// uppercase `Q` keeps it disjoint from every query stem, which is
+/// lowercase (accents folded, see [`fold_accents`]).
+const SECTION_PAD_TERM: &str = "Qpadding";
+
+/// BM25-score every region of one article against `query` (the hit's own
+/// full-text query): the regions go into a temporary **in-memory** Xapian
+/// index, one document per region in document order (`_intro` first), the
+/// query runs against that index through an `Enquire` once it is committed,
+/// and the best score of the article decides the [`SECTION_MIN_SCORE_FRAC`]
+/// cutoff. Returns one score per region in document order, 0.0 where the
+/// region matched nothing.
+///
+/// Each region document receives exactly what the BM25 weighting consumes -
+/// the query terms' within-region frequencies and the region's document
+/// length (the termlist's wdf sum, padded through [`SECTION_PAD_TERM`]) -
+/// because the words are already at hand in the scan below, while feeding
+/// the whole region text through a TermGenerator was measured at 165 ms per
+/// 100 KB here, an order of magnitude past the scan it replaces. The scan
+/// folds and stems with the archive's own stemmer, so the terms are the
+/// unprefixed stems the ZIM full-text index carries and the parsed query's
+/// stems address; the scores are identical to a full index of the text.
+fn region_scores(
+    secs: &[(String, Vec<String>)],
+    terms: &[String],
+    stem: &mut Stemmer,
+    query: &Query,
+) -> Result<Vec<f64>, ToolError> {
+    let mut wdb = WritableDatabase::in_memory()
+        .map_err(|e| section_error(e, "create the in-memory section index"))?;
+    for (name, paras) in secs {
+        let mut doc = Document::new().map_err(|e| section_error(e, "create a document"))?;
+        doc.set_data(name.as_str())
+            .map_err(|e| section_error(e, "set a document's data"))?;
+        // One scan over the region's words: every occurrence counts toward
+        // the document length, and an occurrence of a query term adds to
+        // that term's within-document frequency.
+        let mut total = 0u32;
+        let mut wdfs = vec![0u32; terms.len()];
+        for para in paras {
+            for word in para.split(|c: char| !c.is_alphanumeric()) {
+                if word.is_empty() {
+                    continue;
+                }
+                total += 1;
+                let stemmed = stem.stem(word);
+                if let Some(i) = terms.iter().position(|t| t == stemmed) {
+                    wdfs[i] += 1;
                 }
             }
         }
+        let mut matched = 0u32;
+        for (term, wdf) in terms.iter().zip(&wdfs) {
+            if *wdf > 0 {
+                doc.add_term(term, *wdf)
+                    .map_err(|e| section_error(e, "add a term to a section document"))?;
+                matched += wdf;
+            }
+        }
+        if total > matched {
+            doc.add_term(SECTION_PAD_TERM, total - matched)
+                .map_err(|e| section_error(e, "pad a section document's length"))?;
+        }
+        wdb.add_document(&doc)
+            .map_err(|e| section_error(e, "add a region to the section index"))?;
     }
-    left == 0
+    // commit() publishes the documents to search: without it the Enquire
+    // below would see an empty index.
+    wdb.commit().map_err(|e| section_error(e, "commit the section index"))?;
+    let mut enquire =
+        Enquire::new_writable(&wdb).map_err(|e| section_error(e, "create the enquire"))?;
+    enquire
+        .set_query(query)
+        .map_err(|e| section_error(e, "set the section query"))?;
+    // One score per region: `add_document` assigned docids 1.. sequentially
+    // in document order, so a match's docid maps straight back to its
+    // region; regions absent from the MSet matched nothing and stay at 0.
+    let mset = enquire
+        .get_mset(0, secs.len() as u32, 0)
+        .map_err(|e| section_error(e, "run the section query"))?;
+    let mut scores = vec![0.0; secs.len()];
+    for i in 0..mset.size() {
+        let docid = mset.docid(i) as usize;
+        if (1..=secs.len()).contains(&docid) {
+            scores[docid - 1] = mset.weight(i);
+        }
+    }
+    Ok(scores)
 }
 
 /// Split a paragraph into sentences at `.`, `!`, `?` followed by whitespace
@@ -525,19 +637,25 @@ fn sentences(paragraph: &str) -> Vec<&str> {
 /// text (`is_markdown` picks the Markdown or the HTML splitter). The
 /// preview is the article's lead - the first intro paragraph, truncated to
 /// `INTRO_CHARS` - no matter where in the article the query matched; a
-/// title match keeps the intro's first sentence instead. A lead covering
-/// every query term (like a title match) reports no sections; otherwise
-/// every region (intro under `_intro`, then body sections) is scanned and
-/// the regions with a term match are reported as `sections`. No match at
-/// all reports no sections; empty regions give an empty preview, never a
-/// panic.
+/// title match keeps the intro's first sentence instead. The `sections` of
+/// a full-text hit are BM25-scored: the article's regions (`_intro` first,
+/// then one region per heading in document order) go into a temporary
+/// in-memory Xapian index ([`region_scores`]) that the hit's own full-text
+/// query is run against, and the regions scoring at least
+/// [`SECTION_MIN_SCORE_FRAC`] of the article's best region are reported in
+/// document order - the intro and body sections compete on equal BM25
+/// terms, so a region that merely grazes a common query word drops out
+/// while the region carrying the query's substance wins. No region matching
+/// any query word reports no sections; empty regions give an empty preview,
+/// never a panic.
 fn hit_preview(
     article: &str,
     terms: &[String],
-    title_match: bool,
     stem: &mut Stemmer,
+    ft_query: Option<&Query>,
+    title_match: bool,
     is_markdown: bool,
-) -> (String, Option<Vec<String>>) {
+) -> Result<(String, Option<Vec<String>>), ToolError> {
     let intro = if is_markdown {
         markdown::intro_paragraphs(article, PARA_MATCH_CHARS)
     } else {
@@ -557,33 +675,26 @@ fn hit_preview(
                     .map(|s| s.chars().take(INTRO_CHARS).collect::<String>())
             })
             .unwrap_or_default();
-        return (first, None);
+        return Ok((first, None));
     }
     // The preview is the lead regardless of where the query matched: the
     // old best-matching-sentence search (re-scoring every sentence of
-    // every matched paragraph) is gone. The region scan below feeds only
-    // the `sections` reporting, and it is skipped when the lead already
-    // covers every query term - those hits report no sections, as before.
-    if intro.first().is_some_and(|p| covers_all_terms(p, terms, stem)) {
-        return (lead(), None);
-    }
+    // every matched paragraph) is gone. The region index below feeds only
+    // the `sections` reporting.
+    let Some(query) = ft_query else {
+        return Ok((lead(), None));
+    };
     let secs = if is_markdown {
         markdown::sections(article, PARA_MATCH_CHARS)
     } else {
         html::sections(article, PARA_MATCH_CHARS)
     };
-    // Paragraphs are scored whole for the `sections` reporting only.
-    let mut names: Vec<String> = Vec::new();
-    for (name, paras) in &secs {
-        if paras.iter().any(|para| para_matches(para, terms, stem) > 0) {
-            names.push(name.clone());
-        }
+    if secs.is_empty() {
+        return Ok((lead(), None));
     }
-    if names.is_empty() {
-        (lead(), None)
-    } else {
-        (lead(), Some(names))
-    }
+    let scores = region_scores(&secs, terms, stem, query)?;
+    let names: Vec<String> = secs.iter().map(|(name, _)| name.clone()).collect();
+    Ok((lead(), scored_sections(&names, &scores, SECTION_MIN_SCORE_FRAC)))
 }
 
 // ---------------------------------------------------------------------------
@@ -601,7 +712,7 @@ pub(crate) mod tests {
     };
     use rmcp::handler::server::router::tool::AsyncTool;
     use std::future::Future;
-    use xapian2::{Document, WritableDatabase};
+    use xapian2::{Document, Stem, WritableDatabase};
 
     /// Await an async tool invocation (each hops to a blocking thread) from
     /// a sync `#[test]` on a tiny current-thread runtime.
@@ -921,7 +1032,10 @@ Meltwater streams out of the ice.
             hits[0].preview,
             "La Révolution française éclate en 1789. La monarchie est renversée et la république proclamée."
         );
-        assert_eq!(hits[0].sections, None);
+        // BM25 over the section index scores the intro region against the
+        // query (the lead's terms live there too), so the hit reports it -
+        // the old lead-covers-everything gate is gone.
+        assert_eq!(hits[0].sections, Some(vec!["_intro".to_string()]));
     }
 
     #[test]
@@ -1446,11 +1560,11 @@ Meltwater streams out of the ice.
         assert_eq!(hits[0].path, "C/Atmosphere", "{hits:?}");
         assert_eq!(hits[1].path, "C/Nitrogen", "{hits:?}");
         // The Atmosphere lead covers the whole query ("The atmosphere is
-        // mostly nitrogen and oxygen.") in its first paragraph: an intro
-        // match, so no sections. The Nitrogen lead only covers "nitrogen"
-        // - a partial intro match is reported like any other, as the
-        // region _intro.
-        assert_eq!(hits[0].sections, None, "{:?}", hits[0]);
+        // mostly nitrogen and oxygen.") in its first paragraph: BM25 over
+        // the section index scores the intro region (its only region) and
+        // reports it as _intro. The Nitrogen lead only covers "nitrogen" -
+        // also scored and reported as the region _intro.
+        assert_eq!(hits[0].sections, Some(vec!["_intro".to_string()]), "{:?}", hits[0]);
         assert_eq!(hits[0].preview, "The atmosphere is mostly nitrogen and oxygen.");
         assert_eq!(hits[1].sections, Some(vec!["_intro".to_string()]), "{:?}", hits[1]);
         assert_eq!(hits[1].preview, "Nitrogen is a colorless, odorless gas.");
@@ -1544,24 +1658,106 @@ Meltwater streams out of the ice.
     }
 
     #[test]
-    fn e2e_search_intro_and_section_matches_report_both() {
-        // "salt beds" matches the intro's second paragraph ("salt") and the
-        // Formation section ("Salt beds ..."): both regions are reported,
-        // _intro first, while the preview stays the article's lead.
+    fn e2e_search_on_target_section_outranks_the_intro_mention() {
+        // "salt beds" matches the intro ("salt" twice, no "beds") and the
+        // Formation section ("Salt beds ...", both words): BM25 over the
+        // section index scores Formation - the region carrying both query
+        // words - far above the intro's grazing "salt" mentions, and only
+        // Formation clears the relative bar. The preview stays the lead.
         let (server, _keep) = intro_test_server();
         let hits = search(&server, "salt beds");
         assert_eq!(hits.len(), 1, "{hits:?}");
         let hit = &hits[0];
         assert_eq!(hit.path, "C/Salt");
-        assert_eq!(
-            hit.sections,
-            Some(vec!["_intro".to_string(), "Formation".to_string()]),
-            "{hit:?}"
-        );
+        assert_eq!(hit.sections, Some(vec!["Formation".to_string()]), "{hit:?}");
         assert_eq!(
             hit.preview,
             "Salt is a mineral composed primarily of sodium chloride."
         );
+    }
+
+    /// A query whose common word ("salt") appears in every region but whose
+    /// substance ("salt mining") lives in one section: the old stem-count
+    /// scan reported every region holding any query word - the grazing
+    /// "See also" section included - while BM25 over the section index
+    /// scores the on-target region far above a lone common-word occurrence
+    /// and the grazing region drops out.
+    #[test]
+    fn e2e_search_bm25_drops_grazing_junk_sections() {
+        let dir = tempfile::tempdir().unwrap();
+        // The article's URL must not be reachable by the exact title/URL
+        // probe ("salt mining" -> "Salt_Mining" would be an exact match,
+        // styled as a title match with no sections), so the article carries
+        // a longer name.
+        let index = make_index(&[(
+            "C/Salt_Mining_Industry",
+            "salt mine anci industri extract rock deposit oper worldwid shape trade rout \
+             centuri shaker kitchen tool",
+            "Salt mining industry",
+        )]);
+        let html: &'static [u8] = "<html><body><h1>Salt mining industry</h1>\
+            <p>Salt mining is an ancient industry.</p>\
+            <h2>Overview</h2>\
+            <p>Salt mining extracts rock salt from salt deposits. Salt mines \
+            operate worldwide, and mining salt shaped trade routes for \
+            centuries.</p>\
+            <h2>See also</h2>\
+            <p>Salt shakers are kitchen tools.</p>\
+            </body></html>".as_bytes();
+        let content = [TestEntry {
+            namespace: b'C',
+            url: "Salt_Mining_Industry",
+            title: "Salt mining industry",
+            mime: 0,
+            body: html,
+        }];
+        let bytes = build_archive(&["text/html"], &content, &[], 0, Some(&index));
+        std::fs::write(dir.path().join("test.zim"), &bytes).unwrap();
+        let library = Arc::new(ZimLibrary::scan(dir.path()).unwrap());
+        assert!(library.archives[0].searchable());
+        let server = ZimMcpServer::new(library);
+
+        let hits = search(&server, "salt mining");
+        assert_eq!(hits.len(), 1, "{hits:?}");
+        let hit = &hits[0];
+        assert_eq!(hit.path, "C/Salt_Mining_Industry");
+        // The intro (both words) and the on-target Overview region are
+        // reported, in document order; "See also" - one lone "salt" - does
+        // not clear the bar.
+        assert_eq!(
+            hit.sections,
+            Some(vec!["_intro".to_string(), "Overview".to_string()]),
+            "{hit:?}"
+        );
+        let json = serde_json::to_string(hit).unwrap();
+        assert!(json.contains(r#""sections":["_intro","Overview"]"#), "{json}");
+        assert!(!json.contains("See also"), "{json}");
+    }
+
+    #[test]
+    fn scored_sections_threshold_and_least_bad_fallback() {
+        let names =
+            ["_intro".to_string(), "History".to_string(), "Trivia".to_string()];
+        // The on-topic region leads; the grazing region sits below the 0.4
+        // bar and is dropped, while the reported order stays document order
+        // (not score order).
+        let scores = [0.674, 0.837, 0.153];
+        assert_eq!(
+            scored_sections(&names, &scores, SECTION_MIN_SCORE_FRAC),
+            Some(vec!["_intro".to_string(), "History".to_string()])
+        );
+        // No region matched any query term: no sections, not even a
+        // least-bad pick.
+        assert_eq!(
+            scored_sections(&names, &[0.0, 0.0, 0.0], SECTION_MIN_SCORE_FRAC),
+            None
+        );
+        assert_eq!(scored_sections(&names, &[], SECTION_MIN_SCORE_FRAC), None);
+        // Least-bad fallback: scores exist but none clears the bar (a
+        // fraction above 1.0 - unreachable with the 0.4 constant, which the
+        // best region always clears, but the guarantee must hold anyway):
+        // the single best-scoring region is reported.
+        assert_eq!(scored_sections(&names, &[0.1, 0.9, 0.2], 1.2), Some(vec!["History".to_string()]));
     }
 
     #[test]

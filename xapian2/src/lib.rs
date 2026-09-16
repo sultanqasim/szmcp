@@ -97,9 +97,23 @@ mod ffi {
 
         // WritableDatabase
         pub fn xapian2_wdb_open(path: *const c_char, flags: c_int) -> *mut c_void;
+        pub fn xapian2_wdb_open_inmemory() -> *mut c_void;
         pub fn xapian2_wdb_add_document(db: *mut c_void, d: *mut c_void) -> u32;
         pub fn xapian2_wdb_commit(db: *mut c_void) -> c_int;
         pub fn xapian2_wdb_free(db: *mut c_void);
+
+        // TermGenerator
+        pub fn xapian2_tg_new() -> *mut c_void;
+        pub fn xapian2_tg_set_stemmer(tg: *mut c_void, language: *const c_char) -> c_int;
+        pub fn xapian2_tg_set_stemming_strategy(tg: *mut c_void, strategy: c_int) -> c_int;
+        pub fn xapian2_tg_set_document(tg: *mut c_void, d: *mut c_void) -> c_int;
+        pub fn xapian2_tg_index_text_without_positions(
+            tg: *mut c_void,
+            text: *const c_char,
+            len: u32,
+        ) -> c_int;
+        pub fn xapian2_tg_get_document(tg: *mut c_void) -> *mut c_void;
+        pub fn xapian2_tg_free(tg: *mut c_void);
 
         // Stem
         pub fn xapian2_stem_new(language: *const c_char) -> *mut c_void;
@@ -135,6 +149,7 @@ mod ffi {
 
         // Enquire
         pub fn xapian2_enquire_new(db: *mut c_void) -> *mut c_void;
+        pub fn xapian2_enquire_new_writable(db: *mut c_void) -> *mut c_void;
         pub fn xapian2_enquire_set_query(e: *mut c_void, q: *mut c_void, query_length: u32) -> c_int;
         pub fn xapian2_enquire_set_sort_by_relevance(e: *mut c_void);
         pub fn xapian2_enquire_set_weighting(
@@ -257,7 +272,7 @@ macro_rules! handle_debug {
     };
 }
 
-handle_debug!(Database, Document, WritableDatabase, Query, QueryParser, Enquire, MSet, Stem);
+handle_debug!(Database, Document, WritableDatabase, Query, QueryParser, Enquire, MSet, Stem, TermGenerator);
 
 // ---------------------------------------------------------------------------
 // Flags / operators
@@ -330,8 +345,9 @@ pub mod parse_flags {
     pub const FLAG_DEFAULT: u32 = FLAG_PHRASE | FLAG_BOOLEAN | FLAG_LOVEHATE;
 }
 
-/// How the [`QueryParser`] stems query terms, matching
-/// `Xapian::QueryParser::stem_strategy`.
+/// How query terms are stemmed, matching `Xapian::QueryParser::stem_strategy`
+/// (the same values also serve [`TermGenerator::set_stemming_strategy`]'s
+/// `Xapian::TermGenerator::stem_strategy`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(i32)]
 pub enum StemStrategy {
@@ -704,6 +720,125 @@ pub fn resolve_stem_language(code: &str) -> String {
 }
 
 // ---------------------------------------------------------------------------
+// TermGenerator
+// ---------------------------------------------------------------------------
+
+/// Indexes text into a [`Document`] the way an indexer would: tokenize,
+/// fold, stem (per [`StemStrategy`], [`TermGenerator::set_stemmer`]), and
+/// count within-document frequencies. Meant for building throwaway indexes
+/// whose terms are the ones a [`QueryParser`] with the same stemmer and
+/// strategy produces (the ZIM full-text indexes are `STEM_ALL` over folded
+/// text, unprefixed stems).
+///
+/// `Send` only: the generator holds mutable C++ state; use one per thread.
+///
+/// # Example
+///
+/// ```
+/// use xapian2::{Document, StemStrategy, TermGenerator, WritableDatabase};
+///
+/// # fn main() -> xapian2::Result<()> {
+/// let mut wdb = WritableDatabase::in_memory()?;
+/// let mut tg = TermGenerator::new()?;
+/// tg.set_stemmer("english")?;
+/// tg.set_stemming_strategy(StemStrategy::All)?;
+/// for text in ["first region text", "second region text"] {
+///     let mut doc = Document::new()?;
+///     doc.set_data(text)?;
+///     tg.set_document(&doc)?;
+///     tg.index_text_without_positions(text)?;
+///     wdb.add_document(&tg.get_document()?)?;
+/// }
+/// wdb.commit()?;
+/// # Ok(())
+/// # }
+/// ```
+pub struct TermGenerator {
+    ptr: NonNull<c_void>,
+}
+
+impl TermGenerator {
+    /// Create a generator with Xapian's defaults (no stemmer,
+    /// [`StemStrategy::Some`] once a stemmer is set).
+    pub fn new() -> Result<Self> {
+        // SAFETY: no arguments.
+        let ptr = unsafe { ffi::xapian2_tg_new() };
+        Error::from_ptr(ptr, "failed to create term generator").map(|ptr| Self { ptr })
+    }
+
+    /// Set the stemmer language (e.g. `"english"`); `"none"` disables
+    /// stemming. Fails with `InvalidArgumentError` for an unknown language.
+    pub fn set_stemmer(&mut self, language: &str) -> Result<()> {
+        let lang = cstr(language)?;
+        // SAFETY: `lang` is a valid NUL-terminated string for the call.
+        let status = unsafe { ffi::xapian2_tg_set_stemmer(self.handle(), lang.as_ptr()) };
+        Error::from_status(status)
+    }
+
+    /// Set how indexed terms are stemmed. [`StemStrategy::All`] generates
+    /// only unprefixed stems - how libzim builds the full-text indexes
+    /// embedded in openZIM archives.
+    pub fn set_stemming_strategy(&mut self, strategy: StemStrategy) -> Result<()> {
+        // SAFETY: the handle is valid for the duration of the call.
+        let status =
+            unsafe { ffi::xapian2_tg_set_stemming_strategy(self.handle(), strategy as c_int) };
+        Error::from_status(status)
+    }
+
+    /// Start indexing into a fresh document (the given document's data and
+    /// values are kept; indexed terms accumulate on the copy the generator
+    /// holds). Call this before each document's
+    /// [`index_text_without_positions`][Self::index_text_without_positions]
+    /// - the generator counts every indexed term toward the current
+    /// document's length otherwise.
+    pub fn set_document(&mut self, doc: &Document) -> Result<()> {
+        // SAFETY: both handles are valid for the duration of the call.
+        let status = unsafe { ffi::xapian2_tg_set_document(self.handle(), doc.handle()) };
+        Error::from_status(status)
+    }
+
+    /// Index `text` into the current document without positional data: each
+    /// word occurrence bumps its term's within-document frequency and the
+    /// document length, like the indexer libzim runs over ZIM article text.
+    pub fn index_text_without_positions(&mut self, text: &str) -> Result<()> {
+        let bytes = text.as_bytes();
+        // SAFETY: `bytes` is a valid byte slice; the shim copies it.
+        let status = unsafe {
+            ffi::xapian2_tg_index_text_without_positions(
+                self.handle(),
+                bytes.as_ptr() as *const _,
+                bytes.len() as u32,
+            )
+        };
+        Error::from_status(status)
+    }
+
+    /// The document the generator has been filling - hand it to
+    /// [`WritableDatabase::add_document`]. Each
+    /// [`set_document`][Self::set_document] starts a new one.
+    pub fn get_document(&self) -> Result<Document> {
+        // SAFETY: the handle is valid for the lifetime of `self`.
+        let ptr = unsafe { ffi::xapian2_tg_get_document(self.handle()) };
+        Error::from_ptr(ptr, "failed to fetch indexed document").map(|ptr| Document { ptr })
+    }
+
+    fn handle(&self) -> *mut c_void {
+        self.ptr.as_ptr()
+    }
+}
+
+impl Drop for TermGenerator {
+    fn drop(&mut self) {
+        // SAFETY: the handle was allocated by the shim.
+        unsafe { ffi::xapian2_tg_free(self.ptr.as_ptr()) };
+    }
+}
+
+// SAFETY: a TermGenerator's C++ object is only mutated through `&mut self`
+// methods; moving it between threads is safe.
+unsafe impl Send for TermGenerator {}
+
+// ---------------------------------------------------------------------------
 // WritableDatabase (minimal: build/test databases)
 // ---------------------------------------------------------------------------
 
@@ -721,6 +856,18 @@ impl WritableDatabase {
         // SAFETY: see Database::open_with_flags.
         let ptr = unsafe { ffi::xapian2_wdb_open(c_path.as_ptr(), 0) };
         Error::from_ptr(ptr, "failed to open writable database").map(|ptr| Self { ptr })
+    }
+
+    /// Create an **in-memory** writable database (`DB_BACKEND_INMEMORY`):
+    /// nothing touches the file system, and the database dies with this
+    /// handle. Built for throwaway indexes - fill it, [`commit`][Self::commit]
+    /// it, then search it through an [`Enquire`] over the same handle
+    /// ([`Enquire::new_writable`]).
+    pub fn in_memory() -> Result<Self> {
+        // SAFETY: no arguments.
+        let ptr = unsafe { ffi::xapian2_wdb_open_inmemory() };
+        Error::from_ptr(ptr, "failed to create in-memory writable database")
+            .map(|ptr| Self { ptr })
     }
 
     /// Add a document; returns the assigned document id.
@@ -943,6 +1090,18 @@ impl Enquire {
         // SAFETY: the database handle is valid for the duration of the
         // call; the C++ Enquire copies it.
         let ptr = unsafe { ffi::xapian2_enquire_new(db.handle()) };
+        Error::from_ptr(ptr, "failed to create enquire").map(|ptr| Self { ptr })
+    }
+
+    /// Create an enquire over a [`WritableDatabase`] (a subclass of
+    /// Xapian's Database). Committed documents are searchable through it:
+    /// [`commit`][WritableDatabase::commit] first, then query. Meant for
+    /// throwaway in-memory indexes ([`WritableDatabase::in_memory`]), where
+    /// a separate read-only handle would add nothing.
+    pub fn new_writable(db: &WritableDatabase) -> Result<Self> {
+        // SAFETY: the database handle is valid for the duration of the
+        // call; the C++ Enquire copies it.
+        let ptr = unsafe { ffi::xapian2_enquire_new_writable(db.handle()) };
         Error::from_ptr(ptr, "failed to create enquire").map(|ptr| Self { ptr })
     }
 
@@ -1217,6 +1376,104 @@ mod tests {
             wdb.commit().unwrap();
         }
         Database::open(&db_dir).unwrap()
+    }
+
+    #[test]
+    fn in_memory_padded_documents_score_like_full_text() {
+        // The throwaway-index path used for per-hit section scoring: a
+        // document that carries only the query terms' wdf plus one padding
+        // term holding the leftover document length (a document's length is
+        // the wdf sum of its termlist) must score exactly like the same
+        // text indexed whole through a TermGenerator.
+        let texts = [
+            "The intro mentions salt and mining briefly.",
+            "Deep salt mining operations extract salt. Salt mining is heavy industry here.",
+            "Nothing relevant lives in this third region at all.",
+        ];
+        let terms = ["salt", "mine", "rock"];
+        let mut stem = Stem::new("english").unwrap();
+        // Count each text's total words and per-term wdf.
+        let stats: Vec<(u32, Vec<(u32, u32)>)> = texts // (doclen, [(term index, wdf)])
+            .iter()
+            .map(|text| {
+                let mut doclen = 0u32;
+                let mut wdfs = vec![0u32; terms.len()];
+                for word in text.split(|c: char| !c.is_alphanumeric()) {
+                    if word.is_empty() {
+                        continue;
+                    }
+                    doclen += 1;
+                    // TermGenerator lowercases tokens before stemming, so
+                    // the counting side must too (search.rs folds accents
+                    // and case through the same step).
+                    let stemmed = stem.apply(&word.to_lowercase()).unwrap();
+                    if let Some(i) = terms.iter().position(|t| *t == stemmed) {
+                        wdfs[i] += 1;
+                    }
+                }
+                let matched: Vec<(u32, u32)> = wdfs
+                    .into_iter()
+                    .enumerate()
+                    .filter(|(_, wdf)| *wdf > 0)
+                    .map(|(i, wdf)| (i as u32, wdf))
+                    .collect();
+                (doclen, matched)
+            })
+            .collect();
+        let padded_len: u32 = stats.iter().map(|(doclen, matched)| {
+            doclen - matched.iter().map(|(_, wdf)| wdf).sum::<u32>()
+        }).sum();
+        assert!(padded_len > 0, "fixture must need padding");
+
+        let mut qp = QueryParser::new().unwrap();
+        qp.set_stemmer("english").unwrap();
+        qp.set_stemming_strategy(StemStrategy::All).unwrap();
+        let query = qp.parse_query("salt mining rock").unwrap();
+
+        // (a) The full TermGenerator feed of the region texts.
+        let full_weights: Vec<(u32, f64)> = {
+            let mut wdb = WritableDatabase::in_memory().unwrap();
+            let mut tg = TermGenerator::new().unwrap();
+            tg.set_stemmer("english").unwrap();
+            tg.set_stemming_strategy(StemStrategy::All).unwrap();
+            for (i, text) in texts.iter().enumerate() {
+                let mut doc = Document::new().unwrap();
+                doc.set_data(format!("doc {}", i + 1)).unwrap();
+                tg.set_document(&doc).unwrap();
+                tg.index_text_without_positions(text).unwrap();
+                wdb.add_document(&tg.get_document().unwrap()).unwrap();
+            }
+            wdb.commit().unwrap();
+            let mut enquire = Enquire::new_writable(&wdb).unwrap();
+            enquire.set_query(&query).unwrap();
+            let mset = enquire.get_mset(0, 10, 0).unwrap();
+            (0..mset.size()).map(|i| (mset.docid(i), mset.weight(i))).collect()
+        };
+        assert_eq!(full_weights.len(), 2, "only the two salt/mining regions match");
+        assert_eq!(full_weights[0].0, 2, "the term-dense region ranks first");
+
+        // (b) The padded hand-built documents: same match set, same weights.
+        let mut wdb = WritableDatabase::in_memory().unwrap();
+        for (i, (doclen, matched)) in stats.iter().enumerate() {
+            let mut doc = Document::new().unwrap();
+            doc.set_data(format!("doc {}", i + 1)).unwrap();
+            let mut sum = 0u32;
+            for (term_i, wdf) in matched {
+                doc.add_term(terms[*term_i as usize], *wdf).unwrap();
+                sum += *wdf;
+            }
+            if *doclen > sum {
+                doc.add_term("Qpadding", doclen - sum).unwrap();
+            }
+            wdb.add_document(&doc).unwrap();
+        }
+        wdb.commit().unwrap();
+        let mut enquire = Enquire::new_writable(&wdb).unwrap();
+        enquire.set_query(&query).unwrap();
+        let mset = enquire.get_mset(0, 10, 0).unwrap();
+        let padded: Vec<(u32, f64)> =
+            (0..mset.size()).map(|i| (mset.docid(i), mset.weight(i))).collect();
+        assert_eq!(padded, full_weights);
     }
 
     #[test]

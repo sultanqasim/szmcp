@@ -50,6 +50,12 @@ struct XStem {
     std::string scratch;
 };
 
+// XTermGen wraps Xapian::TermGenerator. Its get_document() result is handed
+// across the FFI boundary as its own XDoc (which owns the scratch buffer).
+struct XTermGen {
+    Xapian::TermGenerator tg;
+};
+
 extern "C" {
 
 // ---- Errors -------------------------------------------------------------
@@ -262,11 +268,102 @@ const char *xapian2_stem_apply(XStem *s, const char *word, uint32_t len, uint32_
 
 void xapian2_stem_free(XStem *s) { delete s; }
 
+// ---- TermGenerator ---------------------------------------------------------
+//
+// Indexes text into a Document the way an indexer would (tokenize, fold,
+// stem, count wdf) - the way libzim builds the full-text indexes embedded
+// in ZIM archives (STEM_ALL over folded text, no positions).
+
+XTermGen *xapian2_tg_new(void) {
+    try {
+        return new XTermGen{Xapian::TermGenerator()};
+    } catch (const std::exception &e) {
+        g_error = e.what();
+    }
+    return nullptr;
+}
+
+int xapian2_tg_set_stemmer(XTermGen *tg, const char *language) {
+    try {
+        tg->tg.set_stemmer(Xapian::Stem(std::string_view(language), false));
+        return 0;
+    } catch (const Xapian::Error &e) {
+        g_error = describe(e);
+    } catch (const std::exception &e) {
+        g_error = e.what();
+    }
+    return -1;
+}
+
+int xapian2_tg_set_stemming_strategy(XTermGen *tg, int strategy) {
+    try {
+        tg->tg.set_stemming_strategy(
+            static_cast<Xapian::TermGenerator::stem_strategy>(strategy));
+        return 0;
+    } catch (const Xapian::Error &e) {
+        g_error = describe(e);
+    }
+    return -1;
+}
+
+int xapian2_tg_set_document(XTermGen *tg, const XDoc *d) {
+    try {
+        tg->tg.set_document(d->doc);
+        return 0;
+    } catch (const Xapian::Error &e) {
+        g_error = describe(e);
+    }
+    return -1;
+}
+
+// Index `text` into the current document without positional data (the ZIM
+// full-text indexes carry none either, and positions cost memory).
+int xapian2_tg_index_text_without_positions(XTermGen *tg, const char *text,
+                                            uint32_t len) {
+    try {
+        tg->tg.index_text_without_positions(std::string_view(text, len));
+        return 0;
+    } catch (const Xapian::Error &e) {
+        g_error = describe(e);
+    }
+    return -1;
+}
+
+// The document the generator has been filling (a copy; set_document starts
+// a new one).
+XDoc *xapian2_tg_get_document(XTermGen *tg) {
+    try {
+        return new XDoc{tg->tg.get_document(), {}};
+    } catch (const Xapian::Error &e) {
+        g_error = describe(e);
+    }
+    return nullptr;
+}
+
+void xapian2_tg_free(XTermGen *tg) { delete tg; }
+
 // ---- WritableDatabase (minimal; used for building/test databases) --------
 
 Xapian::WritableDatabase *xapian2_wdb_open(const char *path, int flags) {
     try {
         return new Xapian::WritableDatabase(path, flags, 0);
+    } catch (const Xapian::Error &e) {
+        g_error = describe(e);
+    } catch (const std::exception &e) {
+        g_error = e.what();
+    }
+    return nullptr;
+}
+
+// Create an in-memory writable database (no file system footprint: the
+// path is ignored and nothing is ever written to disk). The intended use is
+// a throwaway index scored against and discarded within one request; a
+// commit() makes the documents searchable through an Enquire over the same
+// handle.
+Xapian::WritableDatabase *xapian2_wdb_open_inmemory(void) {
+    try {
+        return new Xapian::WritableDatabase(std::string_view(),
+                                            Xapian::DB_BACKEND_INMEMORY, 0);
     } catch (const Xapian::Error &e) {
         g_error = describe(e);
     } catch (const std::exception &e) {
@@ -417,6 +514,19 @@ void xapian2_query_free(Xapian::Query *q) { delete q; }
 // ---- Enquire ----------------------------------------------------------------
 
 Xapian::Enquire *xapian2_enquire_new(const Xapian::Database *db) {
+    try {
+        return new Xapian::Enquire(*db);
+    } catch (const Xapian::Error &e) {
+        g_error = describe(e);
+    }
+    return nullptr;
+}
+
+// Enquire over a WritableDatabase (a subclass of Database): after commit(),
+// the committed documents are searchable through this handle. Used for
+// throwaway in-memory indexes, where a separate read-only handle would add
+// nothing.
+Xapian::Enquire *xapian2_enquire_new_writable(const Xapian::WritableDatabase *db) {
     try {
         return new Xapian::Enquire(*db);
     } catch (const Xapian::Error &e) {

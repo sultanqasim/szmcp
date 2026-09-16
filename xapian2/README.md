@@ -25,9 +25,10 @@ there is no `open_memview`, the default query operator is `Or`, etc.).
 | `Document` | `id()`, `data()`, `value(slot)`, `termlist_count()`, `set_data/add_term/set_value` (mutable) | `Send` only |
 | `Query` | `term(t)`, `match_all()`, `combine(op, a, b)` | `Send + Sync` |
 | `QueryParser` | `new()`, `parse_query(s)`, `set_default_op(op)`, `add_prefix`, `add_boolean_prefix`, `set_stemmer`, `set_database` | `Send` only |
-| `Enquire` | `new(&db)`, `set_query(&q)`, `set_sort_by_relevance()`, `set_weighting(scheme, params)`, `get_mset(first, max, atleast)` | `Send` only |
+| `Enquire` | `new(&db)`, `new_writable(&wdb)`, `set_query(&q)`, `set_sort_by_relevance()`, `set_weighting(scheme, params)`, `get_mset(first, max, atleast)` | `Send` only |
 | `MSet` | `size()`, `docid/weight/percent/rank(i)`, `termfreq(t)`, `document(i)`, `iter()` | `Send + Sync` |
-| `WritableDatabase` | `create(path)`, `add_document(&doc)`, `commit()` (minimal, for tests/tooling) | `Send` only |
+| `WritableDatabase` | `create(path)`, `in_memory()`, `add_document(&doc)`, `commit()` (minimal, for tests/tooling) | `Send` only |
+| `TermGenerator` | `new()`, `set_stemmer(lang)`, `set_stemming_strategy(strategy)`, `set_document(&doc)`, `index_text_without_positions(text)`, `get_document()` | `Send` only |
 
 Errors: Xapian exceptions are captured per-thread and surfaced as
 `xapian2::Error` (implements `std::error::Error`, so `?` works into
