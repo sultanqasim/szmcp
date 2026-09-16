@@ -26,12 +26,8 @@ const INTRO_CHARS: usize = 360;
 const HIT_READ_BYTES: u64 = 1024 * 1024;
 /// Relative BM25 threshold for the `sections` of a fulltext hit: a region
 /// is reported when its BM25 score for the hit's full-text query is at
-/// least this fraction of the article's best-scoring region. 0.4 keeps
-/// every region within 2.5x of the leader - a region that merely grazes one
-/// common query word scores far below that next to the region carrying the
-/// rare words, so grazing regions drop out instead of flooding the report,
-/// while every region with real substance survives.
-const SECTION_MIN_SCORE_FRAC: f64 = 0.4;
+/// least this fraction of the article's best-scoring region.
+const SECTION_MIN_SCORE_FRAC: f64 = 0.5;
 
 /// Most of the article's regions qualifying for the `sections` list means the
 /// whole article is relevant: report no list rather than a near-complete one.
