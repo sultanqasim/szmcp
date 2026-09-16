@@ -6,6 +6,54 @@ directory are exposed through three tools, either as an MCP server over the
 streamable HTTP transport (with CORS headers so it can be used from
 browsers) or as one-shot CLI subcommands.
 
+## Why I made this
+
+One task that I've found LLMs useful for is answering questions about the
+world. Without web search or RAG, generally you need to run a large model
+with 100B+ parameters to get usable results, or at least a knowledge dense
+model like Gemma 4 31B, but that is generally slow, prone to hallucination
+for more obscure facts, and impossible on average personal computers or mobile
+devices. I also don't like having the LLM search the web for my queries, as it
+defeats the privacy and offline functionality goals of running local LLMs.
+
+People (particlularly on Reddit) like to say that world knowledge in LLMs
+is of little value or useless, due to the risk of hallucination. They always
+say it's better give LLMs access to documents or RAG, but for offline setups
+there tends to be a lot of "draw the rest of the owl" involved. There are a
+huge range of different types of world knowledge that LLMs are trained on,
+and Wikipedia is only one piece of that. It's hard to keep an offline copy
+of the internet at home, and even harder to make it efficiently searchable.
+Nonetheless, Wikipedia and other sites that Kiwix arhives and packages into
+portable and easily searchable ZIM files are a good starting point.
+
+One package I found that provides an MCP server for browsing ZIM files is
+[openzim-mcp](https://github.com/cameronrye/openzim-mcp). I tried it out,
+but found that even with its new "simplified" 8-tool toolset, small local
+LLMs tend to struggle to properly drive it, and it tends to waste a lot of
+context, making local LLMs slow. It also had a lot of functionality that's
+of little use in practice. Other small basic ZIM MCP servers also exist,
+but the ones I found seemed immature, unpolished, and lacking in functionality.
+
+My goal was to build a ZIM MCP server that provides just the functionality
+one really needs, which is easy to use (for LLMs and humans), and which is
+context efficient, making usage with small local LLMs on not overly powerful
+computers practical.
+
+This project is almost entirely and unashamedly vibe coded. I made it with
+GLM 5.3 Flash mostly. Even this README was all LLM generated, aside from this
+one section. I won't pretend this is some masterpiece, but it does the job and
+seems solid. You can connect it to the [llama.cpp](https://github.com/ggml-org/llama.cpp)
+llama-server web UI's built in agentic loop, or connect it to your own agent
+of choice. You can also just use the tools it exposes from the command line
+interface to manually explore ZIM files.
+
+This project **does not convert HTML into Markdown**. Content is presented to
+the LLM in its original format. Nevertheless, given that Markdown is much more
+token efficient than HTML, and perhaps easier for the LLM to parse too, I
+recommend using Wikipedia ZIM files that have been converted to Markdown.
+Such files are also more space efficient on disk. I made a Python
+[script](https://github.com/sultanqasim/wikizim_parser) to do this conversion.
+
 ## Tools
 
 - **`zim_search`** — search across all ZIM files in three tiers: an exact
