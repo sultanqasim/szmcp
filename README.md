@@ -79,7 +79,11 @@ mode**.
   archives is reported once per archive, since different archives can hold
   different articles under one title. In single mode the tool takes only the
   query. In directory mode an optional `zim` argument restricts the search
-  to one file; without it all ZIM files are searched as one ranked list.
+  to one file; without it all ZIM files are searched: their full-text hits
+  are re-scored with one BM25 formula over pooled cross-archive statistics
+  and merged best-first (a strong match in a small archive outranks a weak
+  match in a big one), while the exact and title tiers keep their
+  per-archive ranking.
 - **`zim_get`** — get the full content of an article/page/object. Arguments:
   the article path — or an article title such as `"Beaconsfield, Quebec"`,
   converted to its `C/` path (Wikipedia ZIMs); a failed lookup reports the

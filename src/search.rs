@@ -2,7 +2,9 @@
 //! (exact title/URL probe, all-words title match, full-text OR over all
 //! the query words), ranked against the ZIM embedded Xapian indexes,
 //! merged across archives (optionally restricted to the single archive a
-//! `zim` name resolves to), and reported with per-hit previews.
+//! `zim` name resolves to) - the full-text tier by re-scoring every
+//! archive's candidates with one BM25 over pooled cross-archive
+//! statistics - and reported with per-hit previews.
 
 use crate::html;
 use crate::markdown;
@@ -12,12 +14,17 @@ use schemars::JsonSchema;
 use serde::Serialize;
 use std::sync::Arc;
 use xapian2::{
-    resolve_stem_language, Document, Enquire, Operator, Query, QueryParser, Stem, StemStrategy,
-    WritableDatabase,
+    bm25_weight, resolve_stem_language, Document, Enquire, Operator, Query, QueryParser, Stem,
+    StemStrategy, WritableDatabase,
 };
 
 /// Number of results `zim_search` returns in total (across all archives).
 const SEARCH_LIMIT: u32 = 20;
+/// How many full-text candidates each archive contributes to the pooled
+/// re-ranking (its own BM25 order, best first): [`SEARCH_LIMIT`] results
+/// must survive the merge, and pooling rewards an archive with more than
+/// one strong match, so the per-archive fetch is well past the limit.
+const FT_FETCH_PER_ARCHIVE: u32 = 50;
 /// Maximum characters of the `preview` reported per search hit. A longer
 /// preview is cut at the last word boundary at or before the cap (a single
 /// word longer than the cap takes the hard cut) - see [`preview_truncate`].
@@ -168,6 +175,13 @@ struct ArchiveQuery {
     /// query scored against each fulltext hit's section index. `None` for
     /// an all-punctuation query: the caller skips the band.
     ft_query: Option<Query>,
+    /// The fulltext query's (term, wqf) pairs: the exact stems the parsed
+    /// query addresses and how many query tokens yield each one - the term
+    /// multiplicity Xapian calls wqf. The pooled re-ranking re-scores every
+    /// candidate outside Xapian ([`FtPool`]) and needs both, since Xapian
+    /// reports only per-database weights, which are not comparable across
+    /// archives.
+    ft_terms: Vec<(String, u32)>,
 }
 
 impl ArchiveQuery {
@@ -198,7 +212,31 @@ impl ArchiveQuery {
         // written (see `fulltext_query`), punctuation-only ones included.
         let ft_words: Vec<String> = query.split_whitespace().map(str::to_string).collect();
         let ft_query = fulltext_query(&ft_words, &language)?;
-        Ok(Self { stemmer, terms, title_text, ft_query })
+        // The (term, wqf) pairs, derived per token: Xapian scores the
+        // parser's flat OR as one wqf-1 leaf per occurrence, so a term's
+        // multiplicity is the number of tokens whose parse yields it.
+        // Re-parsing each token with the same settings `fulltext_query`
+        // uses (the whole query is semantically the flat OR of those
+        // parses) enumerates the stems through `Query::terms`; a parse
+        // failing on a single token while the whole query parsed cannot
+        // happen for the flags in use, and the whole-query parse is the
+        // authority for matching, so a token that somehow fails is skipped.
+        let mut ft_terms: Vec<(String, u32)> = Vec::new();
+        for word in &ft_words {
+            let Ok(Some(token_query)) = fulltext_query(std::slice::from_ref(word), &language)
+            else {
+                continue;
+            };
+            for term in token_query.terms().map_err(|e| {
+                ToolError::Internal(format!("failed to enumerate query terms: {}", e.msg()))
+            })? {
+                match ft_terms.iter_mut().find(|(t, _)| *t == term) {
+                    Some((_, wqf)) => *wqf += 1,
+                    None => ft_terms.push((term, 1)),
+                }
+            }
+        }
+        Ok(Self { stemmer, terms, title_text, ft_query, ft_terms })
     }
 }
 
@@ -225,6 +263,146 @@ fn fulltext_query(words: &[String], language: &str) -> Result<Option<Query>, Too
         .parse_query(&words.join(" "))
         .map_err(|e| ToolError::InvalidArgument(format!("failed to parse query: {e}")))?;
     Ok(Some(xquery))
+}
+
+/// One full-text candidate of one archive, with the raw per-term data the
+/// pooled re-score ([`FtPool`]) needs: Xapian's own MSet weights come from
+/// per-database statistics and are not comparable across archives, so the
+/// archive's top candidates travel out of the handle-pool closure as data
+/// instead of as weights.
+struct FtCandidate {
+    path: String,
+    /// The index document's title (value slot 0).
+    title: String,
+    /// The document's length (the wdf sum of its termlist).
+    doclen: f64,
+    /// Within-document frequencies, aligned with [`FtArchive::terms`].
+    wdfs: Vec<u32>,
+}
+
+/// One archive's full-text tier payload ([`fetch_fulltext`]): the
+/// collection statistics the pooled re-score consumes plus the archive's
+/// top candidates in its own BM25 order.
+struct FtArchive {
+    /// Documents in the archive's index (`doc_count`).
+    docs: u32,
+    /// Average document length in the archive's index (`average_length`).
+    avlen: f64,
+    /// The archive's (term, wqf) pairs ([`ArchiveQuery::ft_terms`]).
+    terms: Vec<(String, u32)>,
+    /// Each term's document frequency in the archive's index
+    /// (`termfreq`), aligned with `terms`.
+    dfs: Vec<u32>,
+    /// The archive's own top candidates, its local BM25 order.
+    candidates: Vec<FtCandidate>,
+}
+
+/// Fetch one archive's full-text tier payload: the archive's collection
+/// statistics plus its top [`FT_FETCH_PER_ARCHIVE`] candidates (the
+/// archive's own BM25 order) with the per-term raw data the pooled
+/// re-score needs. Everything Xapian happens here - the search handles are
+/// pooled and never shared between searches - so the raw numbers travel
+/// out instead of the weights.
+fn fetch_fulltext(
+    h: &crate::zim::XapianHandles,
+    query_state: &ArchiveQuery,
+) -> Result<FtArchive, ToolError> {
+    let docs = h.fulltext.doc_count();
+    let avlen = h.fulltext.average_length();
+    let terms = query_state.ft_terms.clone();
+    let dfs: Vec<u32> = terms.iter().map(|(t, _)| h.fulltext.termfreq(t)).collect();
+    let mut candidates = Vec::new();
+    // `None` (an all-punctuation query) skips the band.
+    if let Some(xquery) = &query_state.ft_query {
+        let mut enquire = Enquire::new(&h.fulltext)?;
+        enquire.set_query(xquery)?;
+        enquire.set_sort_by_relevance();
+        let mset = enquire.get_mset(0, FT_FETCH_PER_ARCHIVE, 0)?;
+        for (j, m) in mset.iter().enumerate() {
+            let mut doc = mset.document(j as u32)?;
+            let path = doc.data_str()?;
+            if path.is_empty() {
+                continue;
+            }
+            let title = String::from_utf8_lossy(&doc.value(0)?).into_owned();
+            candidates.push(FtCandidate {
+                path,
+                title,
+                doclen: h.fulltext.doc_length(m.docid)?,
+                wdfs: terms.iter().map(|(t, _)| h.fulltext.wdf(m.docid, t)).collect(),
+            });
+        }
+    }
+    Ok(FtArchive { docs, avlen, terms, dfs, candidates })
+}
+
+/// The pooled full-text statistics of one search: Xapian's per-database
+/// statistics summed over the searched archives, exactly how Xapian itself
+/// pools when one search spans several databases. Scoring every archive's
+/// candidates against THESE makes the union one ranking, where each
+/// archive's own weights are on incomparable per-database scales.
+struct FtPool {
+    /// Documents over the searched archives.
+    docs: u32,
+    /// Average document length over the searched archives (the total
+    /// length over the total docs).
+    avlen: f64,
+    /// Pooled document frequency per term - the union of the archives'
+    /// `ft_terms` with their `termfreq`s summed. A stem another archive's
+    /// stemmer never produced is simply absent there and adds 0.
+    df: std::collections::HashMap<String, u32>,
+}
+
+impl FtPool {
+    fn new(per_archive: &[(&Arc<Archive>, FtArchive)]) -> Self {
+        let mut docs = 0u32;
+        let mut total_len = 0.0;
+        let mut df = std::collections::HashMap::new();
+        for (_, ft) in per_archive {
+            docs += ft.docs;
+            total_len += ft.docs as f64 * ft.avlen;
+            for ((term, _), freq) in ft.terms.iter().zip(&ft.dfs) {
+                *df.entry(term.clone()).or_insert(0) += freq;
+            }
+        }
+        let avlen = if docs > 0 { total_len / docs as f64 } else { 0.0 };
+        Self { docs, avlen, df }
+    }
+
+    /// One candidate's pooled BM25 score, computed with the same formula
+    /// Xapian uses, so on the pooled statistics it equals what Xapian would
+    /// score the candidate with ([`bm25_weight`]).
+    fn score(&self, ft: &FtArchive, cand: &FtCandidate) -> f64 {
+        let dfs: Vec<u32> =
+            ft.terms.iter().map(|(t, _)| self.df.get(t).copied().unwrap_or(0)).collect();
+        let wqfs: Vec<u32> = ft.terms.iter().map(|(_, wqf)| *wqf).collect();
+        bm25_weight(self.docs, self.avlen, &dfs, &wqfs, cand.doclen, &cand.wdfs)
+    }
+}
+
+/// Merge the archives' full-text candidates best-first: re-score every
+/// candidate against the pooled statistics ([`FtPool`]) and sort the union.
+/// Ties (identical term profiles and lengths score identically) keep a
+/// deterministic order - archive name, then path.
+fn pooled_fulltext(
+    per_archive: Vec<(&Arc<Archive>, FtArchive)>,
+) -> Vec<(&Arc<Archive>, String, String)> {
+    let pool = &FtPool::new(&per_archive);
+    let mut scored: Vec<(&Arc<Archive>, &FtCandidate, f64)> = per_archive
+        .iter()
+        .flat_map(|(arc, ft)| ft.candidates.iter().map(move |c| (*arc, c, pool.score(ft, c))))
+        .collect();
+    scored.sort_by(|(arc_a, cand_a, score_a), (arc_b, cand_b, score_b)| {
+        score_b
+            .partial_cmp(score_a)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| arc_a.name.cmp(&arc_b.name))
+            .then_with(|| cand_a.path.cmp(&cand_b.path))
+    });
+    scored
+        .into_iter()
+        .map(|(arc, cand, _)| (arc, cand.path.clone(), cand.title.clone()))
+        .collect()
 }
 
 /// A display title derived from an article path: the namespace prefix
@@ -325,13 +503,16 @@ pub fn search(
     // a partial title match is not promoted at all - that judgment is left
     // to the full-text BM25.
     //
-    // Tier 3 - the full-text tier: plain BM25 over the parsed query
-    // (`fulltext_query`).
+    // Tier 3 - the full-text tier: each archive's candidates are fetched
+    // with its own BM25 ranking ([`FT_FETCH_PER_ARCHIVE`] of them) and
+    // re-scored across archives with one BM25 over pooled statistics below.
     let mut title_lists: Vec<(&Arc<Archive>, Vec<(String, String)>)> = Vec::new();
-    // Full-text tier: (weight, path, title from the index).
-    let mut per_archive: Vec<(&Arc<Archive>, Vec<(f64, String, String)>)> = Vec::new();
+    // Full-text tier: the archive's collection statistics plus its top
+    // candidates with the per-term raw data pooled re-scoring needs
+    // ([`FtArchive`]).
+    let mut ft_archives: Vec<(&Arc<Archive>, FtArchive)> = Vec::new();
     for (&arc, query_state) in archives.iter().zip(queries.iter_mut()) {
-        let Some((title_list, list)) = arc.with_xapian(|h| -> Result<_, ToolError> {
+        let Some((title_list, ft)) = arc.with_xapian(|h| -> Result<_, ToolError> {
             let mut title_list = Vec::new();
             if let Some(and_query) = title_query(&query_state.title_text)? {
                 if let Some(title_db) = &h.title {
@@ -367,45 +548,32 @@ pub fn search(
                 }
             }
 
-            // The full-text tier: plain BM25 over the parsed query
-            // (`fulltext_query`); `None` (no words at all) skips the band.
-            let Some(xquery) = &query_state.ft_query else {
-                return Ok((title_list, Vec::new()));
-            };
-            let mut enquire = Enquire::new(&h.fulltext)?;
-            enquire.set_query(xquery)?;
-            enquire.set_sort_by_relevance();
-            let mset = enquire.get_mset(0, SEARCH_LIMIT, 0)?;
-            let mut list = Vec::with_capacity(mset.size() as usize);
-            for (j, m) in mset.iter().enumerate() {
-                let mut doc = mset.document(j as u32)?;
-                let path = doc.data_str()?;
-                if path.is_empty() {
-                    continue;
-                }
-                let title = String::from_utf8_lossy(&doc.value(0)?).into_owned();
-                list.push((m.weight, path, title));
-            }
-            Ok((title_list, list))
+            // The full-text tier: fetch the archive's payload for the
+            // pooled re-ranking (`None`, an all-punctuation query, skips
+            // the band inside `fetch_fulltext`).
+            let ft = fetch_fulltext(h, query_state)?;
+            Ok((title_list, ft))
         })?
         else {
             continue;
         };
         title_lists.push((arc, title_list));
-        per_archive.push((arc, list));
+        ft_archives.push((arc, ft));
     }
 
-    if per_archive.is_empty() {
+    if ft_archives.is_empty() {
         return Err(ToolError::Internal(format!(
             "no ZIM files with a Xapian full-text index were found in {}",
             library.root.display()
         )));
     }
 
-    // Xapian weights are computed from per-database statistics and are not
-    // comparable across archives, so each tier merges its archives' ranked
-    // lists by rotation: every archive contributes its best match before
-    // any archive contributes its second best. Tiers keep their order.
+    // The tiers keep their order (exact, then title, then full-text). The
+    // title tier merges its archives' ranked lists by rotation: Xapian
+    // weights are computed from per-database statistics and are not
+    // comparable across archives, so the tier interleaves them - every
+    // archive contributes its best match before any archive contributes its
+    // second best.
     let mut rank = 0usize;
     loop {
         let mut picked = false;
@@ -420,19 +588,16 @@ pub fn search(
         }
         rank += 1;
     }
-    let mut rank = 0usize;
-    loop {
-        let mut picked = false;
-        for (arc, list) in &per_archive {
-            if let Some((_, path, title)) = list.get(rank) {
-                merged.push((arc, path.clone(), title.clone(), HitKind::Fulltext));
-                picked = true;
-            }
-        }
-        if !picked {
-            break;
-        }
-        rank += 1;
+    // The full-text tier merges by re-ranking instead of rotating: the
+    // per-database BM25 weights are not comparable across archives (an
+    // archive with 60 documents and one with 600k weight their own matches
+    // on different scales), so every candidate is re-scored with ONE BM25
+    // formula over statistics pooled across the searched archives
+    // ([`FtPool`]) and the union is sorted - one ranking, where a strong
+    // match in a small archive beats a weak match in a big one instead of
+    // the archives merely taking turns.
+    for (arc, path, title) in pooled_fulltext(ft_archives) {
+        merged.push((arc, path, title, HitKind::Fulltext));
     }
 
     // Resolve every candidate to its terminal entry before dedupe, then
@@ -2063,23 +2228,237 @@ Scientists measure the flow from observatories.
     }
 
     #[test]
-    fn e2e_search_interleaves_archives_and_dedupes_within_archives() {
+    fn e2e_search_pools_fulltext_across_archives_and_dedupes_within_archives() {
         let (_dir, library) = two_archive_library();
         let server = ZimMcpServer::new(library);
 
         // The same title in both archives is NOT deduped across archives:
         // different archives may hold different articles under one title,
-        // so each archive's copy is reported (library order first).
+        // so each archive's copy is reported (the exact tier's library
+        // order first).
         let hits = search(&server, "apple");
         assert_eq!(hits.len(), 2, "{hits:?}");
         assert_eq!((hits[0].zim.as_str(), hits[0].path.as_str()), ("a.zim", "C/Apple"));
         assert_eq!((hits[1].zim.as_str(), hits[1].path.as_str()), ("b.zim", "C/Apple"));
 
-        // Distinct matches interleave: the best match of each archive first.
+        // Distinct matches rank by the pooled re-score, not by archive
+        // rank rotation: re-scored with one BM25 over the pooled
+        // statistics, b.zim's Cherry (its only term sits in a shorter
+        // document) outscores a.zim's Banana - the rotation this replaces
+        // reported the archives' best matches in library order.
         let hits = search(&server, "banana cherry");
         assert_eq!(hits.len(), 2, "{hits:?}");
-        assert_eq!((hits[0].zim.as_str(), hits[0].path.as_str()), ("a.zim", "C/Banana"));
-        assert_eq!((hits[1].zim.as_str(), hits[1].path.as_str()), ("b.zim", "C/Cherry"));
+        assert_eq!((hits[0].zim.as_str(), hits[0].path.as_str()), ("b.zim", "C/Cherry"));
+        assert_eq!((hits[1].zim.as_str(), hits[1].path.as_str()), ("a.zim", "C/Banana"));
+    }
+
+    /// Two archives whose "cherry" hits differ in strength: a.zim (first in
+    /// library order) holds a weak match - the term once in a long document
+    /// - and b.zim a strong one - four occurrences in a short document.
+    /// Returns the tempdir (it must outlive the searches) and the scanned
+    /// library.
+    fn pooled_rerank_library() -> (tempfile::TempDir, Arc<ZimLibrary>) {
+        let dir = tempfile::tempdir().unwrap();
+        let weak_terms = format!("cherri {}", "filler ".repeat(60));
+        let strong_terms = format!("{}pad pad", "cherri ".repeat(4));
+        let unrelated = "unrelated words entirely";
+        let index_a = make_index(&[
+            ("C/Long_Doc", weak_terms.as_str(), "Long doc"),
+            ("C/A_Other", unrelated, "Other"),
+        ]);
+        let index_b = make_index(&[
+            ("C/Short_Doc", strong_terms.as_str(), "Short doc"),
+            ("C/B_Other", unrelated, "More"),
+        ]);
+        let entry = |url: &'static str, title: &'static str| TestEntry {
+            namespace: b'C',
+            url,
+            title,
+            mime: 0,
+            body: b"<html><body><h1>Filler.</h1><p>Filler text.</p></body></html>",
+        };
+        let content_a = [entry("Long_Doc", "Long doc"), entry("A_Other", "Other")];
+        let content_b = [entry("Short_Doc", "Short doc"), entry("B_Other", "More")];
+        std::fs::write(
+            dir.path().join("a.zim"),
+            build_archive(&["text/html"], &content_a, &[], 0, Some(&index_a)),
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("b.zim"),
+            build_archive(&["text/html"], &content_b, &[], 0, Some(&index_b)),
+        )
+        .unwrap();
+        let library = Arc::new(ZimLibrary::scan(dir.path()).unwrap());
+        assert_eq!(library.archives.len(), 2);
+        (dir, library)
+    }
+
+    #[test]
+    fn e2e_search_pooled_rerank_ranks_the_strong_match_first() {
+        let (_dir, library) = pooled_rerank_library();
+        let server = ZimMcpServer::new(library);
+
+        // Rank rotation interleaved by archive rank and would have reported
+        // the weak a.zim match first (a.zim is scanned first and each
+        // archive holds exactly one hit). The pooled re-score ranks both
+        // candidates with one BM25 over the pooled statistics: b.zim's
+        // short document carries the term four times, a.zim's long one
+        // once, and the strong match must come first.
+        let hits = search(&server, "cherry");
+        assert_eq!(hits.len(), 2, "{hits:?}");
+        assert_eq!((hits[0].zim.as_str(), hits[0].path.as_str()), ("b.zim", "C/Short_Doc"));
+        assert_eq!((hits[1].zim.as_str(), hits[1].path.as_str()), ("a.zim", "C/Long_Doc"));
+    }
+
+    #[test]
+    fn e2e_search_fulltext_rescore_matches_xapian_weights() {
+        // The full-text tier's pooled re-ranking re-scores every candidate
+        // outside Xapian. On a single archive the pooled statistics ARE the
+        // archive's statistics, so each recomputed score must equal the
+        // MSet weight Xapian itself reported for the same query - the FFI
+        // accessors, the formula, and the wqf derivation (a repeated query
+        // word, a term indexing several documents through the tw<2
+        // softening branch, and a rare term through the unsoftened one)
+        // validated end to end over a real parsed query. The fixture's
+        // index terms are the stems its query words stem to.
+        let dir = tempfile::tempdir().unwrap();
+        let index = make_index(&[
+            ("C/One", "appl appl banana kazakhstan", "One"),
+            ("C/Two", "appl banana cherri", "Two"),
+            ("C/Three", "appl pie", "Three"),
+            ("C/Four", "banana glacier", "Four"),
+        ]);
+        let content = [
+            TestEntry { namespace: b'C', url: "One", title: "One", mime: 0, body: b"<html><body><h1>One</h1><p>One text.</p></body></html>" },
+            TestEntry { namespace: b'C', url: "Two", title: "Two", mime: 0, body: b"<html><body><h1>Two</h1><p>Two text.</p></body></html>" },
+            TestEntry { namespace: b'C', url: "Three", title: "Three", mime: 0, body: b"<html><body><h1>Three</h1><p>Three text.</p></body></html>" },
+            TestEntry { namespace: b'C', url: "Four", title: "Four", mime: 0, body: b"<html><body><h1>Four</h1><p>Four text.</p></body></html>" },
+        ];
+        let bytes = build_archive(&["text/html"], &content, &[], 0, Some(&index));
+        std::fs::write(dir.path().join("test.zim"), &bytes).unwrap();
+        let library = Arc::new(ZimLibrary::scan(dir.path()).unwrap());
+        assert!(library.archives[0].searchable());
+        let server = ZimMcpServer::new(library);
+
+        let arc = &server.library.archives[0];
+        let query_state =
+            ArchiveQuery::build(arc, &fold_accents("apple apple cherry kazakhstan")).unwrap();
+        arc.with_xapian(|h| -> Result<(), ToolError> {
+            let ft = fetch_fulltext(h, &query_state)?;
+            // The pooled == local statistics: 4 documents of lengths
+            // 4/3/2/2, and the terms' document frequencies.
+            assert_eq!(ft.docs, 4);
+            assert!((ft.avlen - 2.75).abs() < 1e-9);
+            assert_eq!(
+                ft.terms,
+                [("appl".to_string(), 2), ("cherri".to_string(), 1), ("kazakhstan".to_string(), 1)]
+            );
+            assert_eq!(ft.dfs, [3, 1, 1]);
+            let paths: Vec<&str> = ft.candidates.iter().map(|c| c.path.as_str()).collect();
+            assert_eq!(paths, ["C/One", "C/Two", "C/Three"]);
+
+            // Xapian's own weights for the same query and cap, keyed by the
+            // candidates' paths (unique per archive).
+            let mut enquire = Enquire::new(&h.fulltext)?;
+            enquire.set_query(query_state.ft_query.as_ref().unwrap())?;
+            enquire.set_sort_by_relevance();
+            let mset = enquire.get_mset(0, FT_FETCH_PER_ARCHIVE, 0)?;
+            let mut weight_of = std::collections::HashMap::new();
+            for i in 0..mset.size() {
+                weight_of.insert(mset.document(i)?.data_str()?, mset.weight(i));
+            }
+            assert_eq!(weight_of.len(), 3);
+
+            // The re-score, the merge's own scoring path (pooled == local).
+            let payload = (arc, ft);
+            let pool = FtPool::new(std::slice::from_ref(&payload));
+            for cand in &payload.1.candidates {
+                let score = pool.score(&payload.1, cand);
+                let expected = weight_of[&cand.path];
+                assert!(
+                    (score - expected).abs() <= 1e-9 * expected.abs().max(1e-12),
+                    "{}: recomputed {score} against Xapian {expected}",
+                    cand.path
+                );
+            }
+            Ok(())
+        })
+        .unwrap()
+        .unwrap();
+    }
+
+    /// Real-index verification, run explicitly: the synthetic fixtures are
+    /// built through xapian2's own `WritableDatabase`, but real ZIM indexes
+    /// are glass databases written by libzim with `DB_NO_TERMLIST` (termlist
+    /// access throws on every document there), so the pooled re-score's
+    /// accessors and scores are verified against one. Run with
+    /// `SZMCP_REAL_ZIM=<zim file> cargo test --bin szmcp real_zim -- --ignored`
+    /// (a symlinked file is fine); skipped without the variable.
+    #[test]
+    #[ignore]
+    fn real_zim_fulltext_rescore_matches_xapian_weights() {
+        let Ok(path) = std::env::var("SZMCP_REAL_ZIM") else {
+            eprintln!("SZMCP_REAL_ZIM not set; skipping the real-ZIM verification");
+            return;
+        };
+        let library = Arc::new(ZimLibrary::single(std::path::Path::new(&path)).unwrap());
+        assert!(library.archives[0].searchable(), "{path}");
+        let arc = &library.archives[0];
+        // A repeated query word ("acid" twice) over common chemistry words:
+        // both index many documents, so the pooled re-score sees df > 1.
+        let query_state = ArchiveQuery::build(arc, &fold_accents("acid acid base")).unwrap();
+        let started = std::time::Instant::now();
+        arc.with_xapian(|h| -> Result<(), ToolError> {
+            let ft = fetch_fulltext(h, &query_state)?;
+            // The accessors on a real libzim glass database: sane lengths
+            // and document frequencies (the DB_NO_TERMLIST shape must not
+            // break doc lengths or wdfs).
+            assert!(ft.docs > 0);
+            assert!(ft.avlen > 0.0, "average_length {} on {path}", ft.avlen);
+            assert!(ft.candidates.iter().all(|c| c.doclen > 0.0));
+            assert!(ft.candidates.iter().any(|c| c.wdfs.iter().any(|w| *w > 0)));
+            assert_eq!(
+                ft.terms.iter().map(|(t, w)| (t.as_str(), *w)).collect::<Vec<_>>(),
+                [("acid", 2), ("base", 1)]
+            );
+            assert!(ft.candidates.len() >= 2, "expected several acid/base hits");
+
+            let mut enquire = Enquire::new(&h.fulltext)?;
+            enquire.set_query(query_state.ft_query.as_ref().unwrap())?;
+            enquire.set_sort_by_relevance();
+            let mset = enquire.get_mset(0, FT_FETCH_PER_ARCHIVE, 0)?;
+            let mut weight_of = std::collections::HashMap::new();
+            for i in 0..mset.size() {
+                weight_of.insert(mset.document(i)?.data_str()?, mset.weight(i));
+            }
+            assert_eq!(weight_of.len(), ft.candidates.len());
+
+            let payload = (arc, ft);
+            let pool = FtPool::new(std::slice::from_ref(&payload));
+            let mut worst = 0.0f64;
+            for cand in &payload.1.candidates {
+                let score = pool.score(&payload.1, cand);
+                let expected = weight_of[&cand.path];
+                worst = worst.max((score - expected).abs() / expected.abs().max(1e-12));
+                assert!(
+                    (score - expected).abs() <= 1e-9 * expected.abs().max(1e-12),
+                    "{}: recomputed {score} against Xapian {expected}",
+                    cand.path
+                );
+            }
+            eprintln!(
+                "real ZIM {path}: {} docs, avlen {:.2}, {} candidates, \
+                 max relative difference {worst:.2e}, payload fetch {} ms",
+                payload.1.docs,
+                payload.1.avlen,
+                payload.1.candidates.len(),
+                started.elapsed().as_millis()
+            );
+            Ok(())
+        })
+        .unwrap()
+        .unwrap();
     }
 
     #[test]
