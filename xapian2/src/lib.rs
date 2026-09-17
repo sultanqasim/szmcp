@@ -78,7 +78,10 @@ mod ffi {
         pub fn xapian2_db_open(path: *const c_char, flags: c_int) -> *mut c_void;
         pub fn xapian2_db_open_fd(fd: c_int, flags: c_int) -> *mut c_void;
         pub fn xapian2_db_doccount(db: *mut c_void) -> u32;
+        pub fn xapian2_db_avlength(db: *mut c_void) -> f64;
+        pub fn xapian2_db_doclength(db: *mut c_void, did: u32, ok: *mut c_int) -> f64;
         pub fn xapian2_db_termfreq(db: *mut c_void, term: *const c_char, len: u32) -> u32;
+        pub fn xapian2_db_wdf(db: *mut c_void, did: u32, term: *const c_char, len: u32) -> u32;
         pub fn xapian2_db_get_document(db: *mut c_void, did: u32) -> *mut c_void;
         pub fn xapian2_db_compact(db: *mut c_void, output: *const c_char) -> c_int;
         pub fn xapian2_db_compact_single_file(db: *mut c_void, output: *const c_char) -> c_int;
@@ -145,6 +148,8 @@ mod ffi {
         pub fn xapian2_query_term(term: *const c_char, len: u32, wqf: u32) -> *mut c_void;
         pub fn xapian2_query_match_all() -> *mut c_void;
         pub fn xapian2_query_combine(op: c_int, a: *mut c_void, b: *mut c_void) -> *mut c_void;
+        pub fn xapian2_query_terms(q: *mut c_void, count: *mut u32) -> *mut *mut c_char;
+        pub fn xapian2_free_cstrs(strs: *mut *mut c_char, count: u32);
         pub fn xapian2_query_free(q: *mut c_void);
 
         // Enquire
@@ -454,6 +459,42 @@ impl Database {
         // SAFETY: `bytes` is a valid byte slice; the shim copies it.
         unsafe {
             ffi::xapian2_db_termfreq(self.handle(), bytes.as_ptr() as *const _, bytes.len() as u32)
+        }
+    }
+
+    /// The average document length (`get_avlength`): the statistic BM25
+    /// divides document lengths by, one of the per-database statistics
+    /// [`bm25_weight`] can be fed with. 0 on error.
+    pub fn average_length(&self) -> f64 {
+        // SAFETY: see doc_count.
+        unsafe { ffi::xapian2_db_avlength(self.handle()) }
+    }
+
+    /// The document's length (`get_doclength`): the wdf sum of its termlist,
+    /// what BM25 length-normalises by. Glass stores doc lengths in the
+    /// postlist table, so this works on the `DB_NO_TERMLIST` indexes libzim
+    /// builds (where termlist access throws). Fails for unknown ids.
+    pub fn doc_length(&self, id: u32) -> Result<f64> {
+        let mut ok = 0;
+        // SAFETY: the handle is valid for the lifetime of `self`; `ok` is
+        // written before return.
+        let len = unsafe { ffi::xapian2_db_doclength(self.handle(), id, &mut ok) };
+        if ok == 0 {
+            return Err(Error::last_error("failed to read document length"));
+        }
+        Ok(len)
+    }
+
+    /// The within-document frequency of `term` in document `id` - how many
+    /// times the document indexes the term (`get_wdf`, read through a
+    /// posting-list skip, the only termlist-free route glass offers).
+    /// 0 - data, not an error - when the document does not index the term,
+    /// for a term absent from the index, or for an out-of-range id.
+    pub fn wdf(&self, id: u32, term: &str) -> u32 {
+        let bytes = term.as_bytes();
+        // SAFETY: `bytes` is a valid byte slice; the shim copies it.
+        unsafe {
+            ffi::xapian2_db_wdf(self.handle(), id, bytes.as_ptr() as *const _, bytes.len() as u32)
         }
     }
 
@@ -936,6 +977,34 @@ impl Query {
         Error::from_ptr(ptr, "failed to combine queries").map(|ptr| Self { ptr })
     }
 
+    /// The query's terms, unique and in first-occurrence order
+    /// (`get_terms_begin`/`get_terms_end`; that iterator repeats a term
+    /// once per occurrence, so "acid acid" collapses to one entry here).
+    /// These are the exact stems the parsed query addresses (a `STEM_ALL`
+    /// parse stems its terms), which is what re-scoring code needs to
+    /// fetch per-document wdfs through [`Database::wdf`]; the within-query
+    /// frequency itself is derivable by re-parsing the query's tokens
+    /// separately and counting which yield each term.
+    pub fn terms(&self) -> Result<Vec<String>> {
+        let mut count = 0u32;
+        // SAFETY: the handle is valid for the duration of the call; the
+        // shim writes `count` before returning.
+        let strs = unsafe { ffi::xapian2_query_terms(self.handle(), &mut count) };
+        if strs.is_null() {
+            return Err(Error::last_error("failed to enumerate query terms"));
+        }
+        let mut terms = Vec::with_capacity(count as usize);
+        for i in 0..count {
+            // SAFETY: element i of the array is a NUL-terminated C string
+            // owned by the shim, freed below.
+            let s = unsafe { CStr::from_ptr(*strs.add(i as usize)) };
+            terms.push(s.to_string_lossy().into_owned());
+        }
+        // SAFETY: frees exactly what xapian2_query_terms allocated.
+        unsafe { ffi::xapian2_free_cstrs(strs, count) };
+        Ok(terms)
+    }
+
     fn handle(&self) -> *mut c_void {
         self.ptr.as_ptr()
     }
@@ -1332,6 +1401,73 @@ impl Iterator for MSetIter<'_> {
 impl ExactSizeIterator for MSetIter<'_> {}
 
 // ---------------------------------------------------------------------------
+// Pooled BM25
+// ---------------------------------------------------------------------------
+
+/// The BM25 weight of one document against a collection, replicating
+/// Xapian 2.0's default weighting exactly ([`BM25Weight`] with its
+/// `k1=1, k2=0, k3=1, b=0.5, min_normlen=0.5` defaults, no RSet, factor 1,
+/// `bm25weight.cc`), so scores computed outside Xapian rank exactly like
+/// Xapian's own. The arguments:
+///
+/// - `docs` / `avlen`: the collection's document count and average document
+///   length - pooled values when the collection merges several databases
+///   (sum the doc counts, weight-average the lengths, sum the term
+///   frequencies - what Xapian itself pools over a multi-database search).
+/// - `dfs` / `wqfs` / `wdfs`: one entry per query term, parallel slices:
+///   the term's document frequency in the collection, its multiplicity in
+///   the query (wqf), and its within-document frequency in this document.
+///
+/// The formula (natural `ln`, as in the C++):
+///
+/// ```text
+/// tw_raw(t)  = (docs - df(t) + 0.5) / (df(t) + 0.5)
+/// tw_raw(t) < 2  ->  tw_raw = tw_raw * 0.5 + 1    (Xapian softens, not clamps)
+/// normlen(d) = max(doclen / avlen, min_normlen)   (avlen == 0 floors it at min_normlen)
+/// score(d)   = sum_t tw_raw(t).ln() * wqf(t) * (k1+1)
+///                       * wdf(t,d) / (k1 * (normlen * b + (1-b)) + wdf(t,d))
+/// ```
+///
+/// The wqf enters linearly, NOT through Xapian's `(k3+1)*wqf/(k3+wqf)`
+/// factor, because a parser-built OR query is scored as one leaf postlist
+/// per term occurrence and every leaf carries wqf 1 - for wqf 1 that factor
+/// is 1 whatever k3, so the multiplicity just repeats the leaf's weight
+/// (measured on Xapian 2.0.0: "foo foo" scores exactly twice "foo", while
+/// the wqf=2 k3 factor would give 4/3). A wqf of 1 in a hand-built query
+/// like `Query("term", 2)` would take the k3 factor instead - not the shape
+/// a QueryParser produces.
+pub fn bm25_weight(
+    docs: u32,
+    avlen: f64,
+    dfs: &[u32],
+    wqfs: &[u32],
+    doclen: f64,
+    wdfs: &[u32],
+) -> f64 {
+    const K1: f64 = 1.0;
+    const B: f64 = 0.5;
+    const MIN_NORMLEN: f64 = 0.5;
+    // avlen == 0 (an empty or all-empty-documents collection) sets Xapian's
+    // len_factor to 0, flooring every normlen at min_normlen.
+    let normlen = if avlen > 0.0 { (doclen / avlen).max(MIN_NORMLEN) } else { MIN_NORMLEN };
+    let mut score = 0.0;
+    for ((df, wqf), wdf) in dfs.iter().zip(wqfs).zip(wdfs) {
+        // A wdf of 0 (the document does not index the term) contributes
+        // exactly 0 - the document is not in the term's postlist.
+        if *wdf == 0 {
+            continue;
+        }
+        let tw_raw = (docs as f64 - *df as f64 + 0.5) / (*df as f64 + 0.5);
+        let tw_raw = if tw_raw < 2.0 { tw_raw * 0.5 + 1.0 } else { tw_raw };
+        score += tw_raw.ln()
+            * *wqf as f64
+            * (K1 + 1.0)
+            * (*wdf as f64 / (K1 * (normlen * B + (1.0 - B)) + *wdf as f64));
+    }
+    score
+}
+
+// ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
 
@@ -1498,6 +1634,77 @@ mod tests {
         assert_eq!(mset.size(), 2);
         assert_eq!(mset.termfreq("alpha"), 2);
         assert_eq!(mset.termfreq("zeta"), 0);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The pooled re-ranking path (search.rs) re-scores candidates with
+    /// [`bm25_weight`] from statistics fetched through the Database
+    /// accessors. On a single database the pooled statistics ARE the local
+    /// ones, so every recomputed score must equal the MSet weight Xapian
+    /// itself reported - the accessors, the formula, and the wqf handling
+    /// validated against Xapian in one shot. The fixture exercises a
+    /// repeated query word (wqf 2), terms indexing several documents
+    /// (df > 1, tw_raw < 2: the softening branch), and a rare term (df 1 of
+    /// N 4: tw_raw > 2, the unsoftened branch).
+    #[test]
+    fn bm25_weight_replicates_xapian_mset_weights() {
+        let dir = temp_dir("pooled-bm25");
+        let db = build_db(
+            &dir,
+            &[
+                "foo foo bar",      // wdf(foo)=2, wdf(bar)=1, len 3
+                "foo",              // wdf(foo)=1, len 1
+                "foo bar baz",      // wdf(foo)=1, wdf(bar)=1, len 3
+                "baz qux zap",      // no foo/bar; the only zap
+            ],
+        );
+
+        // Parsed the way search.rs parses the full-text query (STEM_ALL;
+        // "none" keeps the terms verbatim, so build_db's terms match).
+        let mut qp = QueryParser::new().unwrap();
+        qp.set_stemmer("none").unwrap();
+        qp.set_stemming_strategy(StemStrategy::All).unwrap();
+        let query = qp.parse_query("foo foo bar zap").unwrap();
+        assert_eq!(query.terms().unwrap(), ["foo", "bar", "zap"]);
+
+        let mut enquire = Enquire::new(&db).unwrap();
+        enquire.set_query(&query).unwrap();
+        let mset = enquire.get_mset(0, 10, 0).unwrap();
+        assert_eq!(mset.size(), 4, "every document matches some term");
+
+        // Pooled == local on one database: doc counts, average length
+        // ((3 + 1 + 3 + 3) / 4 = 2.5), and the terms' document frequencies.
+        let docs = db.doc_count();
+        let avlen = db.average_length();
+        assert_eq!(docs, 4);
+        assert!((avlen - 2.5).abs() < 1e-12);
+        let dfs = [db.termfreq("foo"), db.termfreq("bar"), db.termfreq("zap")];
+        assert_eq!(dfs, [3, 2, 1]);
+        // "foo" is queried twice (wqf 2), "bar" and "zap" once each.
+        let wqfs = [2u32, 1, 1];
+
+        for m in mset.iter() {
+            let wdfs =
+                [db.wdf(m.docid, "foo"), db.wdf(m.docid, "bar"), db.wdf(m.docid, "zap")];
+            let doclen = db.doc_length(m.docid).unwrap();
+            let score = bm25_weight(docs, avlen, &dfs, &wqfs, doclen, &wdfs);
+            assert!(
+                (score - m.weight).abs() <= 1e-9 * m.weight.abs().max(1e-12),
+                "doc {} recomputed {score} against Xapian weight {}",
+                m.docid,
+                m.weight
+            );
+        }
+
+        // Accessor edge shapes, on the way out: doc 1's length is its wdf
+        // sum (3), a document's wdf for an absent term is 0, and out-of-range
+        // docids are data (0) or an error (doc_length), never a crash.
+        assert_eq!(db.doc_length(1).unwrap(), 3.0);
+        assert_eq!(db.wdf(2, "bar"), 0);
+        assert_eq!(db.wdf(999, "foo"), 0);
+        assert_eq!(db.wdf(1, "zzz"), 0);
+        assert!(db.doc_length(999).is_err());
 
         let _ = std::fs::remove_dir_all(&dir);
     }

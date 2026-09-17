@@ -21,13 +21,14 @@ there is no `open_memview`, the default query operator is `Or`, etc.).
 
 | Type | Key methods | Send / Sync |
 | --- | --- | --- |
-| `Database` | `open(path)`, `open_at(path, offset)`, `doc_count()`, `termfreq(t)`, `get_document(id)`, `compact_to(dir)`, `compact_single_file(path)` | `Send` only |
+| `Database` | `open(path)`, `open_at(path, offset)`, `doc_count()`, `average_length()`, `doc_length(id)`, `termfreq(t)`, `wdf(id, t)`, `get_document(id)`, `compact_to(dir)`, `compact_single_file(path)` | `Send` only |
 | `Document` | `id()`, `data()`, `value(slot)`, `termlist_count()`, `set_data/add_term/set_value` (mutable) | `Send` only |
-| `Query` | `term(t)`, `match_all()`, `combine(op, a, b)` | `Send + Sync` |
+| `Query` | `term(t)`, `match_all()`, `combine(op, a, b)`, `terms()` | `Send + Sync` |
 | `QueryParser` | `new()`, `parse_query(s)`, `set_default_op(op)`, `add_prefix`, `add_boolean_prefix`, `set_stemmer`, `set_database` | `Send` only |
 | `Enquire` | `new(&db)`, `new_writable(&wdb)`, `set_query(&q)`, `set_sort_by_relevance()`, `set_weighting(scheme, params)`, `get_mset(first, max, atleast)` | `Send` only |
 | `MSet` | `size()`, `docid/weight/percent/rank(i)`, `termfreq(t)`, `document(i)`, `iter()` | `Send + Sync` |
 | `WritableDatabase` | `create(path)`, `in_memory()`, `add_document(&doc)`, `commit()` (minimal, for tests/tooling) | `Send` only |
+| `bm25_weight` | free function: Xapian 2.0's default BM25 for one document from collection statistics (the pooled re-ranking behind `szmcp`'s cross-archive full-text merge) | pure `f64` math |
 | `TermGenerator` | `new()`, `set_stemmer(lang)`, `set_stemming_strategy(strategy)`, `set_document(&doc)`, `index_text_without_positions(text)`, `get_document()` | `Send` only |
 
 Errors: Xapian exceptions are captured per-thread and surfaced as

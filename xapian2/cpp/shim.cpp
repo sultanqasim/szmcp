@@ -17,8 +17,11 @@
 
 #include <xapian.h>
 
+#include <algorithm>
 #include <cstdint>
+#include <cstdlib>
 #include <string>
+#include <vector>
 
 #include <cerrno>
 #include <cstring>
@@ -105,6 +108,53 @@ uint32_t xapian2_db_doccount(const Xapian::Database *db) {
 uint32_t xapian2_db_termfreq(const Xapian::Database *db, const char *term, uint32_t len) {
     try {
         return static_cast<uint32_t>(db->get_termfreq(std::string_view(term, len)));
+    } catch (const Xapian::Error &e) {
+        g_error = describe(e);
+    }
+    return 0;
+}
+
+// The average document length (`get_avlength`): the statistic BM25 divides
+// document lengths by. 0 on error.
+double xapian2_db_avlength(const Xapian::Database *db) {
+    try {
+        return db->get_avlength();
+    } catch (const Xapian::Error &e) {
+        g_error = describe(e);
+    }
+    return 0.0;
+}
+
+// The document's length (`get_doclength`): the wdf sum of its termlist.
+// Glass stores doc lengths in the postlist table, so this works on the
+// DB_NO_TERMLIST indexes libzim builds (where termlist access throws).
+// `ok` is 0 when Xapian failed (unknown docid).
+double xapian2_db_doclength(const Xapian::Database *db, uint32_t did, int *ok) {
+    try {
+        *ok = 1;
+        return static_cast<double>(db->get_doclength(did));
+    } catch (const Xapian::Error &e) {
+        g_error = describe(e);
+        *ok = 0;
+    }
+    return 0.0;
+}
+
+// The within-document frequency of `term` in `did` (`get_wdf`, read through
+// a posting-list skip): 0 when the document does not index the term, and 0
+// - data, not an error - for a term absent from the index or an
+// out-of-range docid.
+uint32_t xapian2_db_wdf(const Xapian::Database *db, uint32_t did,
+                        const char *term, uint32_t len) {
+    try {
+        std::string_view t(term, len);
+        auto it = db->postlist_begin(t);
+        auto end = db->postlist_end(t);
+        if (it != end) {
+            it.skip_to(did);
+            if (it != end && *it == did)
+                return static_cast<uint32_t>(it.get_wdf());
+        }
     } catch (const Xapian::Error &e) {
         g_error = describe(e);
     }
@@ -507,6 +557,47 @@ Xapian::Query *xapian2_query_combine(int op, const Xapian::Query *a, const Xapia
         g_error = describe(e);
     }
     return nullptr;
+}
+
+// The query's terms, unique and in first-occurrence order
+// (get_terms_begin/end; that iterator repeats a term once per occurrence,
+// so duplicates are collapsed here). Returns a malloc'd, NULL-terminated
+// array of malloc'd NUL-terminated strings; NULL on error. Release with
+// xapian2_free_cstrs.
+char **xapian2_query_terms(const Xapian::Query *q, uint32_t *out_count) {
+    try {
+        std::vector<std::string> terms;
+        for (auto it = q->get_terms_begin(); it != q->get_terms_end(); ++it) {
+            if (std::find(terms.begin(), terms.end(), *it) == terms.end())
+                terms.push_back(*it);
+        }
+        char **out = static_cast<char **>(
+            malloc((terms.size() + 1) * sizeof(char *)));
+        if (!out) {
+            g_error = "out of memory";
+            return nullptr;
+        }
+        for (size_t i = 0; i < terms.size(); i++) {
+            out[i] = static_cast<char *>(malloc(terms[i].size() + 1));
+            memcpy(out[i], terms[i].data(), terms[i].size());
+            out[i][terms[i].size()] = '\0';
+        }
+        out[terms.size()] = nullptr;
+        *out_count = static_cast<uint32_t>(terms.size());
+        return out;
+    } catch (const Xapian::Error &e) {
+        g_error = describe(e);
+    } catch (const std::exception &e) {
+        g_error = e.what();
+    }
+    return nullptr;
+}
+
+// Free a xapian2_query_terms result.
+void xapian2_free_cstrs(char **strs, uint32_t count) {
+    if (!strs) return;
+    for (uint32_t i = 0; i < count; i++) free(strs[i]);
+    free(strs);
 }
 
 void xapian2_query_free(Xapian::Query *q) { delete q; }
