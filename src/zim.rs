@@ -726,7 +726,6 @@ impl Archive {
         self.language
             .get_or_init(|| match self.zim.language_metadata() {
                 Ok(language) => {
-                    tracing::info!("{} Language metadata: {language:?}", self.name);
                     language
                 }
                 Err(e) => {
