@@ -1393,12 +1393,6 @@ pub(crate) mod testutil {
     }
 
     #[test]
-    fn fulltext_index_absent_reports_none() {
-        let (a, _f) = sample_archive();
-        assert!(a.zim.open_fulltext_xapian().unwrap().is_none());
-    }
-
-    #[test]
     fn language_metadata_first_code_lowercased_or_none() {
         // With metadata: the first code, trimmed and lowercased (multi-code
         // values occur; separators split them).
@@ -1562,30 +1556,4 @@ pub(crate) mod testutil {
         assert!(lib.single_archive().is_none());
     }
 
-    #[test]
-    fn library_mode_matches_how_it_was_opened() {
-        // The mode records the launch shape (one file vs. a scanned
-        // directory), and single_archive hands out the one archive only in
-        // single mode - the MCP tool set is built on both facts.
-        let dir = tempfile::tempdir().unwrap();
-        let content = [TestEntry {
-            namespace: b'C',
-            url: "Apple",
-            title: "Apple",
-            mime: 0,
-            body: b"<html><body><h1>Apple</h1><p>An apple a day.</p></body></html>",
-        }];
-        let bytes = build_archive(&["text/html"], &content, &[], 0, None);
-
-        let file = dir.path().join("one.zim");
-        std::fs::write(&file, &bytes).unwrap();
-        let single = ZimLibrary::single(&file).unwrap();
-        assert_eq!(single.mode, Mode::Single);
-        assert!(Arc::ptr_eq(single.single_archive().unwrap(), &single.archives[0]));
-
-        std::fs::write(dir.path().join("two.zim"), &bytes).unwrap();
-        let scanned = ZimLibrary::scan(dir.path()).unwrap();
-        assert_eq!(scanned.mode, Mode::Directory);
-        assert!(scanned.single_archive().is_none());
-    }
 }

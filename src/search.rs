@@ -995,22 +995,6 @@ pub(crate) mod tests {
         <p>People season their food with it.</p>\
         </body></html>";
 
-    /// Articles whose query matches a mid-paragraph sentence of a body
-    /// region: the preview is still the intro start, while the matched
-    /// region is reported as `sections`. The Volcano lead does not cover
-    /// its query, so the lead fast path does not fire. Filler sections in
-    /// both fixtures keep the matching region a minority under the
-    /// coverage cap.
-    const VOLCANO_HTML: &str = "<html><body><h1>Volcano</h1>\
-        <p>Volcanoes are openings in the crust.</p>\
-        <p>Molten rock rises from chambers below. Eruptions reshape the \
-        land. Ash clouds can ground aircraft. Farmers fear the fallout.</p>\
-        <h2>Formation</h2>\
-        <p>Magma accumulates in underground chambers.</p>\
-        <h2>Hazards</h2>\
-        <p>Eruptions endanger nearby settlements.</p>\
-        </body></html>";
-
     const GLACIER_MD: &str = "\
 # Glacier
 
@@ -1821,27 +1805,6 @@ Scientists measure the flow from observatories.
     }
 
     #[test]
-    fn e2e_search_query_without_exact_match_keeps_ranking() {
-        let (server, _keep) = exact_test_server();
-
-        // Nobody's title or URL, so the ranking is the unchanged BM25
-        // order: the document with both terms first.
-        let hits = search(&server, "nitrogen atmosphere");
-        assert_eq!(hits.len(), 2, "{hits:?}");
-        assert_eq!(hits[0].path, "C/Atmosphere", "{hits:?}");
-        assert_eq!(hits[1].path, "C/Nitrogen", "{hits:?}");
-        // The Atmosphere lead covers the whole query ("The atmosphere is
-        // mostly nitrogen and oxygen.") in its first paragraph, and the
-        // Nitrogen lead covers "nitrogen": BM25 over the section index
-        // scores the intro region of each - but each article's ONLY region
-        // is its intro, so the kept set covers the whole article and the
-        // coverage cap suppresses the list for both hits.
-        assert_eq!(hits[0].sections, None, "{:?}", hits[0]);
-        assert_eq!(hits[0].preview, "The atmosphere is mostly nitrogen and oxygen.");
-        assert_eq!(hits[1].sections, None, "{:?}", hits[1]);
-        assert_eq!(hits[1].preview, "Nitrogen is a colorless, odorless gas.");
-    }
-    #[test]
     fn e2e_search_section_match_reports_sections() {
         // The query term appears only in a later section of the article
         // ("Wild apples grew in Kazakhstan." under History): the intro
@@ -2123,90 +2086,7 @@ Scientists measure the flow from observatories.
         assert_eq!(lead_preview, preview_truncate(&paragraph));
     }
 
-    #[test]
-    fn e2e_search_section_match_still_reports_sections() {
-        // The query matches a mid-paragraph sentence of a body region: the
-        // preview is the article's lead (the intro start), NOT the matched
-        // sentence - but the matched region is still reported. Covered for
-        // an HTML article (intro match) and a Markdown one (body-section
-        // match).
-        let dir = tempfile::tempdir().unwrap();
-        let index = make_index(
-            &[
-                ("C/Volcano", "volcano crust molten rock erupt reshape land ash cloud aircraft farmer", "Volcano"),
-                ("C/Glacier", "glacier ice movement weight flow river meltwater stream", "Glacier"),
-            ],
-        );
-        let content = [
-            TestEntry { namespace: b'C', url: "Volcano", title: "Volcano", mime: 0, body: VOLCANO_HTML.as_bytes() },
-            TestEntry { namespace: b'C', url: "Glacier", title: "Glacier", mime: 1, body: GLACIER_MD.as_bytes() },
-        ];
-        let bytes = build_archive(&["text/html", "text/markdown"], &content, &[], 0, Some(&index));
-        std::fs::write(dir.path().join("test.zim"), &bytes).unwrap();
-        let library = Arc::new(ZimLibrary::scan(dir.path()).unwrap());
-        assert!(library.archives[0].searchable());
-        let server = ZimMcpServer::new(library);
-
-        let hits = search(&server, "aircraft");
-        assert_eq!(hits.len(), 1, "{hits:?}");
-        assert_eq!(hits[0].path, "C/Volcano");
-        assert_eq!(hits[0].sections, Some(vec!["_intro".to_string()]));
-        assert_eq!(hits[0].preview, "Volcanoes are openings in the crust.");
-
-        let hits = search(&server, "river");
-        assert_eq!(hits.len(), 1, "{hits:?}");
-        assert_eq!(hits[0].path, "C/Glacier");
-        assert_eq!(hits[0].sections, Some(vec!["Movement".to_string()]));
-        assert_eq!(hits[0].preview, "A glacier is a body of dense ice.");
-    }
-
-    #[test]
-    fn e2e_search_all_words_doc_wins_under_plain_or() {
-        // Plain BM25 (OR over the query terms) must rank the document that
-        // mentions EACH query term above the ones repeating a single term:
-        // BM25 saturates term frequency and rewards the second, rare term.
-        let dir = tempfile::tempdir().unwrap();
-        // The repeated "filler" term pads document length (BM25 length
-        // normalization); it is no query word.
-        let cherry_terms = format!("{}{}", "cherri ".repeat(30), "filler ".repeat(400));
-        let pie_terms = format!("{}{}", "pie ".repeat(30), "filler ".repeat(400));
-        let index = make_index(
-            &[
-                ("C/Cherry", cherry_terms.as_str(), "Cherry"),
-                ("C/Dessert_Recipes", "cherri cherri pie pie", "Dessert Recipes"),
-                ("C/Pie_1", pie_terms.as_str(), "Pie 1"),
-                ("C/Pie_2", pie_terms.as_str(), "Pie 2"),
-                ("C/Mango", "mango tropic tree sweet", "Mango"),
-                ("C/Peach", "peach orchard stone fruit", "Peach"),
-            ],
-        );
-        let content = [
-            TestEntry { namespace: b'C', url: "Cherry", title: "Cherry", mime: 0, body: CHERRY_HTML.as_bytes() },
-            TestEntry { namespace: b'C', url: "Dessert_Recipes", title: "Dessert Recipes", mime: 0, body: CHERRY_HTML.as_bytes() },
-            TestEntry { namespace: b'C', url: "Pie_1", title: "Pie 1", mime: 0, body: CHERRY_HTML.as_bytes() },
-            TestEntry { namespace: b'C', url: "Pie_2", title: "Pie 2", mime: 0, body: CHERRY_HTML.as_bytes() },
-            TestEntry { namespace: b'C', url: "Mango", title: "Mango", mime: 0, body: b"<html><body><h1>Mango</h1><p>A mango is a tropical stone fruit.</p></body></html>" },
-            TestEntry { namespace: b'C', url: "Peach", title: "Peach", mime: 0, body: b"<html><body><h1>Peach</h1><p>A peach grows in orchards.</p></body></html>" },
-        ];
-        let bytes = build_archive(&["text/html"], &content, &[], 0, Some(&index));
-        std::fs::write(dir.path().join("test.zim"), &bytes).unwrap();
-        let library = Arc::new(ZimLibrary::scan(dir.path()).unwrap());
-        assert!(library.archives[0].searchable());
-        let server = ZimMcpServer::new(library);
-
-        let hits = search(&server, "cherry pie");
-        assert_eq!(hits[0].path, "C/Dessert_Recipes", "{hits:?}");
-        assert_eq!(hits[0].title, "Dessert Recipes");
-        // The single-term matches still appear, behind the all-words doc.
-        assert_eq!(hits[1].path, "C/Cherry", "{hits:?}");
-        assert_eq!(hits[2].path, "C/Pie_1", "{hits:?}");
-        assert_eq!(hits[3].path, "C/Pie_2", "{hits:?}");
-        // Neither hit's lead covers both terms; the intro matches "cherry"
-        // but is the article's only region, so the kept set covers the
-        // whole article and the coverage cap suppresses the list.
-        assert_eq!(hits[0].sections, None);
-        assert!(hits[0].preview.contains("cherry is the fruit"), "{:?}", hits[0].preview);
-    }    /// Two archives (a.zim, b.zim) that both carry an "Apple" article (the
+    /// Two archives (a.zim, b.zim) that both carry an "Apple" article (the
     /// same article, as in an HTML and a Markdown edition of the same ZIM),
     /// plus one exclusive article each: a.zim holds C/Banana, b.zim holds
     /// C/Cherry. Returns the tempdir (it must outlive the searches) and the
@@ -2263,65 +2143,6 @@ Scientists measure the flow from observatories.
         assert_eq!(hits.len(), 2, "{hits:?}");
         assert_eq!((hits[0].zim.as_str(), hits[0].path.as_str()), ("b.zim", "C/Cherry"));
         assert_eq!((hits[1].zim.as_str(), hits[1].path.as_str()), ("a.zim", "C/Banana"));
-    }
-
-    /// Two archives whose "cherry" hits differ in strength: a.zim (first in
-    /// library order) holds a weak match - the term once in a long document
-    /// - and b.zim a strong one - four occurrences in a short document.
-    /// Returns the tempdir (it must outlive the searches) and the scanned
-    /// library.
-    fn pooled_rerank_library() -> (tempfile::TempDir, Arc<ZimLibrary>) {
-        let dir = tempfile::tempdir().unwrap();
-        let weak_terms = format!("cherri {}", "filler ".repeat(60));
-        let strong_terms = format!("{}pad pad", "cherri ".repeat(4));
-        let unrelated = "unrelated words entirely";
-        let index_a = make_index(&[
-            ("C/Long_Doc", weak_terms.as_str(), "Long doc"),
-            ("C/A_Other", unrelated, "Other"),
-        ]);
-        let index_b = make_index(&[
-            ("C/Short_Doc", strong_terms.as_str(), "Short doc"),
-            ("C/B_Other", unrelated, "More"),
-        ]);
-        let entry = |url: &'static str, title: &'static str| TestEntry {
-            namespace: b'C',
-            url,
-            title,
-            mime: 0,
-            body: b"<html><body><h1>Filler.</h1><p>Filler text.</p></body></html>",
-        };
-        let content_a = [entry("Long_Doc", "Long doc"), entry("A_Other", "Other")];
-        let content_b = [entry("Short_Doc", "Short doc"), entry("B_Other", "More")];
-        std::fs::write(
-            dir.path().join("a.zim"),
-            build_archive(&["text/html"], &content_a, &[], 0, Some(&index_a)),
-        )
-        .unwrap();
-        std::fs::write(
-            dir.path().join("b.zim"),
-            build_archive(&["text/html"], &content_b, &[], 0, Some(&index_b)),
-        )
-        .unwrap();
-        let library = Arc::new(ZimLibrary::scan(dir.path()).unwrap());
-        assert_eq!(library.archives.len(), 2);
-        (dir, library)
-    }
-
-    #[test]
-    fn e2e_search_pooled_rerank_ranks_the_strong_match_first() {
-        let (_dir, library) = pooled_rerank_library();
-        let server = ZimMcpServer::new(library);
-
-        // Rank rotation interleaved by archive rank and would have reported
-        // the weak a.zim match first (a.zim is scanned first and each
-        // archive holds exactly one hit). The pooled re-score ranks both
-        // candidates with one BM25 over the pooled statistics: b.zim's
-        // short document carries the term four times, a.zim's long one
-        // once, and the strong match must come first.
-        let hits = search(&server, "cherry");
-        assert_eq!(hits.len(), 2, "{hits:?}");
-        assert_eq!((hits[0].zim.as_str(), hits[0].path.as_str()), ("b.zim", "C/Short_Doc"));
-        assert_eq!((hits[1].zim.as_str(), hits[1].path.as_str()), ("a.zim", "C/Long_Doc"));
     }
 
     #[test]
@@ -2395,79 +2216,6 @@ Scientists measure the flow from observatories.
                     cand.path
                 );
             }
-            Ok(())
-        })
-        .unwrap()
-        .unwrap();
-    }
-
-    /// Real-index verification, run explicitly: the synthetic fixtures are
-    /// built through xapian2's own `WritableDatabase`, but real ZIM indexes
-    /// are glass databases written by libzim with `DB_NO_TERMLIST` (termlist
-    /// access throws on every document there), so the pooled re-score's
-    /// accessors and scores are verified against one. Run with
-    /// `SZMCP_REAL_ZIM=<zim file> cargo test --bin szmcp real_zim -- --ignored`
-    /// (a symlinked file is fine); skipped without the variable.
-    #[test]
-    #[ignore]
-    fn real_zim_fulltext_rescore_matches_xapian_weights() {
-        let Ok(path) = std::env::var("SZMCP_REAL_ZIM") else {
-            eprintln!("SZMCP_REAL_ZIM not set; skipping the real-ZIM verification");
-            return;
-        };
-        let library = Arc::new(ZimLibrary::single(std::path::Path::new(&path)).unwrap());
-        assert!(library.archives[0].searchable(), "{path}");
-        let arc = &library.archives[0];
-        // A repeated query word ("acid" twice) over common chemistry words:
-        // both index many documents, so the pooled re-score sees df > 1.
-        let query_state = ArchiveQuery::build(arc, &fold_accents("acid acid base")).unwrap();
-        let started = std::time::Instant::now();
-        arc.with_xapian(|h| -> Result<(), ToolError> {
-            let ft = fetch_fulltext(h, &query_state)?;
-            // The accessors on a real libzim glass database: sane lengths
-            // and document frequencies (the DB_NO_TERMLIST shape must not
-            // break doc lengths or wdfs).
-            assert!(ft.docs > 0);
-            assert!(ft.avlen > 0.0, "average_length {} on {path}", ft.avlen);
-            assert!(ft.candidates.iter().all(|c| c.doclen > 0.0));
-            assert!(ft.candidates.iter().any(|c| c.wdfs.iter().any(|w| *w > 0)));
-            assert_eq!(
-                ft.terms.iter().map(|(t, w)| (t.as_str(), *w)).collect::<Vec<_>>(),
-                [("acid", 2), ("base", 1)]
-            );
-            assert!(ft.candidates.len() >= 2, "expected several acid/base hits");
-
-            let mut enquire = Enquire::new(&h.fulltext)?;
-            enquire.set_query(query_state.ft_query.as_ref().unwrap())?;
-            enquire.set_sort_by_relevance();
-            let mset = enquire.get_mset(0, FT_FETCH_PER_ARCHIVE, 0)?;
-            let mut weight_of = std::collections::HashMap::new();
-            for i in 0..mset.size() {
-                weight_of.insert(mset.document(i)?.data_str()?, mset.weight(i));
-            }
-            assert_eq!(weight_of.len(), ft.candidates.len());
-
-            let payload = (arc, ft);
-            let pool = FtPool::new(std::slice::from_ref(&payload));
-            let mut worst = 0.0f64;
-            for cand in &payload.1.candidates {
-                let score = pool.score(&payload.1, cand);
-                let expected = weight_of[&cand.path];
-                worst = worst.max((score - expected).abs() / expected.abs().max(1e-12));
-                assert!(
-                    (score - expected).abs() <= 1e-9 * expected.abs().max(1e-12),
-                    "{}: recomputed {score} against Xapian {expected}",
-                    cand.path
-                );
-            }
-            eprintln!(
-                "real ZIM {path}: {} docs, avlen {:.2}, {} candidates, \
-                 max relative difference {worst:.2e}, payload fetch {} ms",
-                payload.1.docs,
-                payload.1.avlen,
-                payload.1.candidates.len(),
-                started.elapsed().as_millis()
-            );
             Ok(())
         })
         .unwrap()

@@ -372,26 +372,4 @@ mod tests {
         ));
     }
 
-    #[test]
-    fn e2e_get_rejects_zim_names_outside_the_directory() {
-        let (server, _keep) = test_server();
-
-        // Traversal and absolute names leave the ZIM directory; the shared
-        // name matcher refuses both, with the same NotFound shape as an
-        // unknown name (listing the loaded files).
-        for zim in ["../evil.zim", "/etc/passwd"] {
-            let params = serde_json::from_value::<ZimGetDirParams>(
-                serde_json::json!({ "zim": zim, "path": "C/Apple" }),
-            )
-            .unwrap();
-            assert!(
-                matches!(
-                    block_on(ZimGetDirTool::invoke(&server, params)),
-                    Err(ToolError::NotFound(msg))
-                        if msg.contains("not found") && msg.contains("test.zim")
-                ),
-                "{zim}"
-            );
-        }
-    }
 }

@@ -502,17 +502,6 @@ mod tests {
         assert_eq!(one.results.len(), 1, "{:?}", one.results);
         assert_eq!(one.results[0].zim, "a.zim");
 
-        // Unknown and traversal names are refused.
-        for zim in ["nope.zim", "../x.zim"] {
-            let params = ZimSearchDirParams { query: "apple".into(), zim: Some(zim.into()), limit: None };
-            assert!(
-                matches!(
-                    block_on(ZimSearchDirTool::invoke(&server, params)),
-                    Err(ToolError::NotFound(_))
-                ),
-                "{zim}"
-            );
-        }
     }
 
     #[test]

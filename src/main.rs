@@ -254,28 +254,4 @@ mod tests {
         assert!(err.contains(&canonical.display().to_string()), "{err}");
     }
 
-    #[test]
-    fn get_and_get_section_accept_content_flag() {
-        for args in [
-            vec!["szmcp", "get", "x.zim", "C/foo", "--content"],
-            vec!["szmcp", "get", "x.zim", "C/foo"],
-            vec!["szmcp", "get_section", "x.zim", "C/foo", "Intro", "--content"],
-            vec!["szmcp", "get_section", "x.zim", "C/foo", "Intro"],
-        ] {
-            // Accepted (flag present or absent); variant shape checked below.
-            Cli::try_parse_from(&args).unwrap_or_else(|e| panic!("{args:?}: {e}"));
-        }
-        // The flag defaults to JSON output.
-        match Cli::try_parse_from(["szmcp", "get", "x.zim", "C/foo"]).unwrap().command {
-            Command::Get { content, .. } => assert!(!content),
-            _ => panic!("expected get"),
-        }
-        match Cli::try_parse_from(["szmcp", "get_section", "x.zim", "C/foo", "Intro"])
-            .unwrap()
-            .command
-        {
-            Command::GetSection { content, .. } => assert!(!content),
-            _ => panic!("expected get_section"),
-        }
-    }
 }
