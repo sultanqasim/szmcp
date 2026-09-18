@@ -642,24 +642,28 @@ pub fn search(
         };
         let article = String::from_utf8_lossy(&bytes);
         // Markdown editions carry plain Markdown, not HTML: pick the matching
-        // splitter so the paragraphs and section names are free of markup.
+        // splitter so the preview text and section names are free of markup.
         let is_markdown = mime.as_deref().is_some_and(|m| m.contains("markdown"));
-        // Section scoring runs the hit archive's own full-text query and its
-        // stemmer (the archive is always from the library, so the lookup
-        // cannot fail).
-        let qi = archives
-            .iter()
-            .position(|a| Arc::ptr_eq(a, arc))
-            .expect("hit archive is from the library");
-        let query_state = &mut queries[qi];
-        let (preview, sections) = hit_preview(
-            &article,
-            &query_state.terms,
-            &mut query_state.stemmer,
-            query_state.ft_query.as_ref(),
-            title_match,
-            is_markdown,
-        )?;
+        let preview = hit_preview(&article, title_match, is_markdown);
+        // Only full-text hits report sections, scored with the hit archive's
+        // own full-text query and stemmer (the archive is always from the
+        // library, so the lookup cannot fail).
+        let sections = if title_match {
+            None
+        } else {
+            let qi = archives
+                .iter()
+                .position(|a| Arc::ptr_eq(a, arc))
+                .expect("hit archive is from the library");
+            let query_state = &mut queries[qi];
+            hit_sections(
+                &article,
+                &query_state.terms,
+                &mut query_state.stemmer,
+                query_state.ft_query.as_ref(),
+                is_markdown,
+            )?
+        };
         hits.push(SearchHit {
             zim: arc.name.clone(),
             path: path.clone(),
@@ -840,59 +844,54 @@ fn preview_truncate(s: &str) -> String {
     }
 }
 
-/// The `preview`/`sections` pair of one search hit, from the article's raw
-/// text (`is_markdown` picks the Markdown or the HTML splitter). The
-/// preview is the article's lead - the first intro paragraph, truncated at
-/// the last word boundary at or before `INTRO_CHARS` ([`preview_truncate`])
-/// - no matter where in the article the query matched; a title match keeps
-/// the intro's first sentence, truncated the same way. The `sections` of
-/// a full-text hit are BM25-scored: the article's regions (`_intro` first,
-/// then one region per heading in document order) go into a temporary
-/// in-memory Xapian index ([`region_scores`]) that the hit's own full-text
-/// query is run against, and the regions scoring at least
-/// [`SECTION_MIN_SCORE_FRAC`] of the article's best region are reported in
-/// document order - the intro and body sections compete on equal BM25
-/// terms, so a region that merely grazes a common query word drops out
-/// while the region carrying the query's substance wins. When more than
-/// [`SECTION_MAX_COVERAGE`] of the regions qualify, the whole article is
-/// likely relevant and no list is reported. No region matching any query
-/// word reports no sections; empty regions give an empty preview, never a
-/// panic.
-fn hit_preview(
-    article: &str,
-    terms: &[String],
-    stem: &mut Stemmer,
-    ft_query: Option<&Query>,
-    title_match: bool,
-    is_markdown: bool,
-) -> Result<(String, Option<Vec<String>>), ToolError> {
+/// The `preview` of one search hit, from the article's raw text
+/// (`is_markdown` picks the Markdown or the HTML splitter). The preview is
+/// the article's lead - the first intro paragraph, truncated at the last
+/// word boundary at or before `INTRO_CHARS` ([`preview_truncate`]) - no
+/// matter where in the article the query matched (the old
+/// best-matching-sentence preview is gone); a title match keeps just the
+/// intro's first sentence, truncated the same way. The preview never looks
+/// at the query: no scoring, only the intro extraction - an article with
+/// no intro yields an empty preview, never a panic.
+fn hit_preview(article: &str, title_match: bool, is_markdown: bool) -> String {
     let intro = if is_markdown {
         markdown::intro_paragraphs(article)
     } else {
         html::intro_paragraphs(article)
     };
-    let lead = || {
-        intro.first()
-            .map(|p| preview_truncate(p))
-            .unwrap_or_default()
-    };
-    if title_match {
-        let first = intro
-            .first()
-            .and_then(|p| {
-                sentences(p)
-                    .first()
-                    .map(|s| preview_truncate(s))
-            })
-            .unwrap_or_default();
-        return Ok((first, None));
+    match intro.first() {
+        None => String::new(),
+        Some(lead) if title_match => {
+            sentences(lead).first().map(|s| preview_truncate(s)).unwrap_or_default()
+        }
+        Some(lead) => preview_truncate(lead),
     }
-    // The preview is the lead regardless of where the query matched: the
-    // old best-matching-sentence search (re-scoring every sentence of
-    // every matched paragraph) is gone. The region index below feeds only
-    // the `sections` reporting.
+}
+
+/// The `sections` of one full-text search hit (title matches report none -
+/// the caller only passes fulltext hits here): the article's regions
+/// (`_intro` first, then one region per heading in document order) are
+/// BM25-scored against the hit's own full-text query. The regions go into
+/// a temporary in-memory Xapian index ([`region_scores`]) and the regions
+/// scoring at least [`SECTION_MIN_SCORE_FRAC`] of the article's best
+/// region are reported in document order - the intro and body sections
+/// compete on equal BM25 terms, so a region that merely grazes a common
+/// query word drops out while the region carrying the query's substance
+/// wins. When more than [`SECTION_MAX_COVERAGE`] of the regions qualify,
+/// the whole article is likely relevant and no list is reported; the same
+/// goes for a region split that found no regions, for no region matching
+/// any query word (best score 0), and for the defensive `ft_query` of
+/// `None` (an all-punctuation query skips the fulltext band and with it
+/// the tier's candidates - a fulltext hit always carries a query).
+fn hit_sections(
+    article: &str,
+    terms: &[String],
+    stem: &mut Stemmer,
+    ft_query: Option<&Query>,
+    is_markdown: bool,
+) -> Result<Option<Vec<String>>, ToolError> {
     let Some(query) = ft_query else {
-        return Ok((lead(), None));
+        return Ok(None);
     };
     let secs = if is_markdown {
         markdown::sections(article)
@@ -900,11 +899,11 @@ fn hit_preview(
         html::sections(article)
     };
     if secs.is_empty() {
-        return Ok((lead(), None));
+        return Ok(None);
     }
     let scores = region_scores(&secs, terms, stem, query)?;
     let names: Vec<String> = secs.iter().map(|(name, _)| name.clone()).collect();
-    Ok((lead(), scored_sections(&names, &scores, SECTION_MIN_SCORE_FRAC, SECTION_MAX_COVERAGE)))
+    Ok(scored_sections(&names, &scores, SECTION_MIN_SCORE_FRAC, SECTION_MAX_COVERAGE))
 }
 
 // ---------------------------------------------------------------------------
@@ -2076,14 +2075,18 @@ Scientists measure the flow from observatories.
         assert_eq!(preview_truncate(&giant), "x".repeat(INTRO_CHARS));
 
         // The same paragraph as a fulltext hit's lead: the preview is the
-        // lead truncated at the word boundary, and only the lead (no
-        // sections) is reported without a full-text query.
-        let mut stem = Stemmer::new("en").unwrap();
+        // lead truncated at the word boundary, and it takes no query at
+        // all; a title match keeps just the first sentence.
         let article = format!("<html><body><h1>T</h1><p>{paragraph}</p></body></html>");
-        let (lead_preview, sections) =
-            hit_preview(&article, &[], &mut stem, None, false, false).unwrap();
-        assert_eq!(sections, None);
-        assert_eq!(lead_preview, preview_truncate(&paragraph));
+        assert_eq!(hit_preview(&article, false, false), preview_truncate(&paragraph));
+        let titled = "<html><body><h1>T</h1><p>First sentence here. Second one.</p></body></html>";
+        assert_eq!(hit_preview(titled, true, false), "First sentence here.");
+        assert_eq!(hit_preview(titled, false, false), "First sentence here. Second one.");
+
+        // No full-text query (an all-punctuation query skips the band):
+        // no sections.
+        let mut stem = Stemmer::new("en").unwrap();
+        assert_eq!(hit_sections(&article, &[], &mut stem, None, false).unwrap(), None);
     }
 
     /// Two archives (a.zim, b.zim) that both carry an "Apple" article (the
