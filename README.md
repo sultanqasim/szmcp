@@ -157,7 +157,9 @@ szmcp get_section /path/to/file.zim C/SomeArticle "History"
   vs. directory mode, see Tools).
 - `search`, `get` and `get_section` run the matching tool once and print its
   response JSON to stdout — the same JSON the MCP tool returns, without the
-  MCP wrapper. `get` and `get_section` take the ZIM file itself — the archive
+  MCP wrapper. `search` takes an optional `--limit` capping the number of
+  results (default 10, matching the tool's `limit` argument). `get` and
+  `get_section` take the ZIM file itself — the archive
   is identified by its own path; search results name ZIM files relative to
   the scanned directory. Errors go to stderr and exit non-zero.
 

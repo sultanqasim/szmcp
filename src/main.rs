@@ -45,6 +45,9 @@ enum Command {
         zim_path: PathBuf,
         /// The search string to look for
         query: String,
+        /// Maximum number of results to return (default 10)
+        #[arg(long)]
+        limit: Option<usize>,
     },
     /// Get the full content of an article from a ZIM file
     Get {
@@ -127,9 +130,10 @@ fn print_result<T: serde::Serialize>(result: &T) -> Result<(), String> {
 async fn run(command: Command) -> Result<(), String> {
     match command {
         Command::Serve { zim_path, bind, port } => serve(&zim_path, bind, port).await,
-        Command::Search { zim_path, query } => {
+        Command::Search { zim_path, query, limit } => {
             let library = open_library(&zim_path)?;
-            let results = search(&library, None, &query, DEFAULT_SEARCH_LIMIT).map_err(|e| e.to_string())?;
+            let limit = limit.unwrap_or(DEFAULT_SEARCH_LIMIT);
+            let results = search(&library, None, &query, limit).map_err(|e| e.to_string())?;
             print_result(&results)
         }
         Command::Get { zim_path, path, content } => {
