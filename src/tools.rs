@@ -120,16 +120,10 @@ impl ToolBase for ZimSearchTool {
     }
     fn description() -> Option<Cow<'static, str>> {
         Some(
-            "Search all articles in all ZIM files. Results are ranked best first in three \
-             tiers: an exact title/URL match comes first (a matching redirect reports the \
-             article it points to), then articles whose title contains every query word, \
-             then full-text matches ranked by BM25 relevance over all query words (partial \
-             matches still return). Each result has the ZIM file name, the article path, \
-             the page title, and a preview - the article's first intro sentence for title \
-             matches, otherwise the sentence that best matches the query together with \
-             \"sections\", the matching regions' names (the intro listed as \"_intro\"). \
-             The same article is reported once even when several spellings of it match. \
-             Use the returned zim and path with the zim_get and zim_get_section tools."
+            "Search for articles in a ZIM file. Returned results are ranked best first. \
+             For full-text search matches where only specific article sections match the \
+             query, a \"sections\" field in the result lists the relevant section names. \
+             Use the returned article path with the zim_get and zim_get_section tools."
                 .into(),
         )
     }
@@ -152,8 +146,7 @@ impl AsyncTool<ZimMcpServer> for ZimSearchTool {
 pub struct ZimSearchDirParams {
     /// The search string to look for in all articles of all ZIM files
     pub query: String,
-    /// ZIM file to search, relative to the ZIM directory (as zim_list
-    /// reports); omit to search all ZIM files
+    /// ZIM file name to search; omit to search all ZIM files
     pub zim: Option<String>,
 }
 
@@ -169,18 +162,12 @@ impl ToolBase for ZimSearchDirTool {
     }
     fn description() -> Option<Cow<'static, str>> {
         Some(
-            "Search all articles in all ZIM files. By default every ZIM file is searched; \
-             pass \"zim\" (a name from zim_list) to restrict the search to one file. \
-             Results are ranked best first in three tiers: an exact title/URL match comes \
-             first (a matching redirect reports the article it points to), then articles \
-             whose title contains every query word, then full-text matches ranked by BM25 \
-             relevance over all query words (partial matches still return). Each result \
-             has the ZIM file name, the article path, the page title, and a preview - the \
-             article's first intro sentence for title matches, otherwise the sentence \
-             that best matches the query together with \"sections\", the matching \
-             regions' names (the intro listed as \"_intro\"). The same article is \
-             reported once even when several spellings of it match. Use the returned zim \
-             and path with the zim_get and zim_get_section tools."
+            "Search for articles in ZIM files. Returned results are ranked best first. \
+             For full-text search matches where only specific article sections match the \
+             query, a \"sections\" field in the result lists the relevant section names. \
+             By default every available ZIM file is searched; pass \"zim\" (a name from \
+             zim_list) to restrict the search to one file. Use the returned ZIM file name \
+             and article path with the zim_get and zim_get_section tools."
                 .into(),
         )
     }
@@ -203,7 +190,7 @@ impl AsyncTool<ZimMcpServer> for ZimSearchDirTool {
 
 #[derive(Deserialize, JsonSchema, Default)]
 pub struct ZimGetParams {
-    /// Path of the article inside the ZIM file, or an article title such as "Beaconsfield, Quebec"
+    /// Path of the article inside the ZIM file, or the article title
     pub path: String,
 }
 
@@ -219,11 +206,7 @@ impl ToolBase for ZimGetTool {
     }
     fn description() -> Option<Cow<'static, str>> {
         Some(
-            "Get the full content of an article or page from the ZIM file. Arguments: the \
-             article/page path (as returned by zim_search) or an article title such as \
-             \"Beaconsfield, Quebec\". Returns the title, final path, MIME type, and the \
-             full content (UTF-8 text, or base64 for binary objects)."
-                .into(),
+            "Get the full content of an article or page from the ZIM file.".into(),
         )
     }
 }
@@ -250,9 +233,9 @@ impl AsyncTool<ZimMcpServer> for ZimGetTool {
 
 #[derive(Deserialize, JsonSchema, Default)]
 pub struct ZimGetDirParams {
-    /// ZIM file name, relative to the ZIM directory (as given in search results)
+    /// ZIM file name
     pub zim: String,
-    /// Path of the article inside the ZIM file, or an article title such as "Beaconsfield, Quebec"
+    /// Path of the article inside the ZIM file, or the article title
     pub path: String,
 }
 
@@ -268,12 +251,7 @@ impl ToolBase for ZimGetDirTool {
     }
     fn description() -> Option<Cow<'static, str>> {
         Some(
-            "Get the full content of an article or page from a ZIM file. Arguments: the \
-             ZIM file name relative to the ZIM directory (as zim_list reports), and the \
-             article/page path (as returned by zim_search) or an article title such as \
-             \"Beaconsfield, Quebec\". Returns the title, final path, MIME type, and the \
-             full content (UTF-8 text, or base64 for binary objects)."
-                .into(),
+            "Get the full content of an article or page from a ZIM file.".into(),
         )
     }
 }
@@ -293,10 +271,9 @@ impl AsyncTool<ZimMcpServer> for ZimGetDirTool {
 
 #[derive(Deserialize, JsonSchema, Default)]
 pub struct ZimGetSectionParams {
-    /// Path of the article inside the ZIM file, or an article title such as "Beaconsfield, Quebec"
+    /// Path of the article inside the ZIM file, or the article title
     pub path: String,
-    /// Name of the section to retrieve: heading text, or `_intro` for the
-    /// introduction
+    /// Name of the section to retrieve
     pub section: String,
 }
 
@@ -314,10 +291,7 @@ impl ToolBase for ZimGetSectionTool {
         Some(
             "Get a single section of an article or page from the ZIM file, identified by \
              its heading text (e.g. \"History\"), or by the special name \"_intro\" for \
-             the introduction (the content before the first heading). The article is \
-             given by its path (as returned by zim_search) or its title (e.g. \
-             \"Beaconsfield, Quebec\"). Returns the page title, the section name, and the \
-             section's content."
+             the article lead."
                 .into(),
         )
     }
@@ -345,12 +319,11 @@ impl AsyncTool<ZimMcpServer> for ZimGetSectionTool {
 
 #[derive(Deserialize, JsonSchema, Default)]
 pub struct ZimGetSectionDirParams {
-    /// ZIM file name, relative to the ZIM directory (as given in search results)
+    /// ZIM file name
     pub zim: String,
-    /// Path of the article inside the ZIM file, or an article title such as "Beaconsfield, Quebec"
+    /// Path of the article inside the ZIM file, or the article title
     pub path: String,
-    /// Name of the section to retrieve: heading text, or `_intro` for the
-    /// introduction
+    /// Name of the section to retrieve
     pub section: String,
 }
 
@@ -366,13 +339,9 @@ impl ToolBase for ZimGetSectionDirTool {
     }
     fn description() -> Option<Cow<'static, str>> {
         Some(
-            "Get a single section of an article or page from a ZIM file, identified by its \
-             heading text (e.g. \"History\"), or by the special name \"_intro\" for the \
-             introduction (the content before the first heading). The article is given \
-             by its path (as returned by zim_search) or its title (e.g. \
-             \"Beaconsfield, Quebec\"), in the ZIM file named by \"zim\" (as zim_list \
-             reports). Returns the page title, the section name, and the section's \
-             content."
+            "Get a single section of an article or page from a ZIM file, identified by \
+             its heading text (e.g. \"History\"), or by the special name \"_intro\" for \
+             the article lead."
                 .into(),
         )
     }
@@ -398,7 +367,7 @@ pub struct ZimListParams {}
 
 #[derive(Serialize, JsonSchema)]
 pub struct ZimListResult {
-    /// ZIM file names, relative to the ZIM directory
+    /// ZIM file names
     pub files: Vec<String>,
 }
 

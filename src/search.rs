@@ -40,23 +40,19 @@ const SECTION_MIN_SCORE_FRAC: f64 = 0.5;
 /// Most of the article's regions qualifying for the `sections` list means the
 /// whole article is relevant: report no list rather than a near-complete one.
 const SECTION_MAX_COVERAGE: f64 = 0.4;
+
 /// One search result.
 #[derive(Serialize, JsonSchema, Debug)]
 pub struct SearchHit {
-    /// ZIM file name, relative to the ZIM directory
+    /// ZIM file name
     pub zim: String,
     /// Path of the article inside the ZIM file
     pub path: String,
     /// Page/article title
     pub title: String,
-    /// Preview of the article: the intro's first sentence for title matches,
-    /// otherwise the lead (the first intro paragraph), capped at the length
-    /// above
+    /// Preview of the start of the article
     pub preview: String,
-    /// Regions holding query matches (`_intro` first when it matched, then
-    /// sections in document order), BM25-ranked against the query with the
-    /// best-scoring regions kept; absent when the query matches the title
-    /// or no region matches any query word
+    /// Headings of article sections holding query matches
     #[serde(skip_serializing_if = "Option::is_none")]
     pub sections: Option<Vec<String>>,
 }

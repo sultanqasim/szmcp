@@ -70,7 +70,7 @@ pub struct ZimGetResult {
     pub mime_type: Option<String>,
     /// Content encoding: "utf-8" or "base64"
     pub content_encoding: &'static str,
-    /// Content of the article/page/object (all of it)
+    /// Content of the article/page/object
     pub content: String,
 }
 
@@ -121,7 +121,7 @@ pub struct ZimGetSectionResult {
     pub title: String,
     /// The section name (heading) that was found
     pub section: String,
-    /// Content of the section (HTML, or Markdown for Markdown articles)
+    /// Content of the section
     pub content: String,
 }
 
