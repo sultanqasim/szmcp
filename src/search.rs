@@ -18,11 +18,11 @@ use xapian2::{
     StemStrategy, WritableDatabase,
 };
 
-/// Number of results `zim_search` returns in total (across all archives).
-const SEARCH_LIMIT: u32 = 20;
+/// Results `zim_search` returns when the tool's `limit` argument is omitted.
+pub const DEFAULT_SEARCH_LIMIT: usize = 10;
 /// How many full-text candidates each archive contributes to the pooled
-/// re-ranking (its own BM25 order, best first): [`SEARCH_LIMIT`] results
-/// must survive the merge, and pooling rewards an archive with more than
+/// re-ranking (its own BM25 order, best first): [`DEFAULT_SEARCH_LIMIT`]
+/// results must survive the merge, and pooling rewards an archive with more than
 /// one strong match, so the per-archive fetch is well past the limit.
 const FT_FETCH_PER_ARCHIVE: u32 = 50;
 /// Maximum characters of the `preview` reported per search hit. A longer
@@ -413,13 +413,15 @@ fn path_title(path: &str) -> String {
 }
 
 /// Search the ZIM files of the library - the pipeline behind the
-/// `zim_search` tool: ranked hits, best first. `only` restricts the whole
+/// `zim_search` tool: ranked hits, best first, at most `limit` of them.
+/// `only` restricts the whole
 /// pipeline to the one named archive (`None` searches every archive); the
 /// name is the relative form results report - see [`ZimLibrary::archive`].
 pub fn search(
     library: &ZimLibrary,
     only: Option<&str>,
     query: &str,
+    limit: usize,
 ) -> Result<SearchResults, ToolError> {
     if query.trim().is_empty() {
         return Err(ToolError::InvalidArgument("query must not be empty".into()));
@@ -515,7 +517,7 @@ pub fn search(
                     let mut enquire = Enquire::new(title_db)?;
                     enquire.set_sort_by_relevance();
                     enquire.set_query(&and_query)?;
-                    let mset = enquire.get_mset(0, SEARCH_LIMIT, 0)?;
+                    let mset = enquire.get_mset(0, limit as u32, 0)?;
                     for j in 0..mset.size() {
                         let mut doc = mset.document(j)?;
                         // The title-index document's data is the article
@@ -627,7 +629,7 @@ pub fn search(
             Some((arc, path, title, kind))
         })
         .collect();
-    merged.truncate(SEARCH_LIMIT as usize);
+    merged.truncate(limit);
 
     let mut hits = Vec::with_capacity(merged.len());
     for (arc, path, title, kind) in &merged {
@@ -1033,12 +1035,12 @@ Scientists measure the flow from observatories.
     /// (`ZimSearchTool`) is exercised by the empty-query validation test
     /// below.
     fn search(server: &ZimMcpServer, query: &str) -> Vec<SearchHit> {
-        super::search(&server.library, None, query).unwrap().results
+        super::search(&server.library, None, query, DEFAULT_SEARCH_LIMIT).unwrap().results
     }
 
     /// [`search`] with the optional single-archive filter filled in.
     fn search_one(server: &ZimMcpServer, only: &str, query: &str) -> Vec<SearchHit> {
-        super::search(&server.library, Some(only), query).unwrap().results
+        super::search(&server.library, Some(only), query, DEFAULT_SEARCH_LIMIT).unwrap().results
     }
 
     /// Build a single-file glass Xapian index the way openZIM does: document
@@ -1317,9 +1319,24 @@ Scientists measure the flow from observatories.
     }
 
     #[test]
+    fn e2e_search_limit_caps_results() {
+        let (server, _keep) = test_server();
+
+        // "banana apple" matches both fixture articles; limit 1 keeps one.
+        let params = ZimSearchParams { query: "banana apple".into(), limit: Some(1) };
+        let results = block_on(ZimSearchTool::invoke(&server, params)).unwrap();
+        assert_eq!(results.results.len(), 1);
+
+        // The omitted limit keeps the default.
+        let params = ZimSearchParams { query: "banana apple".into(), limit: None };
+        let results = block_on(ZimSearchTool::invoke(&server, params)).unwrap();
+        assert!(results.results.len() <= DEFAULT_SEARCH_LIMIT);
+    }
+
+    #[test]
     fn e2e_search_empty_query_is_invalid() {
         let (server, _keep) = test_server();
-        let params = ZimSearchParams { query: "   ".into() };
+        let params = ZimSearchParams { query: "   ".into(), limit: None };
         assert!(matches!(
             block_on(ZimSearchTool::invoke(&server, params)),
             Err(ToolError::InvalidArgument(_))
@@ -2498,7 +2515,7 @@ Scientists measure the flow from observatories.
         // Unknown, traversal, and absolute names are all refused, with the
         // same NotFound message the article lookups report.
         for name in ["nope.zim", "../a.zim", "/etc/a.zim"] {
-            let err = super::search(&server.library, Some(name), "apple").unwrap_err();
+            let err = super::search(&server.library, Some(name), "apple", DEFAULT_SEARCH_LIMIT).unwrap_err();
             let ToolError::NotFound(msg) = err else {
                 panic!("expected NotFound for {name}: {err:?}");
             };

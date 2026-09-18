@@ -88,7 +88,8 @@ mode**.
   Deduplication is within an archive only: the same title in different
   archives is reported once per archive, since different archives can hold
   different articles under one title. In single mode the tool takes only the
-  query. In directory mode an optional `zim` argument restricts the search
+  query, plus an optional `limit` on the number of results (default 10). In
+  directory mode an optional `zim` argument restricts the search
   to one file; without it all ZIM files are searched: their full-text hits
   are re-scored with one BM25 formula over pooled cross-archive statistics
   and merged best-first (a strong match in a small archive outranks a weak

@@ -10,7 +10,7 @@ use get::{get_article, get_section};
 use rmcp::transport::streamable_http_server::{
     session::local::LocalSessionManager, StreamableHttpServerConfig, StreamableHttpService,
 };
-use search::search;
+use search::{search, DEFAULT_SEARCH_LIMIT};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tools::ZimMcpServer;
@@ -129,7 +129,7 @@ async fn run(command: Command) -> Result<(), String> {
         Command::Serve { zim_path, bind, port } => serve(&zim_path, bind, port).await,
         Command::Search { zim_path, query } => {
             let library = open_library(&zim_path)?;
-            let results = search(&library, None, &query).map_err(|e| e.to_string())?;
+            let results = search(&library, None, &query, DEFAULT_SEARCH_LIMIT).map_err(|e| e.to_string())?;
             print_result(&results)
         }
         Command::Get { zim_path, path, content } => {

@@ -17,7 +17,7 @@
 
 use crate::get::{get_article, get_section};
 pub use crate::get::{ZimGetResult, ZimGetSectionResult};
-use crate::search::search;
+use crate::search::{search, DEFAULT_SEARCH_LIMIT};
 pub use crate::search::SearchResults;
 use crate::zim::{Mode, ZimLibrary};
 use rmcp::handler::server::router::tool::{AsyncTool, ToolBase, ToolRouter};
@@ -106,6 +106,8 @@ impl ServerHandler for ZimMcpServer {
 pub struct ZimSearchParams {
     /// The search string to look for in all articles of all ZIM files
     pub query: String,
+    /// Maximum number of results to return (default 10)
+    pub limit: Option<usize>,
 }
 
 pub struct ZimSearchTool;
@@ -132,7 +134,9 @@ impl ToolBase for ZimSearchTool {
 impl AsyncTool<ZimMcpServer> for ZimSearchTool {
     async fn invoke(server: &ZimMcpServer, params: Self::Parameter) -> Result<Self::Output, Self::Error> {
         let library = server.library.clone();
-        tokio::task::spawn_blocking(move || search(&library, None, &params.query))
+        tokio::task::spawn_blocking(move || {
+            search(&library, None, &params.query, params.limit.unwrap_or(DEFAULT_SEARCH_LIMIT))
+        })
             .await
             .map_err(|e| ToolError::Internal(format!("zim_search task failed: {e}")))?
     }
@@ -148,6 +152,8 @@ pub struct ZimSearchDirParams {
     pub query: String,
     /// ZIM file name to search; omit to search all ZIM files
     pub zim: Option<String>,
+    /// Maximum number of results to return (default 10)
+    pub limit: Option<usize>,
 }
 
 pub struct ZimSearchDirTool;
@@ -178,7 +184,14 @@ impl AsyncTool<ZimMcpServer> for ZimSearchDirTool {
         let library = server.library.clone();
         // The pipeline validates the filter name (unknown, or one that
         // leaves the ZIM directory) and reports NotFound.
-        tokio::task::spawn_blocking(move || search(&library, params.zim.as_deref(), &params.query))
+        tokio::task::spawn_blocking(move || {
+            search(
+                &library,
+                params.zim.as_deref(),
+                &params.query,
+                params.limit.unwrap_or(DEFAULT_SEARCH_LIMIT),
+            )
+        })
             .await
             .map_err(|e| ToolError::Internal(format!("zim_search task failed: {e}")))?
     }
@@ -453,7 +466,7 @@ mod tests {
         // the file - SearchHit is mode-independent.
         let results = block_on(ZimSearchTool::invoke(
             &server,
-            ZimSearchParams { query: "apple".into() },
+            ZimSearchParams { query: "apple".into(), limit: None },
         ))
         .unwrap();
         assert!(!results.results.is_empty());
@@ -477,13 +490,13 @@ mod tests {
         // the named file is searched.
         let all = block_on(ZimSearchDirTool::invoke(
             &server,
-            ZimSearchDirParams { query: "banana cherry".into(), zim: None },
+            ZimSearchDirParams { query: "banana cherry".into(), zim: None, limit: None },
         ))
         .unwrap();
         assert_eq!(all.results.len(), 2, "{:?}", all.results);
         let one = block_on(ZimSearchDirTool::invoke(
             &server,
-            ZimSearchDirParams { query: "banana cherry".into(), zim: Some("a.zim".into()) },
+            ZimSearchDirParams { query: "banana cherry".into(), zim: Some("a.zim".into()), limit: None },
         ))
         .unwrap();
         assert_eq!(one.results.len(), 1, "{:?}", one.results);
@@ -491,7 +504,7 @@ mod tests {
 
         // Unknown and traversal names are refused.
         for zim in ["nope.zim", "../x.zim"] {
-            let params = ZimSearchDirParams { query: "apple".into(), zim: Some(zim.into()) };
+            let params = ZimSearchDirParams { query: "apple".into(), zim: Some(zim.into()), limit: None };
             assert!(
                 matches!(
                     block_on(ZimSearchDirTool::invoke(&server, params)),
