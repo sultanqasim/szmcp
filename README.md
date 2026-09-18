@@ -36,10 +36,20 @@ simple queries, and thus very slow on ordinary computers with slow prompt
 processing. Other small basic ZIM MCP servers also exist, but the ones I found
 seemed immature, unpolished, and lacking in functionality.
 
+Two other similar projects are [Zimi](https://github.com/epheterson/Zimi)
+and [zim-mcp-server](https://github.com/ThinkInAI-Hackathon/zim-mcp-server).
+While I have not used either, Zimi appears to be polished and well maintained,
+with a rich set of features, though one could say it has everything but the
+kitchen sink. The zim-mcp-server project appears similar to this, though with
+a more simplistic search mechanism that doesn't support searching across
+multiple archives and combining the results, and it doesn't appear to be
+actively maintained (not that it's necessary for a simple thing).
+
 My goal was to build a ZIM MCP server that provides just the functionality
 one really needs, which is easy to use (for LLMs and humans), and which is
 context efficient, making usage with small local LLMs on not overly powerful
-computers practical.
+computers practical. It's also a single binary written in Rust, keeping
+deployment simple and the code relatively efficient.
 
 This project is unashamedly almost entirely vibe coded. I made it with GLM 5.3
 Flash mostly. Even this README was all LLM generated, aside from this one section.
