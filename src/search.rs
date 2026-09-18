@@ -460,8 +460,8 @@ pub fn search(
     let folded_query = fold_accents(&query.replace('"', " "));
 
     // Which tier produced a hit. Exact and title-tier hits are title
-    // matches: their preview is the first intro sentence and `sections` is
-    // omitted.
+    // matches: their `sections` are omitted (the title said it all); the
+    // preview is the same lead for every tier.
     #[derive(Clone, Copy, PartialEq)]
     enum HitKind {
         /// Exact title/URL probe hit (the ZIM directory itself).
@@ -633,8 +633,7 @@ pub fn search(
 
     let mut hits = Vec::with_capacity(merged.len());
     for (arc, path, title, kind) in &merged {
-        // Exact and title-tier hits are title matches: first intro sentence
-        // as preview, no sections.
+        // Exact and title-tier hits are title matches: no sections.
         let title_match = *kind != HitKind::Fulltext;
         let (mime, bytes) = match arc.article_preview(path, HIT_READ_BYTES) {
             Ok(Some((_, mime, bytes))) => (mime, bytes),
@@ -644,7 +643,7 @@ pub fn search(
         // Markdown editions carry plain Markdown, not HTML: pick the matching
         // splitter so the preview text and section names are free of markup.
         let is_markdown = mime.as_deref().is_some_and(|m| m.contains("markdown"));
-        let preview = hit_preview(&article, title_match, is_markdown);
+        let preview = hit_preview(&article, is_markdown);
         // Only full-text hits report sections, scored with the hit archive's
         // own full-text query and stemmer (the archive is always from the
         // library, so the lookup cannot fail).
@@ -805,26 +804,6 @@ fn region_scores(
     Ok(scores)
 }
 
-/// Split a paragraph into sentences at `.`, `!`, `?` followed by whitespace
-/// or end of paragraph ("U.S." over-splits, acceptable for a preview).
-fn sentences(paragraph: &str) -> Vec<&str> {
-    let mut out = Vec::new();
-    let mut start = 0;
-    for (i, c) in paragraph.char_indices() {
-        if matches!(c, '.' | '!' | '?') {
-            let after = i + c.len_utf8();
-            if after == paragraph.len() || paragraph[after..].starts_with(char::is_whitespace) {
-                out.push(paragraph[start..after].trim());
-                start = after;
-            }
-        }
-    }
-    if start < paragraph.len() {
-        out.push(paragraph[start..].trim());
-    }
-    out.into_iter().filter(|s| !s.is_empty()).collect()
-}
-
 /// Truncate a preview to at most [`INTRO_CHARS`] characters, ending on a
 /// complete word: the text up to the cap, backed up to the last whitespace
 /// boundary so the trailing partial word (and any trailing whitespace) is
@@ -845,27 +824,21 @@ fn preview_truncate(s: &str) -> String {
 }
 
 /// The `preview` of one search hit, from the article's raw text
-/// (`is_markdown` picks the Markdown or the HTML splitter). The preview is
-/// the article's lead - the first intro paragraph, truncated at the last
-/// word boundary at or before `INTRO_CHARS` ([`preview_truncate`]) - no
-/// matter where in the article the query matched (the old
-/// best-matching-sentence preview is gone); a title match keeps just the
-/// intro's first sentence, truncated the same way. The preview never looks
-/// at the query: no scoring, only the intro extraction - an article with
-/// no intro yields an empty preview, never a panic.
-fn hit_preview(article: &str, title_match: bool, is_markdown: bool) -> String {
+/// (`is_markdown` picks the Markdown or the HTML splitter): the article's
+/// lead - the first intro paragraph, truncated at the last word boundary
+/// at or before `INTRO_CHARS` ([`preview_truncate`]). The preview never
+/// looks at the query or at the hit's tier - the old best-matching-sentence
+/// preview (2690cb0) and the title-match first-sentence variant are both
+/// gone, so every hit previews alike: no scoring, only the intro
+/// extraction. An article with no intro yields an empty preview, never a
+/// panic.
+fn hit_preview(article: &str, is_markdown: bool) -> String {
     let intro = if is_markdown {
         markdown::intro_paragraphs(article)
     } else {
         html::intro_paragraphs(article)
     };
-    match intro.first() {
-        None => String::new(),
-        Some(lead) if title_match => {
-            sentences(lead).first().map(|s| preview_truncate(s)).unwrap_or_default()
-        }
-        Some(lead) => preview_truncate(lead),
-    }
+    intro.first().map(|lead| preview_truncate(lead)).unwrap_or_default()
 }
 
 /// The `sections` of one full-text search hit (title matches report none -
@@ -1259,8 +1232,8 @@ Scientists measure the flow from observatories.
         assert_eq!(hits.len(), 1, "{hits:?}");
         assert_eq!(hits[0].path, "C/Révolution");
         // A full-text hit whose lead covers every query term: the whole
-        // two-sentence lead is the preview (a title match would be the
-        // first sentence only).
+        // two-sentence lead is the preview, the same shape any other hit
+        // would report.
         assert_eq!(
             hits[0].preview,
             "La Révolution française éclate en 1789. La monarchie est renversée et la république proclamée."
@@ -1282,8 +1255,8 @@ Scientists measure the flow from observatories.
         assert_eq!(first.zim, "test.zim");
         assert_eq!(first.path, "C/Apple");
         assert_eq!(first.title, "Apple");
-        // An exact title match reports the lead's first sentence as its
-        // preview (the lead is one sentence here).
+        // An exact title match reports the lead as its preview (the lead
+        // is one sentence here).
         assert_eq!(first.preview, "An apple is the fruit of <rosaceae> trees.");
         assert_eq!(first.sections, None);
 
@@ -1447,8 +1420,9 @@ Scientists measure the flow from observatories.
         assert_eq!(hits.len(), 2, "{hits:?}");
         assert_eq!(hits[0].path, "C/Nitrogen_Gas_Effects", "{hits:?}");
         assert_eq!(hits[0].title, "Effects of Nitrogen Gas");
-        // Title-match semantics: the lead's FIRST sentence and no sections -
-        // NOT the Everywhere section the full-text tier would have reported.
+        // Title-match semantics: no sections - NOT the Everywhere section
+        // the full-text tier would have reported. (The lead is one
+        // sentence, so the preview is the whole lead.)
         assert_eq!(hits[0].preview, "Nitrogen gas surrounds us all.");
         assert_eq!(hits[0].sections, None);
         let json = serde_json::to_string(&hits[0]).unwrap();
@@ -1517,14 +1491,20 @@ Scientists measure the flow from observatories.
         let (server, _keep) = title_and_test_server();
 
         // The article's title contains both query words: the title tier's
-        // AND surface match ranks it first, styled as a title match (lead's
-        // first sentence only, not a full-text preview).
+        // AND surface match ranks it first, styled as a title match (no
+        // sections).
         let hits = search(&server, "new york");
         assert!(!hits.is_empty(), "{hits:?}");
         assert_eq!(hits[0].path, "C/New_York_City", "{hits:?}");
         assert_eq!(hits[0].title, "New York City");
         assert_eq!(hits[0].sections, None);
-        assert_eq!(hits[0].preview, "New York City is the largest city in the United States.");
+        // The preview is the lead paragraph for every tier - a title match
+        // reports the whole lead too, both its sentences here (well under
+        // the 360-character cap).
+        assert_eq!(
+            hits[0].preview,
+            "New York City is the largest city in the United States. It sits at the mouth of the Hudson."
+        );
 
         // A partial title match is NOT promoted to the title tier: no title
         // contains all three query words, so every hit comes from the
@@ -1717,8 +1697,8 @@ Scientists measure the flow from observatories.
         assert_eq!(hits[0].path, "C/Nitrogen", "{hits:?}");
         assert_eq!(hits[0].title, "Nitrogen");
         assert_eq!(hits[0].zim, "test.zim");
-        // An exact match is a title match: the lead's first sentence, no
-        // sections.
+        // An exact match is a title match: the lead as preview (one
+        // sentence here), no sections.
         assert_eq!(hits[0].preview, "Nitrogen is a colorless, odorless gas.");
         assert_eq!(hits[0].sections, None);
         assert!(!serde_json::to_string(&hits[0]).unwrap().contains("sections"));
@@ -1738,7 +1718,7 @@ Scientists measure the flow from observatories.
         let hits = search(&server, "NACA");
         assert_eq!(hits[0].path, "C/Aeronautics", "{hits:?}");
         assert_eq!(hits[0].title, "Aeronautics");
-        // The preview is the terminal article's lead, first sentence.
+        // The preview is the terminal article's lead (one sentence here).
         assert_eq!(hits[0].preview, "Aeronautics is the science of flight.");
         assert_eq!(hits[0].sections, None);
         // Fulltext hits follow in BM25 order - Aeronautics itself is
@@ -2074,14 +2054,12 @@ Scientists measure the flow from observatories.
         let giant = "x".repeat(INTRO_CHARS + 40);
         assert_eq!(preview_truncate(&giant), "x".repeat(INTRO_CHARS));
 
-        // The same paragraph as a fulltext hit's lead: the preview is the
-        // lead truncated at the word boundary, and it takes no query at
-        // all; a title match keeps just the first sentence.
+        // The same paragraph as a hit's lead: the preview is the lead
+        // truncated at the word boundary, whether the hit came from a
+        // title or from the full text - the preview takes no hit kind at
+        // all.
         let article = format!("<html><body><h1>T</h1><p>{paragraph}</p></body></html>");
-        assert_eq!(hit_preview(&article, false, false), preview_truncate(&paragraph));
-        let titled = "<html><body><h1>T</h1><p>First sentence here. Second one.</p></body></html>";
-        assert_eq!(hit_preview(titled, true, false), "First sentence here.");
-        assert_eq!(hit_preview(titled, false, false), "First sentence here. Second one.");
+        assert_eq!(hit_preview(&article, false), preview_truncate(&paragraph));
 
         // No full-text query (an all-punctuation query skips the band):
         // no sections.
@@ -2354,7 +2332,7 @@ Other transition metals are described elsewhere.
         let server = ZimMcpServer::new(library);
 
         // Search: the preview is plain text derived from the Markdown, free
-        // of markup, and is the lead's first sentence - the leading title
+        // of markup, and is the lead paragraph - the leading title
         // line and the hatnote are dropped. An exact match carries no
         // sections.
         let hits = search(&server, "zinc");

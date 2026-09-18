@@ -79,14 +79,13 @@ mode**.
   full-text matches ranked by BM25 relevance over all query words — partial
   matches still return. Each result has the ZIM file name (relative to the
   ZIM directory — this `zim` field is reported in both modes), the article
-  path, the title, and `preview` — the article's first intro sentence when
-  the query matches the title, otherwise the article's first intro paragraph
-  (both truncated at a word boundary). A full-text match also carries
+  path, the title, and `preview` — the article's first intro paragraph,
+  truncated at a word boundary. A full-text match also carries
   `sections` — the names of the article regions whose text matches the query,
   BM25-scored, the intro listed as `_intro`. `sections` is omitted for title
   matches, when no region matches, and when so many regions match that the
-  whole article is likely relevant. The
-  same article is reported once even when several spellings of it match.
+  whole article is likely relevant. The same article is reported once even
+  when several spellings of it match.
   Deduplication is within an archive only: the same title in different
   archives is reported once per archive, since different archives can hold
   different articles under one title. In single mode the tool takes only the
