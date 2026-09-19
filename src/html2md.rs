@@ -799,7 +799,12 @@ pub(crate) fn render_list(el: NodeRef, depth: usize) -> String {
 }
 
 /// Definition list: <dt> -> `- **term**`, <dt>+<dd> -> `- **term**: def`,
-/// lone <dd> -> `- def`; 2-space indent per nesting level.
+/// lone <dd> -> `- def`; 2-space indent per nesting level.  A <dd>'s
+/// definition text is its inline content with any direct <ul>/<ol>
+/// children excluded (they render as sub-list lines instead of leaking,
+/// flattened, into the definition); it is attached to the open term's
+/// line — or emitted as a lone `- ` item — *before* the sub-lists, so
+/// definition and sub-list stay in document order.
 pub(crate) fn render_dl(el: NodeRef, depth: usize) -> String {
     let mut out: Vec<String> = Vec::new();
     let indent = "  ".repeat(depth);
@@ -819,26 +824,41 @@ pub(crate) fn render_dl(el: NodeRef, depth: usize) -> String {
                 }
             }
             Some("dd") => {
-                let defn = inline_text(ch).trim().to_string();
+                // Definition text: the dd's inline content with its direct
+                // <ul>/<ol> children excluded — their items render as
+                // sub-list lines below and must not leak (flattened) into
+                // the definition.  Skipped lists' tails arrive as the
+                // following Text child; Comments/PIs are skipped too.
+                let mut parts: Vec<String> = Vec::new();
+                for sub in ch.children() {
+                    match sub.kind() {
+                        NodeKind::Text(t) => parts.push(escape_plain_asterisks(t)),
+                        NodeKind::Element { .. } if matches!(sub.tag(), Some("ul") | Some("ol")) => {}
+                        NodeKind::Element { .. } => parts.push(inline_text(sub)),
+                        _ => {}
+                    }
+                }
+                let defn = collapse_ws(&parts.join("")).trim().to_string();
+                // Attach the definition BEFORE any sub-list renders: an
+                // open term's line is still out[-1] here (nothing was
+                // pushed since it), so the definition lands on the term
+                // line and the sub-lists follow it in document order.
+                if !defn.is_empty() {
+                    match last_term.as_deref() {
+                        Some(t) if !t.is_empty() && !term_has_def => {
+                            let idx = out.len() - 1;
+                            out[idx] = format!("{}: {}", out[idx], defn);
+                            term_has_def = true;
+                        }
+                        _ => out.push(format!("{}- {}", indent, defn)),
+                    }
+                }
                 for sub in ch.element_children() {
                     if matches!(sub.tag(), Some("ul") | Some("ol")) && !is_dropped(sub) {
                         let sub_md = render_list(sub, depth + 1);
                         if !sub_md.is_empty() {
                             out.push(sub_md);
                         }
-                    }
-                }
-                let defn = collapse_ws(&defn).trim().to_string();
-                if !defn.is_empty() {
-                    match last_term.as_deref() {
-                        Some(t) if !t.is_empty() && !term_has_def => {
-                            // attach to the last emitted line (which may be
-                            // a nested sub-list's line, as in the original)
-                            let idx = out.len() - 1;
-                            out[idx] = format!("{}: {}", out[idx], defn);
-                            term_has_def = true;
-                        }
-                        _ => out.push(format!("{}- {}", indent, defn)),
                     }
                 }
             }
@@ -1264,5 +1284,41 @@ mod tests {
             None,
         );
         assert_eq!(md, "# Doc\n\n## Intro\n\nBody text.\n");
+    }
+
+    fn wiki_dl(inner: &str) -> String {
+        html_to_md(
+            &format!(
+                "<html><body><div id=\"mw-content-text\"><div class=\"mw-parser-output\">{}</div></div></body></html>",
+                inner
+            ),
+            Some("T"),
+            None,
+        )
+    }
+
+    /// A <dd> with both inline text and a sub-list: the definition goes on
+    /// the term line, the sub-list renders after it — the sub-list's items
+    /// must not also leak (flattened) into the definition text.
+    #[test]
+    fn dd_text_and_sublist_define_on_the_term_line_then_the_sublist() {
+        let md = wiki_dl("<dl><dt>T</dt><dd>Def <i>x</i><ul><li>s1</li><li>s2</li></ul></dd></dl>");
+        assert_eq!(md, "# T\n\n- **T**: Def *x*\n  - s1\n  - s2\n");
+    }
+
+    /// Lone <dd> with text and a sub-list: its own `- ` line, then the
+    /// sub-list — no duplicated flattened text.
+    #[test]
+    fn lone_dd_with_text_and_sublist_puts_the_text_on_its_own_line() {
+        let md = wiki_dl("<dl><dd>Def <i>x</i><ul><li>s1</li></ul></dd></dl>");
+        assert_eq!(md, "# T\n\n- Def *x*\n  - s1\n");
+    }
+
+    /// A <dd> holding only a sub-list adds no definition: the term line is
+    /// untouched and the sub-list follows it.
+    #[test]
+    fn dd_with_only_a_sublist_leaves_the_term_line_untouched() {
+        let md = wiki_dl("<dl><dt>T</dt><dd><ul><li>s1</li><li>s2</li></ul></dd></dl>");
+        assert_eq!(md, "# T\n\n- **T**\n  - s1\n  - s2\n");
     }
 }
