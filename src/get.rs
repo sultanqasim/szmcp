@@ -79,12 +79,12 @@ fn markdown_title(article: &crate::zim::Article) -> String {
 
 /// Convert an HTML article to Markdown the way `zim2zim.py --infobox`
 /// does: infoboxes as a '## Key facts' block, localized by the archive's
-/// language metadata (English default). `None` when the page is not a wiki
-/// article (scraped non-wiki pages), for which the raw HTML stays the
-/// faithful representation.
-fn convert_if_wiki(arc: &Archive, article: &crate::zim::Article, html: &str) -> Option<String> {
+/// language metadata (English default). Pages without a wiki article body
+/// (scraped non-wiki ZIMs) render from their <body> element instead, so
+/// every text/html entry converts.
+fn convert_html(arc: &Archive, article: &crate::zim::Article, html: &str) -> String {
     let lang = arc.language().unwrap_or_else(|| "eng".to_string());
-    html2md::convert_wiki_page(html, Some(&markdown_title(article)), Some(&lang))
+    html2md::html_to_md(html, Some(&markdown_title(article)), Some(&lang))
 }
 
 #[derive(Serialize, JsonSchema)]
@@ -130,13 +130,13 @@ pub fn get_article(
         )));
     }
     let (content, encoding) = match std::str::from_utf8(&article.bytes) {
-        // HTML pages are served as Markdown unless raw: the conversion
-        // zim2zim --infobox applies when building Markdown ZIMs. Pages
-        // without a wiki article body stay raw HTML.
-        Ok(text) if !raw && is_html(article.mime_type.as_deref()) => match convert_if_wiki(&arc, &article, text) {
-            Some(md) => (md, "utf-8"),
-            None => (text.to_string(), "utf-8"),
-        },
+        // HTML pages are served as Markdown unless raw: wiki articles get
+        // the conversion zim2zim --infobox applies when building Markdown
+        // ZIMs, and pages without a wiki article body render from their
+        // <body> element.
+        Ok(text) if !raw && is_html(article.mime_type.as_deref()) => {
+            (convert_html(&arc, &article, text), "utf-8")
+        }
         Ok(text) => (text.to_string(), "utf-8"),
         Err(_) => (
             base64::engine::general_purpose::STANDARD.encode(&article.bytes),
@@ -183,15 +183,11 @@ pub fn get_section(
             path
         ))
     })?;
-    // HTML wiki pages convert to Markdown first (zim2zim's conversion,
+    // HTML pages convert to Markdown first (zim2zim's conversion,
     // infoboxes included) unless raw; markdown editions carry plain
-    // Markdown, and anything else (or a scraped page without a wiki body)
-    // takes the HTML extractor.
+    // Markdown, and anything else takes the HTML extractor.
     let found = if !raw && is_html(article.mime_type.as_deref()) {
-        match convert_if_wiki(&arc, &article, text) {
-            Some(md) => markdown::section_content(&md, section),
-            None => html::section_content(text, section),
-        }
+        markdown::section_content(&convert_html(&arc, &article, text), section)
     } else if article.mime_type.as_deref().is_some_and(|m| m.contains("markdown")) {
         markdown::section_content(text, section)
     } else {
@@ -249,6 +245,11 @@ mod tests {
         assert_eq!(result.path, "C/Apple");
         assert_eq!(result.mime_type.as_deref(), Some("text/html"));
         assert_eq!(result.content_encoding, "utf-8");
+        assert!(
+            result.content.starts_with("# Apple\n\nAn **apple** is the fruit of <rosaceae> trees."),
+            "{:?}",
+            result.content
+        );
         assert!(result.content.contains("10,000 years"));
 
         // Bare path also works.
@@ -401,7 +402,7 @@ mod tests {
         let result = block_on(ZimGetSectionDirTool::invoke(&server, params)).unwrap();
         assert_eq!(result.section, "_intro");
         assert!(
-            result.content.contains("An <b>apple</b> is the fruit of"),
+            result.content.contains("An **apple** is the fruit of"),
             "{:?}",
             result.content
         );

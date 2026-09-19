@@ -219,9 +219,9 @@ impl ToolBase for ZimGetTool {
     }
     fn description() -> Option<Cow<'static, str>> {
         Some(
-            "Get the full content of an article or page from the ZIM file. HTML wiki \
-             articles are converted to Markdown (infobox rendered as a '## Key \
-             facts' section); non-wiki pages return their raw content.".into(),
+            "Get the full content of an article or page from the ZIM file. HTML \
+             pages are converted to Markdown (wiki infoboxes rendered as a \
+             '## Key facts' section).".into(),
         )
     }
 }
@@ -266,9 +266,9 @@ impl ToolBase for ZimGetDirTool {
     }
     fn description() -> Option<Cow<'static, str>> {
         Some(
-            "Get the full content of an article or page from a ZIM file. HTML wiki \
-             articles are converted to Markdown (infobox rendered as a '## Key \
-             facts' section); non-wiki pages return their raw content.".into(),
+            "Get the full content of an article or page from a ZIM file. HTML \
+             pages are converted to Markdown (wiki infoboxes rendered as a \
+             '## Key facts' section).".into(),
         )
     }
 }
@@ -308,7 +308,7 @@ impl ToolBase for ZimGetSectionTool {
         Some(
             "Get a single section of an article or page from the ZIM file, identified by \
              its heading text (e.g. \"History\"), or by the special name \"_intro\" for \
-             the article lead. HTML wiki articles are converted to Markdown first, so headings are those of the converted text."
+             the article lead. HTML pages are converted to Markdown first, so headings are those of the converted text."
                 .into(),
         )
     }
@@ -358,7 +358,7 @@ impl ToolBase for ZimGetSectionDirTool {
         Some(
             "Get a single section of an article or page from a ZIM file, identified by \
              its heading text (e.g. \"History\"), or by the special name \"_intro\" for \
-             the article lead. HTML wiki articles are converted to Markdown first, so headings are those of the converted text."
+             the article lead. HTML pages are converted to Markdown first, so headings are those of the converted text."
                 .into(),
         )
     }

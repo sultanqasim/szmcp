@@ -101,11 +101,12 @@ mode**.
   converted to its `C/` path (Wikipedia ZIMs); a failed lookup reports the
   converted path, so the exact path from search results can be retried.
   Returns the title, final path (after redirects), MIME type, and all of the
-  content (UTF-8 text, or base64 for binary objects). HTML wiki articles are
+  content (UTF-8 text, or base64 for binary objects). HTML pages are
   automatically converted to Markdown with the `wikizim_parser` conventions
   (`zim2zim --infobox` behavior: the infobox renders as a `## Key facts`
   section, boilerplate sections are dropped); pages without a wiki article
-  body (scraped non-wiki sites, meta-refresh stubs) return their raw HTML.
+  body (scraped non-wiki sites, meta-refresh stubs) render from their
+  `<body>` element, so every text/html entry comes back as Markdown.
   In single mode that is
   the whole argument list. In directory mode a `zim` argument is also
   required: the ZIM file name relative to the ZIM directory, as `zim_list`

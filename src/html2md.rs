@@ -1,11 +1,13 @@
-//! HTML -> Markdown conversion for Wikipedia ZIM articles (the Rust port
-//! of wikizim_parser/html2md.py, using the lxml-shaped DOM of htmldom).
+//! HTML -> Markdown conversion (the Rust port of wikizim_parser's
+//! html2md.py, using the lxml-shaped DOM of htmldom). Wikipedia articles
+//! (div.mw-parser-output) convert exactly like the Python module; any
+//! other HTML page falls back to its <body> element.
 //!
-//! Public API mirrors the Python module: [`html_to_md`], [`inline_text`],
+//! The public entry point is [`html_to_md`]; also exported: [`inline_text`],
 //! [`block_children_md`], and (via [`tables`]) `render_table`.
 
 use crate::cleanup;
-use crate::htmldom::{Dom, NodeKind, NodeRef};
+use crate::htmldom::{Dom, NodeId, NodeKind, NodeRef};
 use crate::tables;
 use crate::util::{collapse_space_tab, collapse_ws, fre, fre_sub, parse_query, percent_decode, re, urlsplit};
 
@@ -861,9 +863,9 @@ pub(crate) fn render_dl(el: NodeRef, depth: usize) -> String {
         .join("\n")
 }
 
-/// Render one <p>: <br> splits the paragraph (a <br>'s tail opens the next
-/// quote line in a blockquote; in prose it is dropped, as in the original),
-/// everything else is inline.
+/// Render one <p>: <br> splits the paragraph (the <br>'s tail opens the
+/// next segment — the next quote line in a blockquote), everything else
+/// is inline.
 fn render_paragraph(p: NodeRef, in_blockquote: bool) -> Vec<String> {
     let ctx = InlineCtx {
         br_mode: if in_blockquote { BrMode::Nl } else { BrMode::Space },
@@ -878,11 +880,7 @@ fn render_paragraph(p: NodeRef, in_blockquote: bool) -> Vec<String> {
             continue; // the leading text or a tail consumed at its owner
         }
         if ch.is_element() && ch.tag() == Some("br") {
-            if in_blockquote {
-                segs.push(escape_plain_asterisks(ch.tail().unwrap_or("")));
-            } else {
-                segs.push(String::new());
-            }
+            segs.push(escape_plain_asterisks(ch.tail().unwrap_or("")));
             continue;
         }
         let piece = if ch.is_element() { render_inline(ch, ctx) } else { String::new() };
@@ -1043,7 +1041,7 @@ pub(crate) fn block_children_md(
     let mut key_facts_pending = key_facts.filter(|k| !k.is_empty());
     for ch in renderable_children(el) {
         if tables::is_infobox_container(ch) {
-            continue; // infoboxes are rendered via include_infoboxes
+            continue; // infoboxes are rendered separately (key_facts_of)
         }
         let tag = ch.tag().unwrap_or("");
         // one heading lookup for the Key facts placement test
@@ -1118,10 +1116,7 @@ fn first_h1_title(dom: &Dom) -> Option<String> {
 }
 
 /// The rendered infoboxes as a '## Key facts' block ('' when none).
-fn key_facts_of(dom: &Dom, include: bool, lang: Option<&str>) -> String {
-    if !include {
-        return String::new();
-    }
+fn key_facts_of(dom: &Dom, lang: Option<&str>) -> String {
     let boxes = crate::infobox_html::extract_infoboxes(dom);
     crate::infobox_html::infoboxes_to_markdown(dom, &boxes, lang).trim().to_string()
 }
@@ -1154,54 +1149,65 @@ fn render_article(
     cleanup::cleanup(&parts.join("\n\n"))
 }
 
-/// Convert Wikipedia article HTML (ZIM/Vector rendered) to Markdown.
+/// Convert HTML to Markdown.
 ///
-/// With `include_infoboxes=true` the article's infobox(es) are rendered as
-/// a '## Key facts' section placed structurally after the intro (mirrors
-/// `zim2zim.py --infobox`). `lang` (a ZIM/BCP-47 code; 'fra'/'fre'/'fr'
+/// A Wikipedia article (div.mw-parser-output under #mw-content-text)
+/// renders exactly like `zim2zim.py --infobox` does: infoboxes as a '## Key
+/// facts' block placed structurally after the intro. Any other page renders
+/// from its `<body>` element (html5ever always materializes one, so head
+/// junk — title/style/script/meta — stays out), which makes arbitrary
+/// scraped pages convert too. On such pages the first in-body `<h1>`
+/// supplies the `# Title` line when `title` is None, and an in-body `<h1>`
+/// whose text equals the output title is removed from the body before
+/// rendering (the title line replaces it); a differing `<h1>` stays and
+/// renders as a `## ` heading. `lang` (a ZIM/BCP-47 code; 'fra'/'fre'/'fr'
 /// select French) localizes the '## Key facts' heading and the dropped
-/// boilerplate sections. Pages without div.mw-parser-output (Python's
-/// `_get_parser_output` miss) render as the title line alone.
-// The tool path uses `convert_wiki_page`; this is the Python-equivalent
-// entry point (title line alone for non-wiki pages), exercised by tests.
-#[cfg_attr(not(test), allow(dead_code))]
+/// boilerplate sections.
 pub fn html_to_md(
     html_str: &str,
     title: Option<&str>,
-    include_infoboxes: bool,
     lang: Option<&str>,
 ) -> String {
-    let dom = Dom::parse(html_str);
-    let key_facts = key_facts_of(&dom, include_infoboxes, lang);
-    let body = match get_parser_output(dom.root()) {
-        Some(body) => body.id(),
-        None => {
-            let mut parts: Vec<String> = Vec::new();
-            if let Some(t) = title {
-                parts.push(format!("# {}", t.trim()));
-            }
-            if !key_facts.is_empty() {
-                parts.push(key_facts);
-            }
-            return cleanup::cleanup(&parts.join("\n\n"));
+    let mut dom = Dom::parse(html_str);
+    let key_facts = key_facts_of(&dom, lang);
+    // The wiki article container, else the page's <body>.
+    let wiki_body = get_parser_output(dom.root()).map(|b| b.id());
+    let body =
+        wiki_body.unwrap_or_else(|| dom.root().find("body").map_or(dom.root().id(), |b| b.id()));
+    let mut title = title.map(str::to_string);
+    if wiki_body.is_none() {
+        if title.is_none() {
+            title = body_h1_title(&dom, body);
         }
-    };
-    render_article(dom, body, key_facts, title, lang)
+        if let Some(t) = &title {
+            drop_title_h1(&mut dom, body, t);
+        }
+    }
+    render_article(dom, body, key_facts, title.as_deref(), lang)
 }
 
-/// The tool-path conversion: like [`html_to_md`] with infoboxes included,
-/// but `None` for pages without div.mw-parser-output — scraped non-wiki
-/// pages, for which the raw HTML stays the faithful representation.
-pub fn convert_wiki_page(
-    html_str: &str,
-    title: Option<&str>,
-    lang: Option<&str>,
-) -> Option<String> {
-    let dom = Dom::parse(html_str);
-    let body = get_parser_output(dom.root())?.id();
-    let key_facts = key_facts_of(&dom, true, lang);
-    Some(render_article(dom, body, key_facts, title, lang))
+/// The first in-body h1's collapsed text, or None when the body has no h1.
+fn body_h1_title(dom: &Dom, body: NodeId) -> Option<String> {
+    let h1 = dom.ref_(body).find("h1")?;
+    let text = collapse_ws(&h1.text_content()).trim().to_string();
+    if text.is_empty() { None } else { Some(text) }
 }
+
+/// Remove the first in-body h1 when its text equals `title`: the `# Title`
+/// line would otherwise say it twice.
+fn drop_title_h1(dom: &mut Dom, body: NodeId, title: &str) {
+    let id = {
+        let scope = dom.ref_(body);
+        match scope.find("h1") {
+            Some(h1) if collapse_ws(&h1.text_content()).trim() == title => Some(h1.id()),
+            _ => None,
+        }
+    };
+    if let Some(id) = id {
+        dom.detach(id);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::html_to_md;
@@ -1211,7 +1217,6 @@ mod tests {
         let md = html_to_md(
             "<html><body><div id=\"mw-content-text\"><div class=\"mw-parser-output\"><p>in 1889.<!--note--> It was made from <a href=\"./Nitrocellulose\">nitrocellulose</a> known as nitrate.</p></div></div></body></html>",
             Some("Nitro"),
-            false,
             None,
         );
         assert!(md.contains("1889. It was made"), "{md}");
@@ -1222,9 +1227,42 @@ mod tests {
         let md = html_to_md(
             "<html><body><div id=\"mw-content-text\"><div class=\"mw-parser-output\"><p>Text <a href=\"Category%3AFoo\"Category:Foo\">label</a><a href=\"./File%3ABar\">img</a>.</p></div></div></body></html>",
             Some("T"),
-            false,
             None,
         );
         assert_eq!(md, "# T\n\nText.\n");
+    }
+
+    #[test]
+    fn br_splits_the_paragraph_without_losing_text() {
+        let md = html_to_md(
+            "<html><body><div id=\"mw-content-text\"><div class=\"mw-parser-output\"><p>a<br>b <i>c</i></p></div></div></body></html>",
+            Some("T"),
+            None,
+        );
+        assert_eq!(md, "# T\n\na\n\nb *c*\n");
+    }
+
+    #[test]
+    fn arbitrary_html_converts_from_the_body() {
+        let md = html_to_md(
+            "<html><head><title>Doc</title><style>p { margin: 0 }</style>\
+             <meta name=\"x\" content=\"y\"></head><body>\
+             <h1>Head</h1><p>Para <b>bold</b>.</p>\
+             <p>See <a href=\"https://x.example/a?b=1&amp;c=2\">link</a>.</p>\
+             </body></html>",
+            None,
+            None,
+        );
+        assert_eq!(md, "# Head\n\nPara **bold**.\n\nSee [link](https://x.example/a?b=1&c=2).\n");
+    }
+
+    #[test]
+    fn in_body_h1_differs_from_the_passed_title_stays() {
+        let md = html_to_md(
+            "<html><body><h1>Intro</h1><p>Body text.</p></body></html>",
+            Some("Doc"),
+            None,
+        );
+        assert_eq!(md, "# Doc\n\n## Intro\n\nBody text.\n");
     }
 }
