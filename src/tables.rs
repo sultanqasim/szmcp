@@ -1,6 +1,6 @@
 //! Table rendering: the port of wikizim_parser/html2md.py's table section
-//! (pipe/HTML tables, stub shells, wrapper tables with nested tables, and
-//! the multicol layout-table flattening).
+//! (pipe/HTML tables, wrapper tables with nested tables, and the multicol
+//! layout-table flattening).
 
 use crate::htmldom::{NodeKind, NodeRef};
 use crate::html2md::{
@@ -231,44 +231,6 @@ fn table_to_pipe(rows: &[NodeRef], caption: &str, texts: &[Vec<String>]) -> Stri
     md
 }
 
-/// True when a table carries no meaningful data and is only a stub shell
-/// left behind by dropped images (cladograms, map figures, thumb floats).
-fn table_is_stub(rows: &[NodeRef], texts: &[Vec<String>], as_html: bool) -> bool {
-    let counts: Vec<usize> = texts.iter().map(|row| row.iter().filter(|t| !t.is_empty()).count()).collect();
-    let nonempty: usize = counts.iter().sum();
-    if as_html {
-        // no row with 2+ non-empty cells, at most two non-empty cells in
-        // all, at least one empty cell, and no multi-line cell: the
-        // residue of clade/diagram tables whose leaf cells held only images
-        let multiline = texts.iter().flatten().any(|t| t.contains('\n'));
-        let total_cells: usize = texts.iter().map(|r| r.len()).sum();
-        return !multiline
-            && counts.iter().max().map_or(true, |&m| m <= 1)
-            && nonempty <= 2
-            && nonempty < total_cells;
-    }
-    let header_idx = rows
-        .iter()
-        .enumerate()
-        .find(|(_, tr)| row_cells(**tr).iter().any(|c| c.tag() == Some("th")))
-        .map(|(i, _)| i)
-        .unwrap_or(0);
-    let data = &counts[header_idx + 1..];
-    data.is_empty()                              // header-only shell
-        || !data.iter().any(|&c| c > 0)          // every data cell empty
-        || (nonempty == 1 && texts.iter().map(|r| r.len()).sum::<usize>() >= 2) // lone label cell
-}
-
-/// True for a pipe table whose cells are nothing but lone label/caption
-/// text: at most two non-empty cells in all and never two non-empty cells
-/// in one row.
-fn pipe_label_shell(texts: &[Vec<String>]) -> bool {
-    let counts: Vec<usize> = texts.iter().map(|row| row.iter().filter(|t| !t.is_empty()).count()).collect();
-    let total: usize = counts.iter().sum();
-    let max = counts.iter().max().copied().unwrap_or(0);
-    total > 0 && total <= 2 && max <= 1
-}
-
 /// Rendered Markdown of a wrapper's nested tables (blank-line joined).
 fn nested_tables_md(nested: &[NodeRef]) -> String {
     let mut parts = Vec::new();
@@ -388,8 +350,14 @@ fn render_multicol(tbl: NodeRef) -> String {
 
 /// Render one <table> element to Markdown. Multicol layout tables flatten
 /// to ordinary block Markdown; complex tables (rowspan/colspan > 1 or
-/// lists in cells) become HTML tables, simple ones pipe tables; stub
-/// shells are dropped unless they wrap nested tables with real data.
+/// lists in cells) become HTML tables, simple ones pipe tables. Only a
+/// table with no renderable content at all is dropped (every cell empty,
+/// or a bare <br> in the HTML path — the residue of stripped images); a
+/// simple table also drops blank rows, while a complex one keeps them
+/// (blank rowspan/colspan rows are the skeleton of large layout grids).
+/// A table left without any row yields just its nested tables'
+/// renderings; everything else renders, and a wrapper table renders its
+/// own rows followed by its nested tables.
 pub(crate) fn render_table(tbl: NodeRef) -> String {
     if tbl.tag() != Some("table") {
         return String::new();
@@ -402,12 +370,9 @@ pub(crate) fn render_table(tbl: NodeRef) -> String {
         .filter(|tr| !row_cells(*tr).is_empty())
         .collect();
     let nested_md = nested_tables_md(&nested_tables(tbl));
-    if rows.is_empty() {
-        return nested_md;
-    }
     let as_html = is_complex_table(&rows);
     // each row's rendered cell text, computed once for the renderers and
-    // the stub rules
+    // the blank-row rule
     let texts: Vec<Vec<String>> = rows
         .iter()
         .map(|tr| {
@@ -423,23 +388,32 @@ pub(crate) fn render_table(tbl: NodeRef) -> String {
                 .collect()
         })
         .collect();
+    // A simple table drops blank rows (the residue of stripped images);
+    // a complex one keeps them. Either way a table left with no rows —
+    // or an HTML table whose every cell is blank — has no renderable
+    // content and yields just its nested tables' renderings.
+    let (rows, texts): (Vec<NodeRef>, Vec<Vec<String>>) = rows
+        .into_iter()
+        .zip(texts)
+        .filter(|(_, row)| as_html || row.iter().any(|t| !t.is_empty()))
+        .unzip();
+    if rows.is_empty()
+        || (as_html
+            && texts
+                .iter()
+                .all(|row| row.iter().all(|t| t.replace("<br>", "").trim().is_empty())))
+    {
+        return nested_md;
+    }
     let caption = table_caption_text(tbl, as_html);
     let md = if as_html {
         table_to_html(&rows, &caption, &texts)
     } else {
         table_to_pipe(&rows, &caption, &texts)
     };
-    if !nested_md.is_empty() {
-        // Real content in the nested tables: a stub wrapper (or one whose
-        // own cells are lone caption/label lines) is dropped in favour of
-        // the nested renderings.
-        if table_is_stub(&rows, &texts, as_html) || (!as_html && pipe_label_shell(&texts)) {
-            return nested_md;
-        }
-        return format!("{}\n\n{}", md, nested_md);
+    if nested_md.is_empty() {
+        md
+    } else {
+        format!("{}\n\n{}", md, nested_md)
     }
-    if table_is_stub(&rows, &texts, as_html) {
-        return String::new(); // stub shell (dropped images/captions only)
-    }
-    md
 }

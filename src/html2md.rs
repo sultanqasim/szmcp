@@ -1352,4 +1352,20 @@ mod tests {
             "# T\n\n*Line one Line two*\n\n| H |\n| --- |\n| a |\n"
         );
     }
+
+    /// Small tables are real content: a lone non-empty cell renders as a
+    /// pipe table (no stub-dropping), while a table whose every cell is
+    /// empty — or a bare <br>, the HTML-path's image residue — drops
+    /// entirely, and blank rows never render next to real ones.
+    #[test]
+    fn lone_cell_table_renders_and_an_all_empty_table_drops() {
+        let md = wiki_doc("<table><tr><td>solo</td></tr></table>");
+        assert_eq!(md, "# T\n\n| solo |\n| --- |\n");
+        let md = wiki_doc("<table><tr><td>solo</td></tr><tr><td></td><td> </td></tr></table>");
+        assert_eq!(md, "# T\n\n| solo |\n| --- |\n");
+        let md = wiki_doc("<table><tr><td></td></tr><tr><td>   </td></tr></table>");
+        assert_eq!(md, "# T\n");
+        let md = wiki_doc("<table><tr><td rowspan=\"2\"><br></td><td></td></tr></table>");
+        assert_eq!(md, "# T\n");
+    }
 }
