@@ -152,16 +152,37 @@ fn protected_lines(md: &str) -> Vec<bool> {
     prot
 }
 
-/// Generic punctuation/whitespace residue repair for one output line.
-fn repair_line(ln: &str) -> String {
-    let mut urls: Vec<String> = Vec::new();
-    let mut s = ln.to_string();
-    if s.contains("://") {
-        s = fre_sub(fre(r"\S*://\S*"), &s, |c| {
-            urls.push(c.get(0).map(|m| m.as_str()).unwrap_or("").to_string());
-            format!("\x00{}\x00", urls.len() - 1)
-        });
+/// Mask URLs (`\S*://\S*`) as `\x00N\x00` placeholders so the punctuation
+/// repairs cannot touch them; returns the masked text plus the extracted
+/// URLs in order of appearance.  (Without a literal `"://"` nothing can
+/// match, so the text is returned unchanged.)
+fn mask_urls(s: &str) -> (String, Vec<String>) {
+    if !s.contains("://") {
+        return (s.to_string(), Vec::new());
     }
+    let mut urls: Vec<String> = Vec::new();
+    let masked = fre_sub(fre(r"\S*://\S*"), s, |c| {
+        urls.push(c.get(0).map(|m| m.as_str()).unwrap_or("").to_string());
+        format!("\x00{}\x00", urls.len() - 1)
+    });
+    (masked, urls)
+}
+
+/// Restore the URLs masked by [`mask_urls`].
+fn unmask_urls(s: &str, urls: &[String]) -> String {
+    if !s.contains('\x00') {
+        return s.to_string();
+    }
+    fre_sub(fre(r"\x00(\d+)\x00"), s, |c| {
+        let idx: usize = c.get(1).map(|m| m.as_str().parse().unwrap_or(0)).unwrap_or(0);
+        urls.get(idx).cloned().unwrap_or_default()
+    })
+}
+
+/// Generic punctuation/whitespace residue repair for one output line.
+/// URLs are masked off for the duration (see [`mask_urls`]).
+fn repair_line(ln: &str) -> String {
+    let (mut s, urls) = mask_urls(ln);
     if s.contains('(') {
         s = re(r"\(\s*\)").replace_all(&s, "").into_owned();
         s = fre_sub(fre(r"\(\s+(?=\S)"), &s, |_| "(".to_string());
@@ -189,13 +210,7 @@ fn repair_line(ln: &str) -> String {
     if s.contains(" .") {
         s = fre_sub(fre(r#"(?<=[A-Za-z0-9\)\]"'*]) +\.(?![.\w])"#), &s, |_| ".".to_string());
     }
-    if s.contains('\x00') {
-        return fre_sub(fre(r"\x00(\d+)\x00"), &s, |c| {
-            let idx: usize = c.get(1).map(|m| m.as_str().parse().unwrap_or(0)).unwrap_or(0);
-            urls.get(idx).cloned().unwrap_or_default()
-        });
-    }
-    s
+    unmask_urls(&s, &urls)
 }
 
 /// Remove blank lines sitting strictly between two consecutive list-item
@@ -221,7 +236,9 @@ fn rejoin_split_lists(lines: Vec<String>, prot: &[bool]) -> Vec<String> {
 
 /// The final cleanup pass: entity decode, nbsp/feff collapse, edit-link
 /// residue removal, blank normalization, per-line repairs and list
-/// rejoining.
+/// rejoining, then one last `end.He` -> `end. He` sentence-period repair
+/// on the joined text — with URLs masked off for that repair, since a
+/// period inside a URL (`example.NET`, `Page.Us`) is not a sentence end.
 pub(crate) fn cleanup(md: &str) -> String {
     let md = html_unescape(md);
     let md = md
@@ -271,8 +288,41 @@ pub(crate) fn cleanup(md: &str) -> String {
     }
 
     let out = rejoin_split_lists(out, &prot);
-    let md = fre_sub(fre(r"(?<=[a-z0-9\)])\.([A-Z])"), &out.join("\n"), |c| {
+    // Restore the space after a sentence period before an uppercase letter,
+    // with URLs masked so the repair stays out of them (`example.NET` keeps
+    // its dot; `end.He` still gains the space).
+    let (joined, urls) = mask_urls(&out.join("\n"));
+    let joined = fre_sub(fre(r"(?<=[a-z0-9\)])\.([A-Z])"), &joined, |c| {
         format!(". {}", c.get(1).map(|m| m.as_str()).unwrap_or(""))
     });
+    let md = unmask_urls(&joined, &urls);
     format!("{}\n", md.trim_matches('\n'))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The final `end.He` -> `end. He` repair gains the space while the
+    /// URL on the same line is left untouched.
+    #[test]
+    fn period_upper_repair_skips_urls() {
+        let md = "See [x](https://example.com/About) now end.He said.";
+        assert_eq!(
+            cleanup(md),
+            "See [x](https://example.com/About) now end. He said.\n"
+        );
+    }
+
+    /// Same for URLs whose own dot+uppercase would be hit by the repair
+    /// (`Page.Us` / `example.NET` used to become `Page. Us` /
+    /// `example. NET`).
+    #[test]
+    fn period_upper_repair_keeps_url_dots() {
+        let md = "See [x](https://example.com/Page.Us) and <https://example.NET>. Then end.He said.";
+        assert_eq!(
+            cleanup(md),
+            "See [x](https://example.com/Page.Us) and <https://example.NET>. Then end. He said.\n"
+        );
+    }
 }
