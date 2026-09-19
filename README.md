@@ -101,7 +101,12 @@ mode**.
   converted to its `C/` path (Wikipedia ZIMs); a failed lookup reports the
   converted path, so the exact path from search results can be retried.
   Returns the title, final path (after redirects), MIME type, and all of the
-  content (UTF-8 text, or base64 for binary objects). In single mode that is
+  content (UTF-8 text, or base64 for binary objects). HTML wiki articles are
+  automatically converted to Markdown with the `wikizim_parser` conventions
+  (`zim2zim --infobox` behavior: the infobox renders as a `## Key facts`
+  section, boilerplate sections are dropped); pages without a wiki article
+  body (scraped non-wiki sites, meta-refresh stubs) return their raw HTML.
+  In single mode that is
   the whole argument list. In directory mode a `zim` argument is also
   required: the ZIM file name relative to the ZIM directory, as `zim_list`
   reports it.
@@ -109,8 +114,10 @@ mode**.
   its heading text (e.g. `"History"`), or the special name `_intro` for the
   introduction (the region before the first heading). The article is
   addressed by its path or its title, as in `zim_get` (plus `zim` in
-  directory mode). Returns the page title, the section name, and the section
-  content.
+  directory mode). HTML wiki articles are converted to Markdown first, so
+  the headings are those of the converted text (and `_intro` includes the
+  `## Key facts` block). Returns the page title, the section name, and the
+  section content.
 - **`zim_list`** (directory mode only) — list the loaded ZIM files as
   `{"files": ["file1.zim", "xyx/file3.zim"]}`, names relative to the ZIM
   directory.
@@ -122,7 +129,14 @@ and absolute paths are refused, while symlinks are fine.
 
 Both classic HTML Wikipedia ZIMs and Markdown ZIMs (as produced by
 `wikizim_parser`, articles with MIME type `text/markdown`) are supported.
-Search text and section extraction use an HTML or a Markdown parser
+`zim_get`/`zim_get_section` convert HTML wiki articles to Markdown with the
+same converter `wikizim_parser/zim2zim.py --infobox` uses (the Rust port in
+`src/html2md.rs` + `src/infobox_html.rs`: paragraphs, headings, wikilinks,
+fenced code, math, pipe/HTML tables, hatnotes, the infobox as a `## Key
+facts` section, per-language boilerplate drops — byte-identical output on
+the reference article sets), so both archive kinds read the same way; the
+CLI's `--raw` flag returns the unconverted HTML. Search text and section
+extraction use an HTML or a Markdown parser
 depending on the article's MIME type, so Markdown articles yield clean
 plain-text search text and Markdown section content; everything else
 behaves the same.
@@ -162,7 +176,9 @@ szmcp get_section /path/to/file.zim C/SomeArticle "History"
   results (default 10, matching the tool's `limit` argument). `get` and
   `get_section` take the ZIM file itself — the archive
   is identified by its own path; search results name ZIM files relative to
-  the scanned directory. Errors go to stderr and exit non-zero.
+  the scanned directory. Both also take `--raw` to skip the HTML→Markdown
+  conversion and print/extract from the raw HTML instead. Errors go to
+  stderr and exit non-zero.
 
 ## Notes
 

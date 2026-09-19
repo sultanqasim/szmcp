@@ -3,6 +3,7 @@
 //! internal-entry and oversize checks, then section extraction dispatch.
 
 use crate::html;
+use crate::html2md;
 use crate::markdown;
 use crate::tools::ToolError;
 use crate::zim::{Archive, ZimLibrary};
@@ -59,6 +60,33 @@ fn article_path(raw: &str) -> String {
     format!("C/{}", raw.replace(" ", "_"))
 }
 
+/// True for the MIME types zim2zim converts (text/html and variants).
+fn is_html(mime: Option<&str>) -> bool {
+    mime.is_some_and(|m| m.starts_with("text/html"))
+}
+
+/// The `# Title` heading source for the conversion: the dirent title, or -
+/// when the archive leaves it empty (Article.title then equals the full
+/// path) - the raw entry URL with underscores read as spaces, matching
+/// zim2zim's `item_path.replace("_", " ")` fallback.
+fn markdown_title(article: &crate::zim::Article) -> String {
+    if article.title == article.full_path {
+        article.full_path[2..].replace('_', " ")
+    } else {
+        article.title.clone()
+    }
+}
+
+/// Convert an HTML article to Markdown the way `zim2zim.py --infobox`
+/// does: infoboxes as a '## Key facts' block, localized by the archive's
+/// language metadata (English default). `None` when the page is not a wiki
+/// article (scraped non-wiki pages), for which the raw HTML stays the
+/// faithful representation.
+fn convert_if_wiki(arc: &Archive, article: &crate::zim::Article, html: &str) -> Option<String> {
+    let lang = arc.language().unwrap_or_else(|| "eng".to_string());
+    html2md::convert_wiki_page(html, Some(&markdown_title(article)), Some(&lang))
+}
+
 #[derive(Serialize, JsonSchema)]
 pub struct ZimGetResult {
     /// Page/article title
@@ -76,15 +104,17 @@ pub struct ZimGetResult {
 
 /// The full content of one article or page from the `zim` archive: `path` is
 /// resolved inside it (redirects followed); internal entries and content over
-/// the response cap are refused.
+/// the response cap are refused. HTML pages are converted to Markdown
+/// unless `raw` is set.
 pub fn get_article(
     library: &ZimLibrary,
     zim: &str,
     path: &str,
+    raw: bool,
 ) -> Result<ZimGetResult, ToolError> {
     let arc = find_archive(library, zim)?;
     // Accept a bare article title as well as a namespaced path.
-    let path = article_path(path);
+    let path = article_path(&path);
     let article = not_found_if_missing(arc.get_article(&path))?;
     if article.full_path.starts_with("X/") {
         return Err(ToolError::InvalidArgument(format!(
@@ -100,6 +130,13 @@ pub fn get_article(
         )));
     }
     let (content, encoding) = match std::str::from_utf8(&article.bytes) {
+        // HTML pages are served as Markdown unless raw: the conversion
+        // zim2zim --infobox applies when building Markdown ZIMs. Pages
+        // without a wiki article body stay raw HTML.
+        Ok(text) if !raw && is_html(article.mime_type.as_deref()) => match convert_if_wiki(&arc, &article, text) {
+            Some(md) => (md, "utf-8"),
+            None => (text.to_string(), "utf-8"),
+        },
         Ok(text) => (text.to_string(), "utf-8"),
         Err(_) => (
             base64::engine::general_purpose::STANDARD.encode(&article.bytes),
@@ -126,12 +163,14 @@ pub struct ZimGetSectionResult {
 }
 
 /// One section of an article from the `zim` archive, by heading text or by the
-/// reserved `_intro` name, extracted from its HTML or Markdown.
+/// reserved `_intro` name, extracted from the article's Markdown (HTML pages
+/// are converted first unless `raw`).
 pub fn get_section(
     library: &ZimLibrary,
     zim: &str,
     path: &str,
     section: &str,
+    raw: bool,
 ) -> Result<ZimGetSectionResult, ToolError> {
     let arc = find_archive(library, zim)?;
     // Converting first also makes the errors below report the converted
@@ -144,9 +183,16 @@ pub fn get_section(
             path
         ))
     })?;
-    // Markdown editions carry plain Markdown, not HTML: pick the matching
-    // extractor; anything without a Markdown MIME type takes the HTML path.
-    let found = if article.mime_type.as_deref().is_some_and(|m| m.contains("markdown")) {
+    // HTML wiki pages convert to Markdown first (zim2zim's conversion,
+    // infoboxes included) unless raw; markdown editions carry plain
+    // Markdown, and anything else (or a scraped page without a wiki body)
+    // takes the HTML extractor.
+    let found = if !raw && is_html(article.mime_type.as_deref()) {
+        match convert_if_wiki(&arc, &article, text) {
+            Some(md) => markdown::section_content(&md, section),
+            None => html::section_content(text, section),
+        }
+    } else if article.mime_type.as_deref().is_some_and(|m| m.contains("markdown")) {
         markdown::section_content(text, section)
     } else {
         html::section_content(text, section)

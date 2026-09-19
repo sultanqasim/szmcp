@@ -219,7 +219,9 @@ impl ToolBase for ZimGetTool {
     }
     fn description() -> Option<Cow<'static, str>> {
         Some(
-            "Get the full content of an article or page from the ZIM file.".into(),
+            "Get the full content of an article or page from the ZIM file. HTML wiki \
+             articles are converted to Markdown (infobox rendered as a '## Key \
+             facts' section); non-wiki pages return their raw content.".into(),
         )
     }
 }
@@ -233,7 +235,7 @@ impl AsyncTool<ZimMcpServer> for ZimGetTool {
             let arc = library
                 .single_archive()
                 .ok_or_else(|| ToolError::Internal("no ZIM archive is loaded".into()))?;
-            get_article(&library, &arc.name, &params.path)
+            get_article(&library, &arc.name, &params.path, false)
         })
         .await
         .map_err(|e| ToolError::Internal(format!("zim_get task failed: {e}")))?
@@ -264,7 +266,9 @@ impl ToolBase for ZimGetDirTool {
     }
     fn description() -> Option<Cow<'static, str>> {
         Some(
-            "Get the full content of an article or page from a ZIM file.".into(),
+            "Get the full content of an article or page from a ZIM file. HTML wiki \
+             articles are converted to Markdown (infobox rendered as a '## Key \
+             facts' section); non-wiki pages return their raw content.".into(),
         )
     }
 }
@@ -272,7 +276,7 @@ impl ToolBase for ZimGetDirTool {
 impl AsyncTool<ZimMcpServer> for ZimGetDirTool {
     async fn invoke(server: &ZimMcpServer, params: Self::Parameter) -> Result<Self::Output, Self::Error> {
         let library = server.library.clone();
-        tokio::task::spawn_blocking(move || get_article(&library, &params.zim, &params.path))
+        tokio::task::spawn_blocking(move || get_article(&library, &params.zim, &params.path, false))
             .await
             .map_err(|e| ToolError::Internal(format!("zim_get task failed: {e}")))?
     }
@@ -304,7 +308,7 @@ impl ToolBase for ZimGetSectionTool {
         Some(
             "Get a single section of an article or page from the ZIM file, identified by \
              its heading text (e.g. \"History\"), or by the special name \"_intro\" for \
-             the article lead."
+             the article lead. HTML wiki articles are converted to Markdown first, so headings are those of the converted text."
                 .into(),
         )
     }
@@ -319,7 +323,7 @@ impl AsyncTool<ZimMcpServer> for ZimGetSectionTool {
             let arc = library
                 .single_archive()
                 .ok_or_else(|| ToolError::Internal("no ZIM archive is loaded".into()))?;
-            get_section(&library, &arc.name, &params.path, &params.section)
+            get_section(&library, &arc.name, &params.path, &params.section, false)
         })
         .await
         .map_err(|e| ToolError::Internal(format!("zim_get_section task failed: {e}")))?
@@ -354,7 +358,7 @@ impl ToolBase for ZimGetSectionDirTool {
         Some(
             "Get a single section of an article or page from a ZIM file, identified by \
              its heading text (e.g. \"History\"), or by the special name \"_intro\" for \
-             the article lead."
+             the article lead. HTML wiki articles are converted to Markdown first, so headings are those of the converted text."
                 .into(),
         )
     }
@@ -364,7 +368,7 @@ impl AsyncTool<ZimMcpServer> for ZimGetSectionDirTool {
     async fn invoke(server: &ZimMcpServer, params: Self::Parameter) -> Result<Self::Output, Self::Error> {
         let library = server.library.clone();
         tokio::task::spawn_blocking(move || {
-            get_section(&library, &params.zim, &params.path, &params.section)
+            get_section(&library, &params.zim, &params.path, &params.section, false)
         })
         .await
         .map_err(|e| ToolError::Internal(format!("zim_get_section task failed: {e}")))?

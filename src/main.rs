@@ -1,8 +1,16 @@
+mod cleanup;
+mod entities;
 mod get;
 mod html;
+mod html2md;
+mod htmldom;
+mod infobox_html;
 mod markdown;
 mod search;
+mod tables;
 mod tools;
+mod util;
+mod wikil10n;
 mod zim;
 
 use clap::{Parser, Subcommand};
@@ -59,6 +67,10 @@ enum Command {
         /// response
         #[arg(long)]
         content: bool,
+        /// Skip the HTML->Markdown conversion and output the raw HTML
+        /// instead (only affects text/html pages)
+        #[arg(long)]
+        raw: bool,
     },
     /// Get one section of an article from a ZIM file, by its heading text
     GetSection {
@@ -72,6 +84,10 @@ enum Command {
         /// response
         #[arg(long)]
         content: bool,
+        /// Skip the HTML->Markdown conversion and extract the section
+        /// from the raw HTML instead (only affects text/html pages)
+        #[arg(long)]
+        raw: bool,
     },
 }
 
@@ -136,10 +152,10 @@ async fn run(command: Command) -> Result<(), String> {
             let results = search(&library, None, &query, limit).map_err(|e| e.to_string())?;
             print_result(&results)
         }
-        Command::Get { zim_path, path, content } => {
+        Command::Get { zim_path, path, content, raw } => {
             let library = open_single_zim(&zim_path)?;
             let zim = single_archive_name(&library)?;
-            let result = get_article(&library, &zim, &path).map_err(|e| e.to_string())?;
+            let result = get_article(&library, &zim, &path, raw).map_err(|e| e.to_string())?;
             if content {
                 println!("{}", result.content);
                 Ok(())
@@ -147,10 +163,11 @@ async fn run(command: Command) -> Result<(), String> {
                 print_result(&result)
             }
         }
-        Command::GetSection { zim_path, path, section, content } => {
+        Command::GetSection { zim_path, path, section, content, raw } => {
             let library = open_single_zim(&zim_path)?;
             let zim = single_archive_name(&library)?;
-            let result = get_section(&library, &zim, &path, &section).map_err(|e| e.to_string())?;
+            let result =
+                get_section(&library, &zim, &path, &section, raw).map_err(|e| e.to_string())?;
             if content {
                 println!("{}", result.content);
                 Ok(())
