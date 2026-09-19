@@ -1368,4 +1368,43 @@ mod tests {
         let md = wiki_doc("<table><tr><td rowspan=\"2\"><br></td><td></td></tr></table>");
         assert_eq!(md, "# T\n");
     }
+
+    /// A list nested one element deeper in a cell (inside a <span>) still
+    /// forces the HTML-table path and renders as `* item` lines: it must
+    /// not be flattened to space-separated text in a pipe table.
+    #[test]
+    fn list_nested_in_a_span_makes_the_table_complex() {
+        let md = wiki_doc(
+            "<table><tr><th>H</th></tr><tr><td><span><ul><li>a</li><li>b</li></ul></span></td></tr></table>",
+        );
+        assert!(md.contains("<table>"), "{md}");
+        assert!(md.contains("<td>* a\n* b</td>"), "{md}");
+        assert!(!md.contains("a b"), "{md}");
+    }
+
+    /// A direct <ul> in a cell renders exactly as before (regression
+    /// guard), and a list-free sibling cell keeps its <br> verbatim.
+    #[test]
+    fn direct_ul_cell_renders_as_before() {
+        let md = wiki_doc(
+            "<table><tr><th>H</th></tr><tr><td><ul><li>a</li><li>b</li></ul></td><td><span>one<br>two</span></td></tr></table>",
+        );
+        assert!(md.contains("<td>* a\n* b</td>"), "{md}");
+        assert!(md.contains("<td>one<br>two</td>"), "{md}");
+    }
+
+    /// A <div> wrapping text and a list keeps the text as prose and the
+    /// list as `* item` lines in document order; a wrapped lone list item
+    /// still degrades to plain text.
+    #[test]
+    fn div_with_text_and_list_keeps_prose_and_list_lines() {
+        let md = wiki_doc(
+            "<table><tr><th>H</th></tr><tr><td><div>text<ul><li>x</li></ul></div></td></tr></table>",
+        );
+        assert!(md.contains("<td>text\n* x</td>"), "{md}");
+        let md = wiki_doc(
+            "<table><tr><th>H</th></tr><tr><td><div><ul><li>solo</li></ul></div></td></tr></table>",
+        );
+        assert!(md.contains("<td>solo</td>"), "{md}");
+    }
 }

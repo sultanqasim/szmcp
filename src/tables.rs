@@ -94,16 +94,26 @@ fn table_caption_text(tbl: NodeRef, keep_br: bool) -> String {
     String::new()
 }
 
-/// One cell's content for the HTML-table output: content rendered inline
-/// with <br> kept verbatim; list content becomes newline-separated
-/// `* item` / `1. item` lines — a lone list item with no other content
-/// renders as plain text, leading prose is joined with a single space.
-fn cell_html_text(cell: NodeRef) -> String {
-    let mut prose: Vec<String> = Vec::new();
-    let mut items: Vec<String> = Vec::new();
-    for ch in cell.children() {
+/// True when `el` contains a <ul>/<ol>/<dl> at any depth (lists must
+/// never be flattened to space-separated text, so any list descendant of
+/// a cell — however deeply nested — makes its table complex and renders
+/// as list lines).
+fn has_list_descendant(el: NodeRef) -> bool {
+    el.descendants()
+        .into_iter()
+        .any(|d| matches!(d.tag(), Some("ul") | Some("ol") | Some("dl")))
+}
+
+/// Gather one node's children into a cell's prose and items: text and
+/// list-free elements render as prose (elements without a list descendant
+/// inline, with <br> kept verbatim); a <ul>/<ol> child becomes `* item`
+/// lines, a <dl> its dl lines, and an element holding a list deeper down
+/// is recursed into as a plain container so its lists still render as
+/// item lines (dropped elements are skipped; their tails arrive via the
+/// following Text child).
+fn collect_cell_content(node: NodeRef, prose: &mut Vec<String>, items: &mut Vec<String>) {
+    for ch in node.children() {
         match ch.kind() {
-            // the leading text or a tail consumed at its owner
             NodeKind::Text(t) => {
                 if !t.is_empty() {
                     prose.push(t.to_string());
@@ -123,12 +133,31 @@ fn cell_html_text(cell: NodeRef) -> String {
                             .filter(|l| !l.trim().is_empty())
                             .map(String::from),
                     ),
-                    _ => prose.push(inline_raw(ch, true)),
+                    _ => {
+                        if has_list_descendant(ch) {
+                            collect_cell_content(ch, prose, items);
+                        } else {
+                            prose.push(inline_raw(ch, true));
+                        }
+                    }
                 }
             }
             _ => {}
         }
     }
+}
+
+/// One cell's content for the HTML-table output: content rendered inline
+/// with <br> kept verbatim; a <ul>/<ol>/<dl> anywhere in the cell — as a
+/// direct child or nested one or more elements deeper in a container —
+/// becomes newline-separated `* item` / `1. item` lines (container text
+/// stays prose; nothing is flattened to space-separated text) — a lone
+/// list item with no other content renders as plain text, leading prose
+/// is joined with a single space.
+fn cell_html_text(cell: NodeRef) -> String {
+    let mut prose: Vec<String> = Vec::new();
+    let mut items: Vec<String> = Vec::new();
+    collect_cell_content(cell, &mut prose, &mut items);
     let lead = collapse_ws(&prose.join("")).trim().to_string();
     if items.is_empty() {
         return lead;
@@ -149,17 +178,17 @@ fn cell_html_text(cell: NodeRef) -> String {
 }
 
 /// A table is complex (HTML output) when any cell carries a multi-cell
-/// rowspan/colspan or contains a list. lxml's `find("ul")` matches direct
-/// children only — a nested list inside a span does not count.
+/// rowspan/colspan or contains a list at any depth: a <ul>/<ol>/<dl>
+/// descendant of a cell forces the HTML-table path, where the list renders
+/// as `* item` / `1. item` lines instead of being flattened to
+/// space-separated text in a pipe table.
 fn is_complex_table(rows: &[NodeRef]) -> bool {
     for tr in rows {
         for c in row_cells(*tr) {
             if span_attr(c, "rowspan").unwrap_or(1) > 1 || span_attr(c, "colspan").unwrap_or(1) > 1 {
                 return true;
             }
-            if c.element_children()
-                .any(|ch| matches!(ch.tag(), Some("ul") | Some("ol") | Some("dl")))
-            {
+            if has_list_descendant(c) {
                 return true;
             }
         }
