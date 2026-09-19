@@ -1286,7 +1286,8 @@ mod tests {
         assert_eq!(md, "# Doc\n\n## Intro\n\nBody text.\n");
     }
 
-    fn wiki_dl(inner: &str) -> String {
+    /// Wiki article shell: `inner` inside div.mw-parser-output.
+    fn wiki_doc(inner: &str) -> String {
         html_to_md(
             &format!(
                 "<html><body><div id=\"mw-content-text\"><div class=\"mw-parser-output\">{}</div></div></body></html>",
@@ -1302,7 +1303,7 @@ mod tests {
     /// must not also leak (flattened) into the definition text.
     #[test]
     fn dd_text_and_sublist_define_on_the_term_line_then_the_sublist() {
-        let md = wiki_dl("<dl><dt>T</dt><dd>Def <i>x</i><ul><li>s1</li><li>s2</li></ul></dd></dl>");
+        let md = wiki_doc("<dl><dt>T</dt><dd>Def <i>x</i><ul><li>s1</li><li>s2</li></ul></dd></dl>");
         assert_eq!(md, "# T\n\n- **T**: Def *x*\n  - s1\n  - s2\n");
     }
 
@@ -1310,7 +1311,7 @@ mod tests {
     /// sub-list — no duplicated flattened text.
     #[test]
     fn lone_dd_with_text_and_sublist_puts_the_text_on_its_own_line() {
-        let md = wiki_dl("<dl><dd>Def <i>x</i><ul><li>s1</li></ul></dd></dl>");
+        let md = wiki_doc("<dl><dd>Def <i>x</i><ul><li>s1</li></ul></dd></dl>");
         assert_eq!(md, "# T\n\n- Def *x*\n  - s1\n");
     }
 
@@ -1318,7 +1319,37 @@ mod tests {
     /// untouched and the sub-list follows it.
     #[test]
     fn dd_with_only_a_sublist_leaves_the_term_line_untouched() {
-        let md = wiki_dl("<dl><dt>T</dt><dd><ul><li>s1</li><li>s2</li></ul></dd></dl>");
+        let md = wiki_doc("<dl><dt>T</dt><dd><ul><li>s1</li><li>s2</li></ul></dd></dl>");
         assert_eq!(md, "# T\n\n- **T**\n  - s1\n  - s2\n");
+    }
+
+    /// A complex table (spans force the HTML-table path) keeps its
+    /// caption's <br> verbatim, consistent with its <br>-keeping cells;
+    /// the pre-fix port degraded it to a space (the Python original's
+    /// dead keep_br flag).
+    #[test]
+    fn html_table_caption_keeps_br() {
+        let md = wiki_doc(
+            "<table><caption>Statistiques 1991-2020 (à 10 km)<br>Records établis depuis 1888</caption><tr><td rowspan=\"2\">a</td><td>b</td></tr><tr><td>c</td></tr></table>",
+        );
+        assert!(
+            md.contains(
+                "<caption>Statistiques 1991-2020 (à 10 km)<br>Records établis depuis 1888</caption>"
+            ),
+            "{md}"
+        );
+    }
+
+    /// A simple table renders as a pipe table: the caption must stay
+    /// single-line, so its <br> degrades to a space.
+    #[test]
+    fn pipe_table_caption_joins_br_lines_with_a_space() {
+        let md = wiki_doc(
+            "<table><caption>Line one<br>Line two</caption><tr><th>H</th></tr><tr><td>a</td></tr></table>",
+        );
+        assert_eq!(
+            md,
+            "# T\n\n*Line one Line two*\n\n| H |\n| --- |\n| a |\n"
+        );
     }
 }

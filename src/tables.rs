@@ -78,14 +78,17 @@ fn nested_tables(tbl: NodeRef) -> Vec<NodeRef> {
     out
 }
 
-/// Rendered text of the table's <caption> element ('' when none). The
-/// original passes its keep_br flag as `_inline_raw`'s br_mode, where
-/// neither True nor False equals "keep", so <br> always degrades to a
-/// space here.
-fn table_caption_text(tbl: NodeRef) -> String {
+/// Rendered text of the table's <caption> element ('' when none).
+/// `keep_br=true` — the HTML-table path, consistent with its <br>-keeping
+/// cells — renders the caption's <br> verbatim; `keep_br=false` — the
+/// single-line pipe-table path — degrades it to a space. (The Python
+/// original passed this bool as `_inline_raw`'s `br_mode` string, where
+/// neither True nor False equals "keep", so both paths always degraded
+/// <br> to a space.)
+fn table_caption_text(tbl: NodeRef, keep_br: bool) -> String {
     for ch in tbl.element_children() {
         if ch.tag() == Some("caption") {
-            return collapse_ws(&inline_raw(ch, false)).trim().to_string();
+            return collapse_ws(&inline_raw(ch, keep_br)).trim().to_string();
         }
     }
     String::new()
@@ -420,10 +423,11 @@ pub(crate) fn render_table(tbl: NodeRef) -> String {
                 .collect()
         })
         .collect();
+    let caption = table_caption_text(tbl, as_html);
     let md = if as_html {
-        table_to_html(&rows, &table_caption_text(tbl), &texts)
+        table_to_html(&rows, &caption, &texts)
     } else {
-        table_to_pipe(&rows, &table_caption_text(tbl), &texts)
+        table_to_pipe(&rows, &caption, &texts)
     };
     if !nested_md.is_empty() {
         // Real content in the nested tables: a stub wrapper (or one whose
