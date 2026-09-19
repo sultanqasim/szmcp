@@ -281,7 +281,9 @@ fn lookup_entity(name: &str) -> Option<&'static str> {
 
 /// Python's `html.unescape`: decode numeric and HTML5 named character
 /// references, with the same longest-prefix fallback for names without a
-/// full-table match ('&notit;' -> '¬it;').
+/// full-table match ('&notit;' -> '¬it;').  The final cleanup pass calls
+/// this only outside fenced code, inline code spans and link destinations,
+/// where `&…;` text is verbatim content rather than parser residue.
 pub(crate) fn html_unescape(s: &str) -> String {
     if !s.contains('&') {
         return s.to_string();

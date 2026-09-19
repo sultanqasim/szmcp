@@ -168,15 +168,76 @@ fn mask_urls(s: &str) -> (String, Vec<String>) {
     (masked, urls)
 }
 
-/// Restore the URLs masked by [`mask_urls`].
-fn unmask_urls(s: &str, urls: &[String]) -> String {
+/// Restore the `\x00N\x00` placeholders of [`mask_urls`] /
+/// [`mask_code_dests`]; repeated until no placeholder is left, so a mask
+/// that swallowed an earlier placeholder (a code span inside a link
+/// destination) unwinds correctly.
+fn unmask(s: &str, items: &[String]) -> String {
     if !s.contains('\x00') {
         return s.to_string();
     }
-    fre_sub(fre(r"\x00(\d+)\x00"), s, |c| {
-        let idx: usize = c.get(1).map(|m| m.as_str().parse().unwrap_or(0)).unwrap_or(0);
-        urls.get(idx).cloned().unwrap_or_default()
-    })
+    let mut s = s.to_string();
+    while s.contains('\x00') {
+        let next = fre_sub(fre(r"\x00(\d+)\x00"), &s, |c| {
+            let idx: usize = c.get(1).map(|m| m.as_str().parse().unwrap_or(0)).unwrap_or(0);
+            items.get(idx).cloned().unwrap_or_default()
+        });
+        if next == s {
+            break; // dangling placeholder: leave it alone
+        }
+        s = next;
+    }
+    s
+}
+
+/// Mask inline code spans (`` `…` ``) and Markdown link destinations (the
+/// `(…)` of `[label](…)`) as `\x00N\x00` placeholders (the [`mask_urls`]
+/// shape) so the entity decode cannot rewrite their verbatim `&…;` text.
+/// Destinations run from `](` to the matching close paren (balanced parens
+/// are part of the URL) or, if unbalanced, to end of line; code spans are
+/// masked first, so a `](` inside one cannot start a destination.
+fn mask_code_dests(ln: &str) -> (String, Vec<String>) {
+    let mut items: Vec<String> = Vec::new();
+    // Inline code spans: a backtick run, its content, the matching run.
+    let mut masked = fre_sub(fre(r"(`+)(.*?)\1"), ln, |c| {
+        items.push(c.get(0).map(|m| m.as_str()).unwrap_or("").to_string());
+        format!("\x00{}\x00", items.len() - 1)
+    });
+    if masked.contains("](") {
+        let b = masked.as_bytes();
+        let mut out = String::with_capacity(masked.len());
+        let mut last = 0usize;
+        let mut i = 0usize;
+        while i + 1 < b.len() {
+            if b[i] == b']' && b[i + 1] == b'(' {
+                let (mut depth, mut j) = (0usize, i + 1);
+                let end = loop {
+                    if j == b.len() {
+                        break b.len(); // unbalanced parens: mask to end of line
+                    }
+                    if b[j] == b'(' {
+                        depth += 1;
+                    } else if b[j] == b')' {
+                        depth -= 1;
+                        if depth == 0 {
+                            break j + 1;
+                        }
+                    }
+                    j += 1;
+                };
+                out.push_str(&masked[last..i]);
+                items.push(masked[i..end].to_string());
+                out.push_str(&format!("\x00{}\x00", items.len() - 1));
+                i = end;
+                last = end;
+            } else {
+                i += 1;
+            }
+        }
+        out.push_str(&masked[last..]);
+        masked = out;
+    }
+    (masked, items)
 }
 
 /// Generic punctuation/whitespace residue repair for one output line.
@@ -210,7 +271,7 @@ fn repair_line(ln: &str) -> String {
     if s.contains(" .") {
         s = fre_sub(fre(r#"(?<=[A-Za-z0-9\)\]"'*]) +\.(?![.\w])"#), &s, |_| ".".to_string());
     }
-    unmask_urls(&s, &urls)
+    unmask(&s, &urls)
 }
 
 /// Remove blank lines sitting strictly between two consecutive list-item
@@ -234,13 +295,40 @@ fn rejoin_split_lists(lines: Vec<String>, prot: &[bool]) -> Vec<String> {
     out
 }
 
-/// The final cleanup pass: entity decode, nbsp/feff collapse, edit-link
+/// The entity-decode step of [`cleanup`]: `html_unescape` over the whole
+/// document, except that fenced code blocks are left untouched entirely
+/// and, on the other lines, inline code spans and Markdown link
+/// destinations are masked off for the duration ([`mask_code_dests`]) —
+/// their `&…;` text is verbatim content the HTML parser deliberately kept
+/// literal, not residue to clean up.
+fn unescape_residue(md: &str) -> String {
+    let mut out: Vec<String> = Vec::new();
+    let mut in_fence = false;
+    for ln in md.split('\n') {
+        if ln.trim_start().starts_with("```") {
+            in_fence = !in_fence;
+            out.push(ln.to_string());
+            continue;
+        }
+        if in_fence {
+            out.push(ln.to_string());
+            continue;
+        }
+        let (masked, spans) = mask_code_dests(ln);
+        out.push(unmask(&html_unescape(&masked), &spans));
+    }
+    out.join("\n")
+}
+
+/// The final cleanup pass: entity decode (leaving fenced code blocks,
+/// inline code spans and link destinations literal — see
+/// [`unescape_residue`]), nbsp/feff collapse, edit-link
 /// residue removal, blank normalization, per-line repairs and list
 /// rejoining, then one last `end.He` -> `end. He` sentence-period repair
 /// on the joined text — with URLs masked off for that repair, since a
 /// period inside a URL (`example.NET`, `Page.Us`) is not a sentence end.
 pub(crate) fn cleanup(md: &str) -> String {
-    let md = html_unescape(md);
+    let md = unescape_residue(md);
     let md = md
         .replace('\u{00a0}', " ")
         .replace('\u{feff}', "")
@@ -295,7 +383,7 @@ pub(crate) fn cleanup(md: &str) -> String {
     let joined = fre_sub(fre(r"(?<=[a-z0-9\)])\.([A-Z])"), &joined, |c| {
         format!(". {}", c.get(1).map(|m| m.as_str()).unwrap_or(""))
     });
-    let md = unmask_urls(&joined, &urls);
+    let md = unmask(&joined, &urls);
     format!("{}\n", md.trim_matches('\n'))
 }
 
@@ -323,6 +411,52 @@ mod tests {
         assert_eq!(
             cleanup(md),
             "See [x](https://example.com/Page.Us) and <https://example.NET>. Then end. He said.\n"
+        );
+    }
+
+    /// Fenced code blocks display entity text verbatim (`<pre>&lt;?php</pre>`
+    /// parses to a literal `&lt;?php` inside the fence), so the entity
+    /// decode must leave them untouched while the surrounding prose still
+    /// decodes (`&notit;` -> `¬it;`).
+    #[test]
+    fn fenced_code_keeps_entities() {
+        let md = "Prose &notit; here.\n\n```html\n&lt;?php\n$a = &amp;lt;b&gt;;\n```\n\nAfter &notit;.";
+        assert_eq!(
+            cleanup(md),
+            "Prose ¬it; here.\n\n```html\n&lt;?php\n$a = &amp;lt;b&gt;;\n```\n\nAfter ¬it;.\n"
+        );
+    }
+
+    /// Same for inline code spans: the entity text between backticks is
+    /// content, the entity in the surrounding prose is residue.
+    #[test]
+    fn inline_code_span_keeps_entities() {
+        let md = "Use `&lt;` for < and `&amp;lt;` here, not `&gt;`-shaped.";
+        assert_eq!(
+            cleanup(md),
+            "Use `&lt;` for < and `&amp;lt;` here, not `&gt;`-shaped.\n"
+        );
+    }
+
+    /// A link destination keeps its literal `&...;` query text while the
+    /// same residue in prose still decodes.
+    #[test]
+    fn link_destination_keeps_entities() {
+        let md = "See [l](https://x.example/a?x=&notit&amp;y=2) now.\n\nElsewhere &notit; ends.";
+        assert_eq!(
+            cleanup(md),
+            "See [l](https://x.example/a?x=&notit&amp;y=2) now.\n\nElsewhere ¬it; ends.\n"
+        );
+    }
+
+    /// Balanced parens are part of the destination and stay inside the
+    /// mask; the prose after the link still decodes.
+    #[test]
+    fn link_destination_with_parens_keeps_entities() {
+        let md = "[l](https://x.example/a_(b)&amp;c) tail &notit;.";
+        assert_eq!(
+            cleanup(md),
+            "[l](https://x.example/a_(b)&amp;c) tail ¬it;.\n"
         );
     }
 }
