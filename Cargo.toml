@@ -26,7 +26,7 @@ zstd = "0.13"
 xz2 = "0.1"
 base64 = "0.22"
 unicode-normalization = "0.1"
-html5ever = "0.39.0"
+html5ever = "0.40.1"
 regex = "1.13.1"
 
 [dev-dependencies]
