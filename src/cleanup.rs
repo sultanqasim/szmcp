@@ -1,7 +1,9 @@
 //! The final cleanup pass and section assembly of the converter (ports
 //! wikizim_parser/html2md.py's `_cleanup` / `_assemble` / `_repair_line`).
 
-use crate::util::{collapse_ws, fre, fre_sub, html_unescape, re};
+use crate::util::{
+    collapse_ws, html_unescape, prev_char, re, run_end,
+};
 
 /// Section headings whose entire section is dropped (English Wikipedia
 /// names; wikil10n adds the per-language ones).
@@ -162,9 +164,11 @@ fn stash(items: &mut Vec<String>, span: &str) -> String {
 fn mask_urls(s: &str) -> (String, Vec<String>) {
     let mut urls: Vec<String> = Vec::new();
     let masked = if s.contains("://") {
-        fre_sub(fre(r"\S*://\S*"), s, |c| {
-            stash(&mut urls, c.get(0).map(|m| m.as_str()).unwrap_or(""))
-        })
+        re(r"\S*://\S*")
+            .replace_all(s, |c: &regex::Captures| {
+                stash(&mut urls, c.get(0).map(|m| m.as_str()).unwrap_or(""))
+            })
+            .into_owned()
     } else {
         s.to_string()
     };
@@ -181,16 +185,84 @@ fn unmask(s: &str, items: &[String]) -> String {
     }
     let mut s = s.to_string();
     while s.contains('\x00') {
-        let next = fre_sub(fre(r"\x00(\d+)\x00"), &s, |c| {
-            let idx: usize = c.get(1).map(|m| m.as_str().parse().unwrap_or(0)).unwrap_or(0);
-            items.get(idx).cloned().unwrap_or_default()
-        });
+        let next = re(r"\x00(\d+)\x00")
+            .replace_all(&s, |c: &regex::Captures| {
+                let idx: usize = c
+                    .get(1)
+                    .map(|m| m.as_str().parse().unwrap_or(0))
+                    .unwrap_or(0);
+                items.get(idx).cloned().unwrap_or_default()
+            })
+            .into_owned();
         if next == s {
             break; // dangling placeholder: leave it alone
         }
         s = next;
     }
     s
+}
+
+/// End offset of a `` (`+)(.*?)\1 `` match starting exactly at byte
+/// offset `p`, where `kmax` is the length of the maximal backtick run at
+/// `p`.  Python `re`-style backtracking: the greedy `` `+ `` runs down
+/// from `kmax`, and for each run the `(.*?)` span grows lazily one char
+/// at a time (`.` never matches a newline) until the same run of
+/// backticks closes it; the first closure wins.
+fn code_span_end(ln: &str, p: usize, kmax: usize) -> Option<usize> {
+    let b = ln.as_bytes();
+    for k in (1..=kmax).rev() {
+        let mut l = p + k; // group 2 spans [p+k, l), lazily growing
+        loop {
+            // The backreference: k backticks right after the span.
+            if l + k <= ln.len() && b[l..l + k].iter().all(|&x| x == b'`') {
+                return Some(l + k);
+            }
+            if l >= ln.len() {
+                break;
+            }
+            let c = ln[l..].chars().next().unwrap();
+            if c == '\n' {
+                break; // `.` cannot cross a newline
+            }
+            l += c.len_utf8();
+        }
+    }
+    None
+}
+
+/// Mask inline code spans (`` `…` ``) as `\x00N\x00` placeholders (the
+/// [`mask_urls`] shape), stashing the span text into `items`.  Scanned
+/// with Python `re.sub` semantics: try each backtick position, replace
+/// on a match and continue after it, else advance one character.
+/// (Without a backtick nothing can match.)
+fn mask_code_spans(ln: &str, items: &mut Vec<String>) -> String {
+    if !ln.contains('`') {
+        return ln.to_string();
+    }
+    let b = ln.as_bytes();
+    let mut out = String::with_capacity(ln.len());
+    let mut last = 0usize;
+    let mut from = 0usize;
+    while let Some(k) = ln[from..].find('`') {
+        let p = from + k;
+        let mut kmax = 0usize;
+        while p + kmax < ln.len() && b[p + kmax] == b'`' {
+            kmax += 1;
+        }
+        match code_span_end(ln, p, kmax) {
+            Some(end) => {
+                out.push_str(&ln[last..p]);
+                out.push_str(&stash(items, &ln[p..end]));
+                last = end;
+                from = end;
+            }
+            None => {
+                from = p + 1;
+            }
+        }
+    }
+    out.push_str(&ln[last..]);
+    out
 }
 
 /// Mask inline code spans (`` `…` ``) and Markdown link destinations (the
@@ -201,9 +273,7 @@ fn unmask(s: &str, items: &[String]) -> String {
 /// masked first, so a `](` inside one cannot start a destination.
 fn mask_code_dests(ln: &str) -> (String, Vec<String>) {
     let mut items: Vec<String> = Vec::new();
-    let mut masked = fre_sub(fre(r"(`+)(.*?)\1"), ln, |c| {
-        stash(&mut items, c.get(0).map(|m| m.as_str()).unwrap_or(""))
-    });
+    let mut masked = mask_code_spans(ln, &mut items);
     if masked.contains("](") {
         let b = masked.as_bytes();
         let mut out = String::with_capacity(masked.len());
@@ -240,39 +310,256 @@ fn mask_code_dests(ln: &str) -> (String, Vec<String>) {
     (masked, items)
 }
 
+/// `\(\s+(?=\S)` -> `(`: "( (" becomes "((", but "(  " at end of line
+/// stays.  Candidates are the `(` positions; the greedy `\s+` takes the
+/// maximal whitespace run, and the lookahead only holds when a non-space
+/// char follows it — a run to end of line fails, and so does every
+/// shorter prefix of the run (it would end in whitespace), so the
+/// maximal-run test is the whole rule.  Python `re.sub` scan semantics:
+/// replace and continue after the match.
+fn sub_paren_space(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut last = 0usize;
+    let mut from = 0usize;
+    while let Some(k) = s[from..].find('(') {
+        let p = from + k;
+        let run = run_end(s, p + 1, char::is_whitespace);
+        if run > p + 1 && s[run..].chars().next().is_some_and(|c| !c.is_whitespace()) {
+            out.push_str(&s[last..p]);
+            out.push('(');
+            last = run;
+            from = run;
+        } else {
+            from = p + 1;
+        }
+    }
+    out.push_str(&s[last..]);
+    out
+}
+
+/// `(?<=\S)\s+\)` -> `)`: "( )" becomes "()", "(  )" too, while "( ) "
+/// at start of line stays.  Candidates are the maximal whitespace runs
+/// (greedy `\s+` can only reach a `)` at the run's end — a shorter run
+/// would end in whitespace); the lookbehind wants a non-space char
+/// before the run.
+fn sub_ws_close_paren(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut last = 0usize;
+    let mut i = 0usize;
+    while i < s.len() {
+        let start = match s[i..].find(char::is_whitespace) {
+            Some(k) => i + k,
+            None => break,
+        };
+        let end = run_end(s, start, char::is_whitespace);
+        if end < s.len()
+            && s.as_bytes()[end] == b')'
+            && prev_char(s, start).is_some_and(|c| !c.is_whitespace())
+        {
+            out.push_str(&s[last..start]);
+            out.push(')');
+            last = end + 1;
+            i = end + 1;
+        } else {
+            i = end;
+        }
+    }
+    out.push_str(&s[last..]);
+    out
+}
+
+/// `(?<=[A-Za-z0-9])\.\.(?![.\w/])` -> `.`: "3.." becomes "3.", while
+/// "a..." keeps its dots (the second pair is preceded by a dot) and
+/// "a..b" keeps both dots (the lookahead sees a word char).  Candidates
+/// are the ".." positions; a rejected pair is followed up one char later
+/// because overlapping pairs share their middle dot.
+fn sub_dot_pair(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut last = 0usize;
+    let mut from = 0usize;
+    while let Some(k) = s[from..].find("..") {
+        let p = from + k;
+        // [A-Za-z0-9] is pure ASCII, so the char before the pair can be
+        // tested on its last byte (a non-ASCII char ends in >= 0x80).
+        let lookbehind = p > 0 && s.as_bytes()[p - 1].is_ascii_alphanumeric();
+        let lookahead = !re("^[.\\w/]").is_match(&s[p + 2..]);
+        if lookbehind && lookahead {
+            out.push_str(&s[last..p]);
+            out.push('.');
+            last = p + 2;
+            from = p + 2;
+        } else {
+            from = p + 1;
+        }
+    }
+    out.push_str(&s[last..]);
+    out
+}
+
+/// `(?<=\S) {2,}` -> ` `: "x   " becomes "x ", runs after whitespace or
+/// at start of line stay.  Candidates are the maximal runs of spaces
+/// (the core matches only `' '`), needing two or more.
+fn sub_double_space(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut last = 0usize;
+    let mut i = 0usize;
+    while i < s.len() {
+        let start = match s[i..].find(' ') {
+            Some(k) => i + k,
+            None => break,
+        };
+        let end = run_end(s, start, |c| c == ' ');
+        if end - start >= 2 && prev_char(s, start).is_some_and(|c| !c.is_whitespace()) {
+            out.push_str(&s[last..start]);
+            out.push(' ');
+            last = end;
+        }
+        i = end;
+    }
+    out.push_str(&s[last..]);
+    out
+}
+
+/// `,\s*\.(?![.\w])` -> `.`: ", ." becomes ".", ", .x" stays.  The
+/// greedy `\s*` can only reach a `.` at the run's end, so the candidate
+/// dot is uniquely placed; the lookahead holds past end of line too.
+fn sub_comma_dot(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut last = 0usize;
+    let mut from = 0usize;
+    while let Some(k) = s[from..].find(',') {
+        let p = from + k;
+        let run = run_end(s, p + 1, char::is_whitespace);
+        if s[run..].starts_with('.') && !re("^[.\\w]").is_match(&s[run + 1..]) {
+            out.push_str(&s[last..p]);
+            out.push('.');
+            last = run + 1;
+            from = run + 1;
+        } else {
+            from = p + 1;
+        }
+    }
+    out.push_str(&s[last..]);
+    out
+}
+
+/// `,\s*,(?!\w)` -> `,`: ", ," becomes ",", ", ,a" stays.
+fn sub_comma_comma(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut last = 0usize;
+    let mut from = 0usize;
+    while let Some(k) = s[from..].find(',') {
+        let p = from + k;
+        let run = run_end(s, p + 1, char::is_whitespace);
+        if s[run..].starts_with(',') && !re("^\\w").is_match(&s[run + 1..]) {
+            out.push_str(&s[last..p]);
+            out.push(',');
+            last = run + 1;
+            from = run + 1;
+        } else {
+            from = p + 1;
+        }
+    }
+    out.push_str(&s[last..]);
+    out
+}
+
+/// `(?<=[A-Za-z0-9\)\]"'*]) +\.(?![.\w])` -> `.`: "x ." becomes "x.",
+/// "( ." and " ." after a word too, while " ) ." (preceded by a space)
+/// and "x .y" stay.  Candidates are the maximal runs of spaces ending at
+/// a dot; the lookbehind class is pure ASCII, so it is tested on the
+/// last byte of the char before the run.
+fn sub_cls_space_dot(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut last = 0usize;
+    let mut i = 0usize;
+    while i < s.len() {
+        let start = match s[i..].find(' ') {
+            Some(k) => i + k,
+            None => break,
+        };
+        let end = run_end(s, start, |c| c == ' ');
+        let lookbehind = start > 0
+            && matches!(
+                s.as_bytes()[start - 1],
+                b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9' | b')' | b']' | b'"' | b'\'' | b'*'
+            );
+        if s[end..].starts_with('.') && lookbehind && !re("^[.\\w]").is_match(&s[end + 1..]) {
+            out.push_str(&s[last..start]);
+            out.push('.');
+            last = end + 1;
+            i = end + 1;
+        } else {
+            i = end;
+        }
+    }
+    out.push_str(&s[last..]);
+    out
+}
+
+/// `(?<=[a-z0-9\)])\.([A-Z])` -> `. X`: "end.He" becomes "end. He" (the
+/// uppercase letter is kept), while "H.He" (H not in the class) stays.
+/// The lookbehind class is pure ASCII, tested on the last byte of the
+/// char before the dot; the `[A-Z]` is a single ASCII char.
+fn sub_period_upper(joined: &str) -> String {
+    let mut out = String::with_capacity(joined.len());
+    let mut last = 0usize;
+    let mut from = 0usize;
+    while let Some(k) = joined[from..].find('.') {
+        let p = from + k;
+        let upper = joined[p + 1..]
+            .chars()
+            .next()
+            .filter(|c| c.is_ascii_uppercase());
+        if let Some(c) = upper {
+            if p > 0 && matches!(joined.as_bytes()[p - 1], b'a'..=b'z' | b'0'..=b'9' | b')') {
+                out.push_str(&joined[last..p]);
+                out.push_str(". ");
+                out.push(c);
+                last = p + 1 + c.len_utf8();
+                from = last;
+                continue;
+            }
+        }
+        from = p + 1;
+    }
+    out.push_str(&joined[last..]);
+    out
+}
+
 /// Generic punctuation/whitespace residue repair for one output line.
 /// URLs are masked off for the duration.
 fn repair_line(ln: &str) -> String {
     let (mut s, urls) = mask_urls(ln);
-    // The `contains` checks are pure shortcuts — each pattern fails
-    // without its trigger characters — but skipping the regex runs (the
-    // lookbehind ones are expensive) keeps large articles fast.
+    // The `contains` checks are pure shortcuts — each rule fails without
+    // its trigger characters — but skipping the scans keeps large
+    // articles fast.
     if s.contains('(') {
         s = re(r"\(\s*\)").replace_all(&s, "").into_owned();
-        s = fre_sub(fre(r"\(\s+(?=\S)"), &s, |_| "(".to_string());
+        s = sub_paren_space(&s);
     }
     if s.contains(')') {
-        s = fre_sub(fre(r#"(?<=\S)\s+\)"#), &s, |_| ")".to_string());
+        s = sub_ws_close_paren(&s);
     }
     if s.contains("..") {
-        s = fre_sub(fre(r#"(?<=[A-Za-z0-9])\.\.(?![.\w/])"#), &s, |_| ".".to_string());
+        s = sub_dot_pair(&s);
     }
     if s.contains("  ") {
-        s = fre_sub(fre(r"(?<=\S) {2,}"), &s, |_| " ".to_string());
+        s = sub_double_space(&s);
     }
     if s.contains(',') {
         s = re(r"^(\s*(?:[-*+] |\d+[.)] ))\s*,+\s*")
             .replace_all(&s, "$1")
             .into_owned();
         if s.contains('.') {
-            s = fre_sub(fre(r",\s*\.(?![.\w])"), &s, |_| ".".to_string());
+            s = sub_comma_dot(&s);
         }
         if s.matches(',').count() > 1 {
-            s = fre_sub(fre(r",\s*,(?!\w)"), &s, |_| ",".to_string());
+            s = sub_comma_comma(&s);
         }
     }
     if s.contains(" .") {
-        s = fre_sub(fre(r#"(?<=[A-Za-z0-9\)\]"'*]) +\.(?![.\w])"#), &s, |_| ".".to_string());
+        s = sub_cls_space_dot(&s);
     }
     unmask(&s, &urls)
 }
@@ -383,9 +670,7 @@ pub(crate) fn cleanup(md: &str) -> String {
     // with URLs masked so the repair stays out of them (`example.NET` keeps
     // its dot; `end.He` still gains the space).
     let (joined, urls) = mask_urls(&out.join("\n"));
-    let joined = fre_sub(fre(r"(?<=[a-z0-9\)])\.([A-Z])"), &joined, |c| {
-        format!(". {}", c.get(1).map(|m| m.as_str()).unwrap_or(""))
-    });
+    let joined = sub_period_upper(&joined);
     let md = unmask(&joined, &urls);
     format!("{}\n", md.trim_matches('\n'))
 }

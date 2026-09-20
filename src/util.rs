@@ -18,45 +18,23 @@ pub(crate) fn re(pat: &'static str) -> &'static regex::Regex {
     rx
 }
 
-/// A cached compiled `fancy-regex` (needed for lookaround/backreferences).
-pub(crate) fn fre(pat: &'static str) -> &'static fancy_regex::Regex {
-    static CACHE: OnceLock<Mutex<HashMap<&'static str, &'static fancy_regex::Regex>>> =
-        OnceLock::new();
-    let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
-    let mut cache = cache.lock().unwrap_or_else(|e| e.into_inner());
-    if let Some(&rx) = cache.get(pat) {
-        return rx;
+/// Byte offset one past the last char of the maximal run of chars
+/// accepted by `run` beginning at byte offset `i` (a char boundary).
+pub(crate) fn run_end(s: &str, i: usize, run: impl Fn(char) -> bool) -> usize {
+    let mut end = i;
+    for c in s[i..].chars() {
+        if run(c) {
+            end += c.len_utf8();
+        } else {
+            break;
+        }
     }
-    let rx: &'static fancy_regex::Regex =
-        Box::leak(Box::new(fancy_regex::Regex::new(pat).unwrap()));
-    cache.insert(pat, rx);
-    rx
+    end
 }
 
-/// `re.sub` with a replacement function over a fancy-regex.
-pub(crate) fn fre_sub(
-    rx: &fancy_regex::Regex,
-    text: &str,
-    f: impl FnMut(&fancy_regex::Captures<'_, str>) -> String,
-) -> String {
-    let mut out = String::new();
-    let mut last = 0usize;
-    let mut f = f;
-    for caps in rx.captures_iter(text) {
-        let caps = match caps {
-            Ok(caps) => caps,
-            Err(_) => break,
-        };
-        let m = match caps.get(0) {
-            Some(m) => m,
-            None => break,
-        };
-        out.push_str(&text[last..m.start()]);
-        out.push_str(&f(&caps));
-        last = m.end();
-    }
-    out.push_str(&text[last..]);
-    out
+/// The char immediately before byte offset `i` (a char boundary).
+pub(crate) fn prev_char(s: &str, i: usize) -> Option<char> {
+    s[..i].chars().next_back()
 }
 
 /// One shared collapse: runs of chars accepted by `run` become one space,

@@ -9,7 +9,9 @@
 use crate::cleanup;
 use crate::htmldom::{Dom, NodeKind, NodeRef};
 use crate::tables;
-use crate::util::{collapse_space_tab, collapse_ws, fre, fre_sub, parse_query, percent_decode, re, urlsplit};
+use crate::util::{
+    collapse_space_tab, collapse_ws, parse_query, percent_decode, prev_char, re, run_end, urlsplit,
+};
 
 // ---------------------------------------------------------------------------
 // Conventions copied from wiki2md.py
@@ -373,24 +375,117 @@ fn wiki_edit_target(href: &str) -> Option<String> {
     Some(title.replace('_', " "))
 }
 
-/// A hatnote's duplicate article mention around the [[title]] wikilink
-/// rendered from its edit-widget anchor.
-const HN_MENTION: &str = concat!(
-    r"(?<!\S)(\[\[([^\[\]|#]+)(?:#[^\[\]|]*)?(?:\|[^\[\]]*)?\]\]|",
-    r"([^\[\]\s][^\[\]]*?))[\s.,;:!?]*\[\[(?:\2|\3)\]\]"
-);
+/// The `[\s.,;:!?]*` gap and the `[[key]]` after a hatnote mention;
+/// returns the offset just past the closing `]]`.
+fn hn_close(s: &str, from: usize, key: &str) -> Option<usize> {
+    let end = run_end(s, from, |c| {
+        c.is_whitespace() || matches!(c, '.' | ',' | ';' | ':' | '!' | '?')
+    });
+    if s[end..].starts_with("[[")
+        && s[end + 2..].starts_with(key)
+        && s[end + 2 + key.len()..].starts_with("]]")
+    {
+        Some(end + 2 + key.len() + 2)
+    } else {
+        None
+    }
+}
+
+/// One match of the old hatnote-mention pattern starting exactly at byte
+/// offset `i` (a char boundary; the `(?<!\S)` part is checked by the
+/// caller): returns the mention text and the offset just past its
+/// closing `[[…]]`.
+///
+/// The mention is a whole wikilink `[[target(#frag)?(|label)?]]` (the
+/// key is the target) or lazily growing bare text (the key is the text
+/// itself).  The wikilink parts are maximal plain-class runs anchored to
+/// their lead chars, so the maximal scan decides them (no shorter run
+/// can reach a `]]` the maximal one missed); the bare text grows one
+/// char at a time and the first length whose closing link matches wins.
+fn hn_mention_at(s: &str, i: usize) -> Option<(&str, usize)> {
+    let b = s.as_bytes();
+    if s[i..].starts_with("[[") {
+        // [[target(#frag)?(|label)?]]: target = 1+ chars none of [ ] | #,
+        // fragment after '#' (0+ chars none of [ ] |), label after '|'
+        // (0+ chars none of [ ]).
+        let t0 = i + 2;
+        let mut p = t0;
+        while p < s.len() && !matches!(b[p], b'[' | b']' | b'|' | b'#') {
+            p += 1;
+        }
+        if p == t0 {
+            return None; // the target needs at least one char
+        }
+        let tend = p; // the key is the target only (not #frag/|label)
+        if p < s.len() && b[p] == b'#' {
+            p += 1;
+            while p < s.len() && !matches!(b[p], b'[' | b']' | b'|') {
+                p += 1;
+            }
+        }
+        if p < s.len() && b[p] == b'|' {
+            p += 1;
+            while p < s.len() && !matches!(b[p], b'[' | b']') {
+                p += 1;
+            }
+        }
+        if !(p + 1 < s.len() && b[p] == b']' && b[p + 1] == b']') {
+            return None;
+        }
+        hn_close(s, p + 2, &s[t0..tend]).map(|end| (&s[i..p + 2], end))
+    } else {
+        // Bare text: first char neither bracket nor whitespace, then the
+        // mention grows lazily while its next char is not a bracket.
+        let c0 = s[i..].chars().next()?;
+        if c0.is_whitespace() || c0 == '[' || c0 == ']' {
+            return None;
+        }
+        let mut n = c0.len_utf8();
+        loop {
+            if let Some(end) = hn_close(s, i + n, &s[i..i + n]) {
+                return Some((&s[i..i + n], end));
+            }
+            let next = s[i + n..].chars().next()?;
+            if next == '[' || next == ']' {
+                return None;
+            }
+            n += next.len_utf8();
+        }
+    }
+}
 
 /// Keep a wikilink mention verbatim; absorb a bare-text mention into a
-/// [[title]] link.
+/// [[title]] link.  Hand-rolled port of the old hatnote-mention pattern
+/// `(?<!\S)(\[\[([^\[\]|#]+)(?:#[^\[\]|]*)?(?:\|[^\[\]]*)?\]\]|([^\[\]\s][^\[\]]*?))[\s.,;:!?]*\[\[(?:\2|\3)\]\]`
+/// with Python's `re.sub` scan semantics: try each position left to
+/// right — only ones after whitespace (or at the very start) can match —
+/// replace on a full match and continue after it, otherwise advance one
+/// character.
 fn absorb_hatnote_mentions(txt: &str) -> String {
-    fre_sub(fre(HN_MENTION), txt, |c| {
-        let g1 = c.get(1).map(|m| m.as_str()).unwrap_or("");
-        if g1.starts_with("[[") {
-            g1.to_string()
-        } else {
-            format!("[[{}]]", g1)
+    let mut out = String::with_capacity(txt.len());
+    let mut last = 0usize;
+    let mut i = 0usize;
+    while i < txt.len() {
+        if i == 0 || prev_char(txt, i).is_some_and(|c| c.is_whitespace()) {
+            if let Some((mention, end)) = hn_mention_at(txt, i) {
+                out.push_str(&txt[last..i]);
+                if mention.starts_with("[[") {
+                    out.push_str(mention);
+                } else {
+                    out.push_str("[[");
+                    out.push_str(mention);
+                    out.push(']');
+                    out.push(']');
+                }
+                last = end;
+                i = end;
+                continue;
+            }
         }
-    })
+        i += txt[i..].chars().next().unwrap().len_utf8();
+    }
+    out.push_str(&txt[last..]);
+    out
 }
 
 /// `*[[Target]]*` when the label equals the target, else `*[[Target|label]]*`.
@@ -1190,7 +1285,43 @@ pub fn html_to_md(
 
 #[cfg(test)]
 mod tests {
-    use super::html_to_md;
+    use super::{absorb_hatnote_mentions, html_to_md};
+
+    /// A bare-text mention of the linked article is absorbed into the
+    /// wikilink ("…from X , [[X]]" → "…from [[X]]").
+    #[test]
+    fn hatnote_bare_mention_is_absorbed() {
+        assert_eq!(
+            absorb_hatnote_mentions("This section is an excerpt from X , [[X]]."),
+            "This section is an excerpt from [[X]]."
+        );
+    }
+
+    /// A wikilink mention (labelled or not) survives: the duplicate
+    /// closing mention is dropped, the first kept verbatim.
+    #[test]
+    fn hatnote_wikilink_mention_survives() {
+        assert_eq!(
+            absorb_hatnote_mentions("This section is an excerpt from [[X|label]] , [[X]]."),
+            "This section is an excerpt from [[X|label]]."
+        );
+        assert_eq!(
+            absorb_hatnote_mentions("For other uses, see [[X]] , [[X]] ."),
+            "For other uses, see [[X]] ."
+        );
+    }
+
+    /// Mentions whose keys differ never match, and an interior match must
+    /// not drop the gap it spans: both shapes stay as they are.
+    #[test]
+    fn hatnote_non_matches_stay() {
+        assert_eq!(absorb_hatnote_mentions("ab , [[b]]"), "ab , [[b]]");
+        assert_eq!(absorb_hatnote_mentions("[[a]] , [[b]]"), "[[a]] , [[b]]");
+        assert_eq!(
+            absorb_hatnote_mentions("[[a]] , [[b]] [[b]]"),
+            "[[a]] , [[b]]"
+        );
+    }
 
     #[test]
     fn comment_tail_survives() {
