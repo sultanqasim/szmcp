@@ -4,9 +4,11 @@
 //! an element's `.tail` is the text node following it, parents are
 //! reachable, and subtrees can be copied, unwrapped and removed.
 
-use html5ever::tendril::TendrilSink;
-use html5ever::{parse_document, ParseOpts};
-use markup5ever_rcdom::{NodeData, RcDom};
+use html5ever::interface::tree_builder::{ElementFlags, NodeOrText, QuirksMode, TreeSink};
+use html5ever::tendril::{StrTendril, TendrilSink};
+use html5ever::{parse_document, Attribute, ExpandedName, ParseOpts, QualName};
+use std::cell::UnsafeCell;
+use std::collections::HashMap;
 
 pub type NodeId = usize;
 
@@ -53,21 +55,18 @@ impl Dom {
         // lxml parses <noscript> contents as ordinary elements; without
         // this they would collapse into one text node.
         opts.tree_builder.scripting_enabled = false;
-        let rcdom: RcDom = parse_document(RcDom::default(), opts)
-            .from_utf8()
-            .one(html.as_bytes());
         // ~40 bytes of HTML per arena node on real pages; a single
         // capacity guess avoids most of the growth reallocations.
-        let mut nodes = Vec::with_capacity(html.len() / 40);
-        let doc = build(&mut nodes, &rcdom.document);
+        let sink = ArenaSink::with_capacity(html.len() / 40 + 16);
+        let nodes = parse_document(sink, opts).from_utf8().one(html.as_bytes());
         // The spec's tree builder always inserts an <html> element; a
         // fragment without one would still get it.
-        let root = nodes[doc]
+        let root = nodes[0]
             .children
             .iter()
             .copied()
             .find(|&c| matches!(&nodes[c].kind, NodeKind::Element { tag, .. } if tag == "html"))
-            .unwrap_or(doc);
+            .unwrap_or(0);
         Dom { nodes, root }
     }
 
@@ -188,38 +187,6 @@ impl Dom {
         self.nodes[id].parent = None;
         merge_sibling_text(&mut self.nodes, parent);
     }
-}
-
-fn build(nodes: &mut Vec<Node>, rcdom: &markup5ever_rcdom::Handle) -> NodeId {
-    let id = match &rcdom.data {
-        NodeData::Document => {
-            push_node(nodes, NodeKind::Document)
-        }
-        NodeData::Text { contents } => {
-            push_node(nodes, NodeKind::Text(contents.borrow().to_string()))
-        }
-        // Comments, processing instructions and doctypes are all
-        // non-renderable; the converter treats them identically.
-        NodeData::Comment { .. }
-        | NodeData::ProcessingInstruction { .. }
-        | NodeData::Doctype { .. } => push_node(nodes, NodeKind::Comment),
-        NodeData::Element { name, attrs, .. } => {
-            let tag = lower_name(&name.local);
-            let attrs = attrs
-                .borrow()
-                .iter()
-                .map(|a| (lower_name(&a.name.local), a.value.to_string()))
-                .collect();
-            push_node(nodes, NodeKind::Element { tag, attrs })
-        }
-    };
-    for child in rcdom.children.borrow().iter() {
-        let cid = build(nodes, child);
-        nodes[cid].parent = Some(id);
-        nodes[id].children.push(cid);
-    }
-    merge_sibling_text(nodes, id);
-    id
 }
 
 /// A tag/attribute name as a String, ASCII-lower-cased only when it has
@@ -464,3 +431,255 @@ fn collect_text(node: &NodeRef<'_>, out: &mut String) {
 }
 
 
+
+// ---------------------------------------------------------------------------
+// html5ever TreeSink that builds the arena directly: no markup5ever_rcdom
+// tree, no copy pass. Semantics mirror RcDom exactly: text merged into a
+// preceding text node on append/append_before_sibling, adjacent text runs
+// re-merged after remove_from_parent/reparent_children (what the removed
+// copy pass used to normalize), template contents kept in a detached
+// fragment invisible to the converter, comments/PIs/doctypes as ignorable
+// nodes, element/attr names lower-cased for the consumer while the original
+// QualNames are kept beside the arena for the tree builder (foreign content
+// needs the case, e.g. svg foreignObject integration points).
+// ---------------------------------------------------------------------------
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct H(NodeId);
+
+struct SinkInner {
+    nodes: Vec<Node>,
+    /// original QualName per node (placeholder for non-elements, never read)
+    names: Vec<QualName>,
+    /// element id -> detached template-contents fragment (rare)
+    tcontents: HashMap<NodeId, NodeId>,
+    /// element id -> MathML annotation-xml integration point (rare)
+    mip: HashMap<NodeId, bool>,
+}
+
+impl SinkInner {
+    fn push_node(&mut self, kind: NodeKind) -> NodeId {
+        let id = self.nodes.len();
+        self.nodes.push(Node { kind, parent: None, children: Vec::new() });
+        self.names.push(QualName::new(None, html5ever::ns!(), html5ever::local_name!("")));
+        id
+    }
+
+    fn push_text(&mut self, text: StrTendril) -> NodeId {
+        let id = self.nodes.len();
+        self.nodes.push(Node { kind: NodeKind::Text(text.to_string()), parent: None, children: Vec::new() });
+        self.names.push(QualName::new(None, html5ever::ns!(), html5ever::local_name!("")));
+        id
+    }
+}
+
+/// The html5ever 0.39 tree builder drives every [`TreeSink`] method through
+/// `&self` while mutating the tree. That is sound here because the sink is
+/// a `parse()`-local object whose only client is the parser's single-threaded
+/// driver — no handle, reference or clone of it ever escapes, and `finish()`
+/// consumes it — so the `UnsafeCell` just provides the `&mut` access that a
+/// `&self` API hides; a `RefCell` would add per-access borrow bookkeeping to
+/// a borrow pattern that is statically exclusive anyway.
+struct ArenaSink {
+    inner: UnsafeCell<SinkInner>,
+}
+
+impl ArenaSink {
+    fn with_capacity(cap: usize) -> ArenaSink {
+        let mut nodes = Vec::with_capacity(cap);
+        nodes.push(Node { kind: NodeKind::Document, parent: None, children: Vec::new() });
+        let mut names = Vec::with_capacity(cap);
+        names.push(QualName::new(None, html5ever::ns!(), html5ever::local_name!("")));
+        ArenaSink {
+            inner: UnsafeCell::new(SinkInner {
+                nodes,
+                names,
+                tcontents: HashMap::new(),
+                mip: HashMap::new(),
+            }),
+        }
+    }
+
+    fn inner(&self) -> &SinkInner {
+        unsafe { &*self.inner.get() }
+    }
+
+    fn mut_inner(&self) -> &mut SinkInner {
+        unsafe { &mut *self.inner.get() }
+    }
+}
+
+impl TreeSink for ArenaSink {
+    type Output = Vec<Node>;
+    type Handle = H;
+
+    type ElemName<'a>
+        = ExpandedName<'a>
+    where
+        Self: 'a;
+
+    fn finish(self) -> Vec<Node> {
+        self.inner.into_inner().nodes
+    }
+
+    fn parse_error(&self, _msg: std::borrow::Cow<'static, str>) {}
+
+    fn get_document(&self) -> H {
+        H(0)
+    }
+
+    fn set_quirks_mode(&self, _mode: QuirksMode) {}
+
+    fn same_node(&self, x: &H, y: &H) -> bool {
+        x == y
+    }
+
+    fn elem_name<'a>(&'a self, target: &'a H) -> ExpandedName<'a> {
+        self.inner().names[target.0].expanded()
+    }
+
+    fn create_element(&self, name: QualName, attrs: Vec<Attribute>, flags: ElementFlags) -> H {
+        let inner = self.mut_inner();
+        let tag = lower_name(&name.local);
+        let attrs: Vec<(String, String)> = attrs
+            .into_iter()
+            .map(|a| (lower_name(&a.name.local), a.value.to_string()))
+            .collect();
+        let id = inner.push_node(NodeKind::Element { tag, attrs });
+        inner.names[id] = name;
+        if flags.template {
+            let tid = inner.push_node(NodeKind::Document);
+            inner.tcontents.insert(id, tid);
+        }
+        if flags.mathml_annotation_xml_integration_point {
+            inner.mip.insert(id, true);
+        }
+        H(id)
+    }
+
+    fn create_comment(&self, _text: StrTendril) -> H {
+        H(self.mut_inner().push_node(NodeKind::Comment))
+    }
+
+    fn create_pi(&self, _target: StrTendril, _data: StrTendril) -> H {
+        H(self.mut_inner().push_node(NodeKind::Comment))
+    }
+
+    fn append_doctype_to_document(
+        &self,
+        _name: StrTendril,
+        _public_id: StrTendril,
+        _system_id: StrTendril,
+    ) {
+        let inner = self.mut_inner();
+        let id = inner.push_node(NodeKind::Comment);
+        inner.nodes[id].parent = Some(0);
+        inner.nodes[0].children.push(id);
+    }
+
+    fn append(&self, parent: &H, child: NodeOrText<H>) {
+        let inner = self.mut_inner();
+        let pid = parent.0;
+        match child {
+            NodeOrText::AppendText(text) => {
+                if let Some(&last) = inner.nodes[pid].children.last() {
+                    if let NodeKind::Text(t) = &mut inner.nodes[last].kind {
+                        t.push_str(&text);
+                        return;
+                    }
+                }
+                let id = inner.push_text(text);
+                inner.nodes[id].parent = Some(pid);
+                inner.nodes[pid].children.push(id);
+            }
+            NodeOrText::AppendNode(h) => {
+                debug_assert!(inner.nodes[h.0].parent.is_none());
+                inner.nodes[h.0].parent = Some(pid);
+                inner.nodes[pid].children.push(h.0);
+            }
+        }
+    }
+
+    fn append_before_sibling(&self, sibling: &H, child: NodeOrText<H>) {
+        let inner = self.mut_inner();
+        let sid = sibling.0;
+        let (pid, i) = {
+            let p = inner.nodes[sid].parent.expect("append_before_sibling: no parent");
+            let idx = inner.nodes[p].children.iter().position(|&c| c == sid).expect("not a child");
+            (p, idx)
+        };
+        match child {
+            NodeOrText::AppendText(text) => {
+                if i > 0 {
+                    let prev = inner.nodes[pid].children[i - 1];
+                    if let NodeKind::Text(t) = &mut inner.nodes[prev].kind {
+                        t.push_str(&text);
+                        return;
+                    }
+                }
+                let id = inner.push_text(text);
+                inner.nodes[id].parent = Some(pid);
+                inner.nodes[pid].children.insert(i, id);
+            }
+            NodeOrText::AppendNode(h) => {
+                if let Some(oldp) = inner.nodes[h.0].parent.take() {
+                    if let Some(pos) = inner.nodes[oldp].children.iter().position(|&c| c == h.0) {
+                        inner.nodes[oldp].children.remove(pos);
+                    }
+                }
+                inner.nodes[h.0].parent = Some(pid);
+                inner.nodes[pid].children.insert(i, h.0);
+            }
+        }
+    }
+
+    fn append_based_on_parent_node(&self, element: &H, prev_element: &H, child: NodeOrText<H>) {
+        let has_parent = self.inner().nodes[element.0].parent.is_some();
+        if has_parent {
+            self.append_before_sibling(element, child);
+        } else {
+            self.append(prev_element, child);
+        }
+    }
+
+    fn get_template_contents(&self, target: &H) -> H {
+        H(*self.inner().tcontents.get(&target.0).expect("not a template element!"))
+    }
+
+    fn add_attrs_if_missing(&self, target: &H, attrs: Vec<Attribute>) {
+        let inner = self.mut_inner();
+        let NodeKind::Element { attrs: existing, .. } = &mut inner.nodes[target.0].kind else {
+            panic!("not an element");
+        };
+        for a in attrs {
+            let lname = lower_name(&a.name.local);
+            if existing.iter().any(|(k, _)| *k == lname) {
+                continue;
+            }
+            existing.push((lname, a.value.to_string()));
+        }
+    }
+
+    fn remove_from_parent(&self, target: &H) {
+        let inner = self.mut_inner();
+        let Some(oldp) = inner.nodes[target.0].parent.take() else { return };
+        if let Some(pos) = inner.nodes[oldp].children.iter().position(|&c| c == target.0) {
+            inner.nodes[oldp].children.remove(pos);
+        }
+        merge_sibling_text(&mut inner.nodes, oldp);
+    }
+
+    fn reparent_children(&self, node: &H, new_parent: &H) {
+        let inner = self.mut_inner();
+        let children = std::mem::take(&mut inner.nodes[node.0].children);
+        for &c in &children {
+            inner.nodes[c].parent = Some(new_parent.0);
+        }
+        inner.nodes[new_parent.0].children.extend(children);
+        merge_sibling_text(&mut inner.nodes, new_parent.0);
+    }
+
+    fn is_mathml_annotation_xml_integration_point(&self, handle: &H) -> bool {
+        *self.inner().mip.get(&handle.0).unwrap_or(&false)
+    }
+}

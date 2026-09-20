@@ -27,7 +27,6 @@ xz2 = "0.1"
 base64 = "0.22"
 unicode-normalization = "0.1"
 html5ever = "0.39.0"
-markup5ever_rcdom = "0.39.0"
 regex = "1.13.1"
 
 [dev-dependencies]
