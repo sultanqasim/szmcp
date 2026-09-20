@@ -18,6 +18,11 @@ use get::{get_article, get_section};
 use rmcp::transport::streamable_http_server::{
     session::local::LocalSessionManager, StreamableHttpServerConfig, StreamableHttpService,
 };
+use axum::body::Body;
+use axum::extract::{Request, State};
+use axum::http::{header, HeaderValue, Method, StatusCode};
+use axum::middleware::Next;
+use axum::response::Response;
 use search::{search, DEFAULT_SEARCH_LIMIT};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -200,37 +205,24 @@ async fn serve(zim_path: &Path, bind: String, port: u16) -> Result<(), String> {
 
     let session_manager = Arc::new(LocalSessionManager::default());
 
-    use tower_http::cors::{AllowOrigin, CorsLayer};
 
-    let (config, cors_layer) = if bind == "0.0.0.0" || bind == "*" || bind == "::" {
+    let any_origin = bind == "0.0.0.0" || bind == "*" || bind == "::";
+    let config = if any_origin {
         // External binding: accept any Host/Origin.
-        let config = StreamableHttpServerConfig::default().disable_allowed_hosts();
-        let cors_layer = CorsLayer::permissive();
-        (config, cors_layer)
+        StreamableHttpServerConfig::default().disable_allowed_hosts()
     } else {
-        // Loopback binding: restrict Hosts (DNS rebinding) and Origins.
-        let config = StreamableHttpServerConfig::default()
-            .with_allowed_hosts(["localhost", "127.0.0.1", "::1"]); // block DNS rebinding
-        let cors_layer = CorsLayer::permissive()
-            .allow_origin(AllowOrigin::predicate(|origin, _parts| {
-                origin.to_str().ok().map_or(false, |s| {
-                    s.starts_with("http://localhost:")
-                        || s == "http://localhost"
-                        || s.starts_with("http://127.0.0.1:")
-                        || s == "http://127.0.0.1"
-                    || s.starts_with("http://[::1]:")
-                        || s == "http://[::1]"
-                        || s == "null"
-                })
-            }));
-        (config, cors_layer)
+        // Loopback binding: restrict Hosts (DNS rebinding).
+        StreamableHttpServerConfig::default().with_allowed_hosts(["localhost", "127.0.0.1", "::1"])
     };
 
     let mcp_service = StreamableHttpService::new(service_factory, session_manager, config);
 
     let app = axum::Router::new()
         .fallback_service(mcp_service)
-        .layer(cors_layer);
+        .layer(axum::middleware::from_fn_with_state(
+            any_origin,
+            cors_middleware,
+        ));
 
     eprintln!("szmcp - Sultan's ZIM MCP");
     eprintln!("ZIM path: {}", zim_path.display());
@@ -250,6 +242,84 @@ async fn serve(zim_path: &Path, bind: String, port: u16) -> Result<(), String> {
     axum::serve(listener, app).await.map_err(|e| e.to_string())?;
 
     Ok(())
+}
+
+/// CORS middleware (the tower-http CorsLayer behavior the server relied
+/// on): every OPTIONS request is answered here as a preflight (200, empty,
+/// with the method/header allowlists), and every other response carries the
+/// expose list. With `any_origin` (external binds) all origins are allowed
+/// with the literal `*`; otherwise only loopback origins (localhost /
+/// 127.0.0.1 / [::1], optional :port, or `null`) pass and are mirrored,
+/// with `Vary: Origin` so caches keep origins apart.
+async fn cors_middleware(State(any_origin): State<bool>, req: Request, next: Next) -> Response {
+    let origin = req
+        .headers()
+        .get(header::ORIGIN)
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_string);
+    if req.method() == Method::OPTIONS {
+        let mut res = Response::builder()
+            .status(StatusCode::OK)
+            .body(Body::empty())
+            .unwrap();
+        put_cors_headers(&mut res, any_origin, origin.as_deref(), true);
+        if !any_origin {
+            res.headers_mut()
+                .insert(header::VARY, HeaderValue::from_static("Origin"));
+        }
+        return res;
+    }
+    let mut res = next.run(req).await;
+    put_cors_headers(&mut res, any_origin, origin.as_deref(), false);
+    if !any_origin {
+        res.headers_mut()
+            .insert(header::VARY, HeaderValue::from_static("Origin"));
+    }
+    res
+}
+
+/// The `Access-Control-*` headers of one response: a preflight gets the
+/// method/header allowlists, an actual response the expose list; the
+/// allowed origin (always `*` for external binds) goes on both.
+fn put_cors_headers(res: &mut Response, any_origin: bool, origin: Option<&str>, preflight: bool) {
+    let h = res.headers_mut();
+    let acao = if any_origin {
+        Some(HeaderValue::from_static("*"))
+    } else {
+        origin
+            .filter(|o| loopback_origin(o))
+            .and_then(|o| HeaderValue::from_str(o).ok())
+    };
+    if let Some(acao) = acao {
+        h.insert(header::ACCESS_CONTROL_ALLOW_ORIGIN, acao);
+    }
+    if preflight {
+        h.insert(
+            header::ACCESS_CONTROL_ALLOW_METHODS,
+            HeaderValue::from_static("*"),
+        );
+        h.insert(
+            header::ACCESS_CONTROL_ALLOW_HEADERS,
+            HeaderValue::from_static("*"),
+        );
+    } else {
+        h.insert(
+            header::ACCESS_CONTROL_EXPOSE_HEADERS,
+            HeaderValue::from_static("*"),
+        );
+    }
+}
+
+/// The loopback-origin predicate of the loopback bind mode.
+/// The loopback-origin predicate of the loopback bind mode.
+fn loopback_origin(origin: &str) -> bool {
+    origin.starts_with("http://localhost:")
+        || origin == "http://localhost"
+        || origin.starts_with("http://127.0.0.1:")
+        || origin == "http://127.0.0.1"
+        || origin.starts_with("http://[::1]:")
+        || origin == "http://[::1]"
+        || origin == "null"
 }
 
 #[cfg(test)]
