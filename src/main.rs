@@ -200,7 +200,7 @@ async fn serve(zim_path: &Path, bind: String, port: u16) -> Result<(), String> {
     let addr = format!("{bind}:{port}");
 
     let factory_library = library.clone();
-    let service_factory = move || Ok(ZimMcpServer::new(factory_library.clone()).router());
+    let service_factory = move || Ok(ZimMcpServer::new(factory_library.clone()));
 
     let session_manager = Arc::new(LocalSessionManager::default());
 

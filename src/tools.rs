@@ -6,8 +6,8 @@
 //! library takes no `zim` argument (there is nothing to name), a scanned
 //! directory takes one (required on the get tools, an optional filter on
 //! search) and gains `zim_list` to report the file names the other tools
-//! take. The two shapes are separate tool types, registered per mode by
-//! [`ZimMcpServer::router`].
+//! take. The two shapes are separate tool types, registered per mode in
+//! [`ZimMcpServer::new`].
 //!
 //! The tools are async: each one moves its arguments onto a blocking thread
 //! (`tokio::task::spawn_blocking`) and awaits the result. The pipelines do
@@ -21,10 +21,9 @@ use crate::search::{search, DEFAULT_SEARCH_LIMIT};
 pub use crate::search::SearchResults;
 use crate::zim::{Mode, ZimLibrary};
 use rmcp::handler::server::router::tool::{AsyncTool, ToolBase, ToolRouter};
-use rmcp::handler::server::router::Router;
 use rmcp::handler::server::ServerHandler;
-use rmcp::model::{Implementation, ServerInfo};
-use rmcp::ErrorData;
+use rmcp::model::{Implementation, ServerConfig};
+use rmcp::{tool_handler, ErrorData};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use std::borrow::Cow;
@@ -60,21 +59,20 @@ impl From<ToolError> for ErrorData {
 
 #[derive(Clone)]
 pub struct ZimMcpServer {
-    pub info: ServerInfo,
+    pub info: ServerConfig,
     pub library: Arc<ZimLibrary>,
+    /// The mode's tool set; rmcp 3.x routes tool calls through the server's
+    /// own `ServerHandler` (via `#[tool_handler]`), so the router lives here.
+    pub tool_router: ToolRouter<ZimMcpServer>,
 }
 
 impl ZimMcpServer {
     pub fn new(library: Arc<ZimLibrary>) -> Self {
-        let mut info = ServerInfo::default();
+        let mut info = ServerConfig::default();
         info.server_info = Implementation::new("szmcp", env!("CARGO_PKG_VERSION"));
-        Self { info, library }
-    }
-
-    pub fn router(self) -> Router<ZimMcpServer> {
         // The launch shape decides the tool set, not the directory
         // contents: one ZIM file means the tools need no `zim` argument.
-        let tool_router = match self.library.mode {
+        let tool_router = match library.mode {
             Mode::Single => ToolRouter::new()
                 .with_async_tool::<ZimSearchTool>()
                 .with_async_tool::<ZimGetTool>()
@@ -85,15 +83,21 @@ impl ZimMcpServer {
                 .with_async_tool::<ZimGetSectionDirTool>()
                 .with_async_tool::<ZimListTool>(),
         };
-
-        let mut router = Router::new(self);
-        router.tool_router = tool_router;
-        router
+        Self {
+            info,
+            library,
+            tool_router,
+        }
     }
 }
 
+// `#[tool_handler]` fills in the tool methods of `ServerHandler` - it wires
+// `call_tool`/`list_tools`/`get_tool` to `self.tool_router`, the same
+// delegation the tool router used to provide through its own `Service`
+// implementation before rmcp 3.x made the server itself the entry point.
+#[tool_handler(router = self.tool_router)]
 impl ServerHandler for ZimMcpServer {
-    fn get_info(&self) -> ServerInfo {
+    fn get_info(&self) -> ServerConfig {
         self.info.clone()
     }
 }
