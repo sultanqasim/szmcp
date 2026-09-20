@@ -636,7 +636,7 @@ impl Zim {
                     match xapian2::Database::open_at(path, off_in_file, xapian2::DbFlags::NONE) {
                         Ok(db) => return Ok(Some(db)),
                         Err(e) => {
-                            tracing::warn!("open_at for embedded Xapian index failed ({e}); copying to temp file");
+                            eprintln!("warning: open_at for embedded Xapian index failed ({e}); copying to temp file");
                         }
                     }
                 }
@@ -729,8 +729,8 @@ impl Archive {
                     language
                 }
                 Err(e) => {
-                    tracing::warn!(
-                        "reading the Language metadata of {} failed ({e}); queries assume english stems",
+                    eprintln!(
+                        "warning: reading the Language metadata of {} failed ({e}); queries assume english stems",
                         self.name
                     );
                     None
@@ -783,8 +783,8 @@ impl Archive {
                 let title = match self.zim.open_title_xapian() {
                     Ok(title) => title,
                     Err(e) => {
-                        tracing::warn!(
-                            "opening the title index of {} failed ({e}); ranking by full text only",
+                        eprintln!(
+                            "warning: opening the title index of {} failed ({e}); ranking by full text only",
                             self.name
                         );
                         None

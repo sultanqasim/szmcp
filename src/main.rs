@@ -180,10 +180,6 @@ async fn run(command: Command) -> Result<(), String> {
 
 #[tokio::main]
 async fn main() -> std::process::ExitCode {
-    // Log to stderr in every mode: stdout carries only JSON (the CLI
-    // subcommands' tool responses).
-    tracing_subscriber::fmt().with_writer(std::io::stderr).init();
-
     match run(Cli::parse().command).await {
         Ok(()) => std::process::ExitCode::SUCCESS,
         Err(e) => {
