@@ -15,26 +15,20 @@ pub fn normalize_language(lang: Option<&str>) -> String {
     tok
 }
 
-fn string(key: &'static str, default: &'static str, lang: Option<&str>) -> &'static str {
-    let norm = normalize_language(lang);
-    match norm.as_str() {
-        "fr" => match key {
-            "key_facts" => "Données clés",
-            "details" => "Détails",
-            _ => default,
-        },
-        _ => default,
-    }
-}
-
 /// The infobox section heading ('Key facts' / 'Données clés').
 pub fn key_facts_title(lang: Option<&str>) -> &'static str {
-    string("key_facts", "Key facts", lang)
+    match normalize_language(lang).as_str() {
+        "fr" => "Données clés",
+        _ => "Key facts",
+    }
 }
 
 /// Default sub-heading for a multi-infobox page ('Details'/'Détails').
 pub fn details_title(lang: Option<&str>) -> &'static str {
-    string("details", "Details", lang)
+    match normalize_language(lang).as_str() {
+        "fr" => "Détails",
+        _ => "Details",
+    }
 }
 
 /// Extra (non-English) boilerplate section headings to drop, lower-case.

@@ -6,7 +6,7 @@ use std::collections::HashSet;
 use crate::cleanup;
 use crate::htmldom::{Dom, NodeId, NodeRef};
 use crate::html2md::{escape_plain_asterisks, is_dropped, render_inline_default, render_list};
-use crate::tables::{own_table_rows, render_table, row_cells};
+use crate::tables::{own_table_rows, render_table, row_cells, top_level_tables};
 use crate::util::{collapse_ws, re};
 use crate::wikil10n;
 
@@ -116,14 +116,7 @@ fn is_residue_only(s: &str) -> bool {
 /// visible.
 fn strip_toggles(dom: &mut Dom) {
     let root = dom.root().id();
-    let toggles: Vec<NodeId> = dom
-        .ref_(root)
-        .self_and_descendants()
-        .into_iter()
-        .filter(|e| e.is_element() && is_toggle_el(*e))
-        .map(|e| e.id())
-        .collect();
-    for tgl in toggles {
+    for tgl in element_ids(dom, is_toggle_el) {
         let Some(par) = dom.parent_of(tgl) else { continue };
         dom.detach(tgl);
         dom.merge_text(par);
@@ -138,6 +131,16 @@ fn strip_toggles(dom: &mut Dom) {
             par = nxt;
         }
     }
+}
+
+/// Ids of the `dom`'s elements (document order) matching `pred`.
+fn element_ids(dom: &Dom, pred: impl Fn(NodeRef) -> bool) -> Vec<NodeId> {
+    dom.ref_(dom.root().id())
+        .self_and_descendants()
+        .into_iter()
+        .filter(|e| e.is_element() && pred(*e))
+        .map(|e| e.id())
+        .collect()
 }
 
 /// True when `el` carries inline emphasis or a collapse-widget element.
@@ -158,20 +161,21 @@ fn needs_plain_copy(el: NodeRef) -> bool {
 
 /// Unwrap all <b>/<strong>/<i>/<em> emphasis in the standalone copy.
 fn unwrap_emphasis(dom: &mut Dom) {
-    let emph: Vec<NodeId> = dom
-        .ref_(dom.root().id())
-        .self_and_descendants()
-        .into_iter()
-        .filter(|e| {
-            e.is_element()
-                && EMPH_TAGS.contains(&e.tag().unwrap_or(""))
-                && dom.parent_of(e.id()).is_some()
-        })
-        .map(|e| e.id())
-        .collect();
+    let emph = element_ids(dom, |e| {
+        EMPH_TAGS.contains(&e.tag().unwrap_or("")) && dom.parent_of(e.id()).is_some()
+    });
     for id in emph {
         dom.drop_tag(id); // no-op when detached (removed with a toggle)
     }
+}
+
+/// A standalone copy of `el` with collapse widgets removed and emphasis
+/// unwrapped (the Key facts no-emphasis rule).
+fn plain_copy(el: NodeRef) -> Dom {
+    let mut copy = el.dom.copy_subtree(el.id());
+    strip_toggles(&mut copy);
+    unwrap_emphasis(&mut copy);
+    copy
 }
 
 /// Render a Key facts label/value cell with ALL inline emphasis stripped
@@ -180,9 +184,7 @@ fn plain_inline(el: NodeRef) -> String {
     if !needs_plain_copy(el) {
         return render_inline_default(el);
     }
-    let mut copy = el.dom.copy_subtree(el.id());
-    strip_toggles(&mut copy);
-    unwrap_emphasis(&mut copy);
+    let copy = plain_copy(el);
     render_inline_default(copy.ref_(copy.root().id()))
 }
 
@@ -194,20 +196,17 @@ fn top_lists<'a>(cell: NodeRef<'a>) -> Vec<NodeRef<'a>> {
         if !matches!(el.tag(), Some("ul") | Some("ol")) {
             continue;
         }
-        let mut nested = false;
-        let mut par = el.parent();
-        while let Some(p) = par {
-            if p.id() == cell.id() {
-                break;
-            }
-            if p.is_element()
-                && matches!(p.tag(), Some("ul") | Some("ol") | Some("li") | Some("dl") | Some("dd") | Some("dt"))
-            {
-                nested = true;
-                break;
-            }
-            par = p.parent();
-        }
+        // nested when an ancestor below `cell` is itself list-ish
+        let nested = el
+            .ancestors()
+            .take_while(|p| p.id() != cell.id())
+            .any(|p| {
+                p.is_element()
+                    && matches!(
+                        p.tag(),
+                        Some("ul") | Some("ol") | Some("li") | Some("dl") | Some("dd") | Some("dt")
+                    )
+            });
         if !nested {
             out.push(el);
         }
@@ -221,28 +220,8 @@ fn is_map_row(cell: NodeRef) -> bool {
         return true;
     }
     cell.descendants()
-        .iter()
+        .into_iter()
         .any(|el| el.is_element() && el.has_any_class(MAP_CLASSES))
-}
-
-/// Descendant <table> elements of `cell` that are not themselves nested
-/// inside another descendant table.
-pub(crate) fn child_tables_pub<'a>(cell: NodeRef<'a>) -> Vec<NodeRef<'a>> {
-    let mut out = Vec::new();
-    'outer: for tbl in cell.find_all("table") {
-        let mut anc = tbl.parent();
-        while let Some(a) = anc {
-            if a.id() == cell.id() {
-                out.push(tbl);
-                continue 'outer;
-            }
-            if a.is_element() && a.tag() == Some("table") {
-                continue 'outer;
-            }
-            anc = a.parent();
-        }
-    }
-    out
 }
 
 /// A nested table built from ordinary infobox rows (>= 2 rows whose cells
@@ -263,17 +242,7 @@ fn is_office_table(tbl: NodeRef) -> bool {
 /// True when `tbl` and every element between it and the document root
 /// survives the drop rules.
 fn drop_free(tbl: NodeRef) -> bool {
-    if is_dropped(tbl) {
-        return false;
-    }
-    let mut anc = tbl.parent();
-    while let Some(a) = anc {
-        if !a.is_element() || is_dropped(a) {
-            return false;
-        }
-        anc = a.parent();
-    }
-    true
+    !is_dropped(tbl) && tbl.ancestors().all(|a| !is_dropped(a))
 }
 
 /// Visible text of `cell` that precedes the embedded table `stop`.
@@ -380,20 +349,17 @@ fn is_context_row(cell: NodeRef) -> bool {
 // Parsed structure
 // ---------------------------------------------------------------------------
 
-/// A group heading cell (element) or a plain-text scaffold title.
-#[derive(Clone)]
-pub(crate) enum Cell {
-    Element(NodeId),
-    Text(String),
-}
-
+/// A group heading: its level and eagerly computed heading text (element
+/// heading cells render through the inline path; scaffold titles are
+/// asterisk-escaped plain text). The tree is never mutated between
+/// extraction and rendering, so the text can be computed upfront.
 #[derive(Clone)]
 pub(crate) struct Header {
-    cell: Cell,
     level: u32,
+    text: String,
 }
 
-#[derive(Clone)]
+#[derive(Clone, Default)]
 pub(crate) struct Row {
     label_cell: Option<NodeId>,
     value_cells: Vec<NodeId>,
@@ -403,15 +369,13 @@ pub(crate) struct Row {
     list_els: Vec<NodeId>,
 }
 
-/// A pre-rendered Markdown table block: an embedded non-infobox data table.
-#[derive(Clone)]
-pub(crate) struct RawTable(String);
-
 #[derive(Clone)]
 pub(crate) enum Item {
     Header(Header),
     Row(Row),
-    RawTable(RawTable),
+    /// A pre-rendered Markdown table block: an embedded non-infobox data
+    /// table.
+    RawTable(String),
     /// A full-width header row with no text: the separator idiom that
     /// closes a section.
     GroupEnd,
@@ -476,9 +440,8 @@ fn fact_row(label_cell: NodeRef, data_cells: &[NodeRef]) -> Option<Row> {
         label_cell: Some(label_cell.id()),
         value_cells: data_cells.iter().map(|c| c.id()).collect(),
         is_sub,
-        split_label: false,
-        is_context: false,
         list_els: lists,
+        ..Default::default()
     })
 }
 
@@ -498,12 +461,9 @@ fn full_data_row(cell: NodeRef) -> Option<Row> {
         return None;
     }
     Some(Row {
-        label_cell: None,
         value_cells: vec![cell.id()],
-        is_sub: false,
         split_label: true,
-        is_context: false,
-        list_els: Vec::new(),
+        ..Default::default()
     })
 }
 
@@ -537,10 +497,8 @@ fn v3_bloc_rows(wrapper: NodeRef) -> Vec<Row> {
                 rows.push(Row {
                     label_cell: Some(el.id()),
                     value_cells,
-                    is_sub: false,
-                    split_label: false,
-                    is_context: false,
                     list_els: lists,
+                    ..Default::default()
                 });
             }
             i = j;
@@ -552,15 +510,27 @@ fn v3_bloc_rows(wrapper: NodeRef) -> Vec<Row> {
 }
 
 /// Cells of `rows[i + 1]`, or None (used for header/value lookahead).
-/// Cells of `rows[i + 1]`, or None (used for header/value lookahead).
 fn next_row_cells<'a>(rows: &'a [NodeRef<'a>], i: usize) -> Option<Vec<NodeRef<'a>>> {
     let cells = row_cells(*rows.get(i + 1)?);
     if cells.is_empty() { None } else { Some(cells) }
 }
 
+/// True when `nxt` is ONE non-empty td value cell (not a context row):
+/// a header followed by such a cell labels that value.
+fn is_single_value(nc: &Option<Vec<NodeRef>>) -> bool {
+    matches!(
+        nc,
+        Some(nc)
+            if nc.len() == 1
+                && nc[0].tag() == Some("td")
+                && !visible_text(nc[0]).is_empty()
+                && !is_context_row(nc[0])
+    )
+}
+
 /// The title signal of an embedded office-group sub-table: a leading bare
-/// <th> row or a <caption>. Returns (skip_row, title_cell).
-fn subtable_title(tbl: NodeRef) -> (Option<NodeId>, Option<Cell>) {
+/// <th> row or a <caption>. Returns (skip_row, title text).
+fn subtable_title(tbl: NodeRef) -> (Option<NodeId>, Option<String>) {
     let rows = own_table_rows(tbl);
     if let Some(first) = rows.first() {
         let cells = row_cells(*first);
@@ -570,28 +540,22 @@ fn subtable_title(tbl: NodeRef) -> (Option<NodeId>, Option<Cell>) {
             && !visible_text(cells[0]).is_empty()
         {
             let nxt = next_row_cells(&rows, 0);
-            let nxt_is_value = match &nxt {
-                Some(nc)
-                    if nc.len() == 1
-                        && nc[0].tag() == Some("td")
-                        && !visible_text(nc[0]).is_empty()
-                        && !is_context_row(nc[0]) =>
-                {
-                    true
-                }
-                _ => false,
-            };
-            if !nxt_is_value {
-                return (Some(first.id()), Some(Cell::Element(cells[0].id())));
+            if !is_single_value(&nxt) {
+                return (Some(first.id()), Some(header_text(cells[0])));
             }
         }
     }
     for ch in tbl.element_children() {
         if ch.tag() == Some("caption") && !visible_text(ch).is_empty() {
-            return (None, Some(Cell::Element(ch.id())));
+            return (None, Some(header_text(ch)));
         }
     }
     (None, None)
+}
+
+/// Collapsed inline text of a group heading cell.
+fn header_text(el: NodeRef) -> String {
+    collapse_ws(&render_inline_default(el)).trim().to_string()
 }
 
 /// Dispatch the rows of one infobox-structured table into `items`.
@@ -623,10 +587,7 @@ fn collect_rows(
             }
             continue;
         }
-        if ["infobox-subheader", "infobox-below", "infobox-caption"]
-            .iter()
-            .any(|c| c0.has_class(c))
-        {
+        if c0.has_any_class(&["infobox-subheader", "infobox-below", "infobox-caption"]) {
             continue;
         }
         if c0.tag() == Some("th") && cells.len() == 1 {
@@ -646,7 +607,7 @@ fn collect_rows(
             }
             // Data tables embedded in the header cell render as tables.
             let mut embedded_md: Vec<String> = Vec::new();
-            for st in child_tables_pub(c0) {
+            for st in top_level_tables(c0, |_| true) {
                 if !is_office_table(st) && drop_free(st) {
                     let md = render_table(st);
                     if !md.is_empty() {
@@ -655,36 +616,22 @@ fn collect_rows(
                 }
             }
             let nxt = next_row_cells(rows, i);
-            let nxt_is_value = match &nxt {
-                Some(nc)
-                    if nc.len() == 1
-                        && nc[0].tag() == Some("td")
-                        && !visible_text(nc[0]).is_empty()
-                        && !is_context_row(nc[0])
-                        && embedded_md.is_empty() =>
-                {
-                    true
-                }
-                _ => false,
-            };
-            if nxt_is_value {
+            if is_single_value(&nxt) && embedded_md.is_empty() {
                 // A header immediately followed by ONE non-empty value cell
                 // labels that value rather than grouping sub-rows.
                 let value = nxt.unwrap().remove(0);
                 items.push(Item::Row(Row {
                     label_cell: Some(c0.id()),
                     value_cells: vec![value.id()],
-                    is_sub: false,
-                    split_label: false,
-                    is_context: false,
                     list_els: top_lists(value).iter().map(|l| l.id()).collect(),
+                    ..Default::default()
                 }));
                 skip_next.insert(i + 1);
                 continue;
             }
-            items.push(Item::Header(Header { cell: Cell::Element(c0.id()), level: header_level }));
+            items.push(Item::Header(Header { level: header_level, text: header_text(c0) }));
             for md in embedded_md {
-                items.push(Item::RawTable(RawTable(md)));
+                items.push(Item::RawTable(md));
             }
             continue;
         }
@@ -699,25 +646,27 @@ fn collect_rows(
             // the same item stream; its title (a leading bare <th>, a
             // <caption>, or the cell text ahead of it) becomes a parent
             // heading with the group headers demoted one level.
-            let embedded: Vec<NodeRef> =
-                child_tables_pub(c0).into_iter().filter(|st| is_office_table(*st)).collect();
+            let embedded: Vec<NodeRef> = top_level_tables(c0, |_| true)
+                .into_iter()
+                .filter(|st| is_office_table(*st))
+                .collect();
             if !embedded.is_empty() {
                 for (k, st) in embedded.iter().enumerate() {
-                    let (skip_tr, title_cell) = subtable_title(*st);
-                    let mut title_cell = title_cell;
-                    if title_cell.is_none() && k == 0 {
+                    let (skip_tr, mut title) = subtable_title(*st);
+                    if title.is_none() && k == 0 {
+                        // the cell text ahead of the first sub-table
                         let lead = leading_text_before(c0, st.id());
                         if !lead.is_empty() {
-                            title_cell = Some(Cell::Text(lead));
+                            title = Some(collapse_ws(&escape_plain_asterisks(&lead)).trim().to_string());
                         }
                     }
-                    match title_cell {
+                    match title {
                         None => {
                             let own = own_table_rows(*st);
                             collect_rows(&own, items, fallback_title, false, header_level);
                         }
-                        Some(cell) => {
-                            items.push(Item::Header(Header { cell: cell.clone(), level: header_level }));
+                        Some(text) => {
+                            items.push(Item::Header(Header { level: header_level, text }));
                             let own: Vec<NodeRef> = own_table_rows(*st)
                                 .into_iter()
                                 .filter(|tr| Some(tr.id()) != skip_tr)
@@ -791,16 +740,7 @@ pub(crate) fn extract_infoboxes(dom: &Dom) -> Vec<Infobox> {
     let mut boxes = Vec::new();
     for el in containers {
         // Containers nested inside another container are excluded.
-        let mut nested = false;
-        let mut anc = el.parent();
-        while let Some(a) = anc {
-            if container_ids.contains(&a.id()) {
-                nested = true;
-                break;
-            }
-            anc = a.parent();
-        }
-        if nested {
+        if el.ancestors().any(|a| container_ids.contains(&a.id())) {
             continue;
         }
         if el.tag() == Some("table") {
@@ -810,30 +750,21 @@ pub(crate) fn extract_infoboxes(dom: &Dom) -> Vec<Infobox> {
         // frwiki wrapper div: parse each of its top-level tables as a box;
         // the wrapper's 'entete' title div stands in for the above row,
         // and taxobox_v3 bloc label/value pairs join the first box.
-        let mut above = String::new();
-        for d in el.descendants() {
-            if d.is_element() && d.has_class("entete") {
-                above = visible_text(d);
-                if !above.is_empty() {
-                    break;
-                }
-            }
-        }
+        let above = el
+            .descendants()
+            .into_iter()
+            .filter(|d| d.is_element() && d.has_class("entete"))
+            .map(|d| visible_text(d))
+            .find(|t| !t.is_empty())
+            .unwrap_or_default();
         let bloc_rows = v3_bloc_rows(el);
         let mut top_tables = Vec::new();
         for tbl in el.find_all("table") {
-            let mut deeper = false;
-            let mut a = tbl.parent();
-            while let Some(p) = a {
-                if p.id() == el.id() {
-                    break;
-                }
-                if p.is_element() && p.tag() == Some("table") {
-                    deeper = true;
-                    break;
-                }
-                a = p.parent();
-            }
+            // a table nested inside a deeper table is not a box table
+            let deeper = tbl
+                .ancestors()
+                .take_while(|p| p.id() != el.id())
+                .any(|p| p.tag() == Some("table"));
             if !deeper {
                 top_tables.push(tbl);
             }
@@ -922,9 +853,7 @@ fn append_row(dom: &Dom, lines: &mut Vec<String>, row: &Row, indent: usize) {
         let mut items: Vec<String> = Vec::new();
         for le in &row.list_els {
             let md = if needs_plain_copy(dom.ref_(*le)) {
-                let mut copy = dom.copy_subtree(*le);
-                strip_toggles(&mut copy);
-                unwrap_emphasis(&mut copy);
+                let copy = plain_copy(dom.ref_(*le));
                 render_list(copy.ref_(copy.root().id()), 0)
             } else {
                 render_list(dom.ref_(*le), 0)
@@ -1006,21 +935,13 @@ fn emit_items(dom: &Dom, lines: &mut Vec<String>, items: &[&Item]) {
     for item in items {
         match item {
             Item::Header(h) => {
-                let t = match &h.cell {
-                    Cell::Element(id) => {
-                        collapse_ws(&render_inline_default(dom.ref_(*id))).trim().to_string()
-                    }
-                    Cell::Text(s) => {
-                        collapse_ws(&escape_plain_asterisks(s)).trim().to_string()
-                    }
-                };
-                if !t.is_empty() {
-                    emit_heading(lines, format!("{} {}", "#".repeat(h.level as usize), t));
+                if !h.text.is_empty() {
+                    emit_heading(lines, format!("{} {}", "#".repeat(h.level as usize), &h.text));
                 }
                 anchor_open = false;
                 context_open = false;
             }
-            Item::RawTable(RawTable(md)) => {
+            Item::RawTable(md) => {
                 // an embedded real table renders verbatim between blank
                 // lines (never indented: an indented table would be code)
                 if !lines.is_empty() && lines.last().map(String::as_str) != Some("") {

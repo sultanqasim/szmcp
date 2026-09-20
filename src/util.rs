@@ -59,13 +59,13 @@ pub(crate) fn fre_sub(
     out
 }
 
-/// The render-path whitespace collapse: runs of whitespace become one
-/// space (Python's `re.sub(r"\s+", " ", s)`).
-pub(crate) fn collapse_ws(s: &str) -> String {
+/// One shared collapse: runs of chars accepted by `run` become one space,
+/// dropped at the start of the text.
+fn collapse(s: &str, run: impl Fn(char) -> bool) -> String {
     let mut out = String::with_capacity(s.len());
     let mut in_ws = false;
     for c in s.chars() {
-        if c.is_whitespace() {
+        if run(c) {
             in_ws = true;
         } else {
             if in_ws && !out.is_empty() {
@@ -81,28 +81,18 @@ pub(crate) fn collapse_ws(s: &str) -> String {
     out
 }
 
+/// The render-path whitespace collapse: runs of whitespace become one
+/// space (Python's `re.sub(r"\s+", " ", s)`).
+pub(crate) fn collapse_ws(s: &str) -> String {
+    collapse(s, char::is_whitespace)
+}
+
 /// Python's `[ \t]+ -> " "`.
 pub(crate) fn collapse_space_tab(s: &str) -> String {
     if !s.contains("  ") && !s.contains('\t') {
         return s.to_string();
     }
-    let mut out = String::with_capacity(s.len());
-    let mut in_ws = false;
-    for c in s.chars() {
-        if c == ' ' || c == '\t' {
-            in_ws = true;
-        } else {
-            if in_ws && !out.is_empty() {
-                out.push(' ');
-            }
-            in_ws = false;
-            out.push(c);
-        }
-    }
-    if in_ws && !out.is_empty() {
-        out.push(' ');
-    }
-    out
+    collapse(s, |c| c == ' ' || c == '\t')
 }
 
 /// `urllib.parse.unquote` (percent-decode as UTF-8, invalid escapes kept).
@@ -133,17 +123,12 @@ pub(crate) fn percent_decode(s: &str) -> String {
 }
 
 /// The parts of a URL that the conversion logic needs (a small
-/// `urllib.parse.urlsplit`).
+/// `urllib.parse.urlsplit`): the scheme is detected only to skip it, the
+/// fragment is dropped.
 pub(crate) struct SplitUrl {
-    // `scheme`/`fragment` are part of the urllib.parse.urlsplit mirror;
-    // the converter reads them only occasionally.
-    #[allow(dead_code)]
-    pub scheme: String,
     pub netloc: String,
     pub path: String,
     pub query: String,
-    #[allow(dead_code)]
-    pub fragment: String,
 }
 
 pub(crate) fn urlsplit(url: &str) -> SplitUrl {
@@ -154,7 +139,6 @@ pub(crate) fn urlsplit(url: &str) -> SplitUrl {
         .collect();
     let cleaned = cleaned.trim_matches(|c: char| c <= '\u{20}');
     let mut rest = cleaned;
-    let mut scheme = String::new();
     if let Some(i) = rest.find(':') {
         if i > 0 {
             let head = &rest[..i];
@@ -166,7 +150,6 @@ pub(crate) fn urlsplit(url: &str) -> SplitUrl {
                 .chars()
                 .all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.'));
             if ok {
-                scheme = head.to_lowercase();
                 rest = &rest[i + 1..];
             }
         }
@@ -182,9 +165,7 @@ pub(crate) fn urlsplit(url: &str) -> SplitUrl {
         netloc = after[..delim].to_string();
         rest = &after[delim..];
     }
-    let mut fragment = String::new();
     if let Some(i) = rest.find('#') {
-        fragment = rest[i + 1..].to_string();
         rest = &rest[..i];
     }
     let mut query = String::new();
@@ -193,11 +174,9 @@ pub(crate) fn urlsplit(url: &str) -> SplitUrl {
         rest = &rest[..i];
     }
     SplitUrl {
-        scheme,
         netloc,
         path: rest.to_string(),
         query,
-        fragment,
     }
 }
 
@@ -337,17 +316,15 @@ fn parse_charref(after: &str) -> Option<(String, usize)> {
         if let Some((_, v)) = INVALID_CHARREFS.iter().find(|(n, _)| *n == num) {
             return Some((v.to_string(), consumed));
         }
-        if (0xd800..=0xdfff).contains(&num) || num > 0x10ffff || is_invalid_codepoint(num) {
-            let replacement = if (0xd800..=0xdfff).contains(&num)
-                || num > 0x10ffff
-            {
-                "\u{FFFD}"
-            } else {
-                ""
-            };
-            return Some((replacement.to_string(), consumed));
+        // Surrogates and out-of-range values become U+FFFD; the remaining
+        // invalid codepoints are dropped outright.
+        if (0xd800..=0xdfff).contains(&num) || num > 0x10ffff {
+            return Some(("\u{FFFD}".to_string(), consumed));
         }
-        return Some((char::from_u32(num)?.to_string(), consumed));
+        if is_invalid_codepoint(num) {
+            return Some((String::new(), consumed));
+        }
+        return Some((char::from_u32(num).unwrap().to_string(), consumed));
     }
     // Named: [^\t\n\f <&#;]{1,32};?  (the regex char class, minus '&')
     let mut len = 0usize;

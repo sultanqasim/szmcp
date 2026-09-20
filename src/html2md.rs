@@ -7,7 +7,7 @@
 //! [`block_children_md`], and (via [`tables`]) `render_table`.
 
 use crate::cleanup;
-use crate::htmldom::{Dom, NodeId, NodeKind, NodeRef};
+use crate::htmldom::{Dom, NodeKind, NodeRef};
 use crate::tables;
 use crate::util::{collapse_space_tab, collapse_ws, fre, fre_sub, parse_query, percent_decode, re, urlsplit};
 
@@ -22,14 +22,10 @@ use crate::util::{collapse_space_tab, collapse_ws, fre, fre_sub, parse_query, pe
 const DROP_LINK_NS: &[&str] = &["file:", "image:", "media:", "category:"];
 
 fn in_dropped_ns(target: &str) -> bool {
-    let target = target.trim_start_matches(':');
-    match target.split_once(':') {
-        Some((head, _)) => {
-            let head = format!("{}:", head.to_lowercase());
-            DROP_LINK_NS.contains(&head.as_str())
-        }
-        None => false,
-    }
+    let Some((head, _)) = target.trim_start_matches(':').split_once(':') else {
+        return false;
+    };
+    DROP_LINK_NS.contains(&format!("{}:", head.to_lowercase()).as_str())
 }
 
 /// Wiki language name -> markdown fence language.
@@ -60,13 +56,8 @@ fn fence_lang(raw: &str) -> String {
 }
 
 fn heading_level(tag: &str) -> Option<u32> {
-    match tag {
-        "h1" => Some(1),
-        "h2" => Some(2),
-        "h3" => Some(3),
-        "h4" => Some(4),
-        "h5" => Some(5),
-        "h6" => Some(6),
+    match tag.as_bytes() {
+        [b'h', d] if (b'1'..=b'6').contains(d) => Some((d - b'0') as u32),
         _ => None,
     }
 }
@@ -103,7 +94,7 @@ fn carries_math(el: NodeRef) -> bool {
 pub(crate) fn is_dropped(el: NodeRef) -> bool {
     let tag = match el.tag() {
         Some(t) => t,
-        None => return true, // comment / PI
+        None => return true, // comment / processing instruction
     };
     if DROP_TAGS.contains(&tag) {
         return true;
@@ -221,38 +212,35 @@ pub(crate) fn escape_plain_asterisks(chunk: &str) -> String {
     if !chunk.contains('*') {
         return chunk.to_string();
     }
-    // Split on `$...$` math spans (Python's _MATH_SPLIT_RE.split).
-    let mut parts: Vec<&str> = Vec::new();
-    let bytes = chunk.as_bytes();
-    let mut rest_pos = 0usize;
-    let mut i = 0usize;
-    while i < bytes.len() {
-        if bytes[i] == b'$' {
-            if let Some(q) = chunk[i + 1..].find('$') {
-                if !chunk[i + 1..i + 1 + q].contains('\n') {
-                    if rest_pos < i {
-                        parts.push(&chunk[rest_pos..i]);
-                    }
-                    parts.push(&chunk[i..i + q + 2]);
-                    i += q + 2;
-                    rest_pos = i;
-                    continue;
-                }
-            }
-        }
-        i += 1;
-    }
-    if rest_pos < chunk.len() {
-        parts.push(&chunk[rest_pos..]);
-    }
-    let mut out = String::new();
-    for part in parts {
+    // A '$' opens a math span when another '$' follows on the same line;
+    // otherwise it stays plain text. A plain run that begins and ends
+    // with a rejected '$' is left verbatim, like its Python original.
+    fn push_plain(out: &mut String, part: &str) {
         if part.starts_with('$') && part.ends_with('$') && part.len() > 1 {
             out.push_str(part);
         } else {
             out.push_str(&part.replace('*', "\\*"));
         }
     }
+    let mut out = String::new();
+    let bytes = chunk.as_bytes();
+    let mut plain_start = 0usize;
+    let mut i = 0usize;
+    while i < bytes.len() {
+        if bytes[i] == b'$' {
+            if let Some(q) = chunk[i + 1..].find('$') {
+                if !chunk[i + 1..i + 1 + q].contains('\n') {
+                    push_plain(&mut out, &chunk[plain_start..i]);
+                    out.push_str(&chunk[i..i + q + 2]); // the $...$ span
+                    i += q + 2;
+                    plain_start = i;
+                    continue;
+                }
+            }
+        }
+        i += 1;
+    }
+    push_plain(&mut out, &chunk[plain_start..]);
     out
 }
 
@@ -330,6 +318,10 @@ fn is_media_href(href: &str) -> bool {
     if href.is_empty() {
         return false;
     }
+    // Fast path for plain internal hrefs: with none of the urlsplit-
+    // triggering characters present, urlsplit's cleaning is the identity —
+    // except that it would trim trailing C0/space, which this path (like
+    // the Python original's identical fast path) deliberately keeps.
     let plain = !href.contains(':')
         && !href.contains('%')
         && !href.contains('#')
@@ -340,16 +332,14 @@ fn is_media_href(href: &str) -> bool {
         && !href.starts_with("//")
         && href.as_bytes()[0] > b' ';
     if plain {
-        let seg = href.rsplit('/').next().unwrap_or("");
-        return seg_is_media(seg);
+        return seg_is_media(href.rsplit('/').next().unwrap_or(""));
     }
     let parts = urlsplit(href);
     if parts.netloc.to_lowercase() == "upload.wikimedia.org" {
         return true;
     }
-    let decoded_path = percent_decode(&parts.path);
-    let seg = decoded_path.rsplit('/').next().unwrap_or("");
-    seg_is_media(seg)
+    let decoded = percent_decode(&parts.path);
+    seg_is_media(decoded.rsplit('/').next().unwrap_or(""))
 }
 
 /// Article title of a Wikipedia edit/admin URL (action=edit), or None.
@@ -426,7 +416,6 @@ fn emph_is_whole(label: &str) -> Option<(&'static str, &str)> {
 }
 
 /// Whitespace stranded before dropped-element punctuation is pulled up.
-/// Whitespace stranded before dropped-element punctuation is pulled up.
 fn drop_boundary_punct(tail: &str) -> bool {
     tail.chars()
         .next()
@@ -461,25 +450,21 @@ fn starts_block(ch: NodeRef) -> bool {
 // Inline rendering
 // ---------------------------------------------------------------------------
 
-#[derive(Clone, Copy, PartialEq)]
+/// <br> rendering: a space, the literal `<br>`, or a newline.
+#[derive(Clone, Copy, PartialEq, Default)]
 enum BrMode {
+    #[default]
     Space,
     Keep,
     Nl,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Default)]
 struct InlineCtx {
     no_escape: bool,
     in_link: bool,
     br_mode: BrMode,
     in_hatnote: bool,
-}
-
-impl Default for InlineCtx {
-    fn default() -> Self {
-        InlineCtx { no_escape: false, in_link: false, br_mode: BrMode::Space, in_hatnote: false }
-    }
 }
 
 /// Render one element (or text node) in inline context.
@@ -619,8 +604,7 @@ fn render_children(el: NodeRef, ctx: InlineCtx) -> String {
             }
             last = out.last().and_then(|s| s.chars().last());
         }
-        let piece_empty = piece.is_empty();
-        if !piece_empty {
+        if !piece.is_empty() {
             last = piece.chars().last();
         }
         out.push(piece);
@@ -631,7 +615,6 @@ fn render_children(el: NodeRef, ctx: InlineCtx) -> String {
     }
     out.join("")
 }
-
 
 /// Render an <a> element: wikilink, external link, fragment-only label,
 /// or dropped media link.
@@ -798,11 +781,7 @@ pub(crate) fn list_item_lines(list_el: NodeRef, depth: usize, raw: bool) -> Vec<
 
 /// Render <ul>/<ol> with 2-space indent per nesting level.
 pub(crate) fn render_list(el: NodeRef, depth: usize) -> String {
-    list_item_lines(el, depth, false)
-        .into_iter()
-        .filter(|l| !l.trim().is_empty())
-        .collect::<Vec<_>>()
-        .join("\n")
+    list_item_lines(el, depth, false).join("\n")
 }
 
 /// Definition list: <dt> -> `- **term**`, <dt>+<dd> -> `- **term**: def`,
@@ -884,10 +863,7 @@ pub(crate) fn render_dl(el: NodeRef, depth: usize) -> String {
             _ => {}
         }
     }
-    out.into_iter()
-        .filter(|l| !l.trim().is_empty())
-        .collect::<Vec<_>>()
-        .join("\n")
+    out.join("\n")
 }
 
 /// Render one <p>: <br> splits the paragraph (the <br>'s tail opens the
@@ -928,10 +904,9 @@ fn render_paragraph(p: NodeRef, in_blockquote: bool) -> Vec<String> {
     }
     let mut out: Vec<String> = Vec::new();
     for s in &segs {
-        let s = if s.contains("  ") || s.contains('\t') { collapse_space_tab(s) } else { s.clone() };
-        let s = s.trim();
+        let s = collapse_space_tab(s).trim().to_string();
         if !s.is_empty() {
-            out.push(s.to_string());
+            out.push(s);
         } else if in_blockquote {
             out.push(String::new());
         }
@@ -1026,8 +1001,11 @@ fn heading_of(el: NodeRef) -> Option<(u32, String)> {
 /// Markdown of ONE block-level child element ('' when it renders to
 /// nothing) — the per-child dispatch of block_children_md.
 pub(crate) fn block_md(ch: NodeRef, in_blockquote: bool) -> String {
-    let tag = ch.tag().unwrap_or("");
-    match tag {
+    // a bare hN, or a div.mw-heading wrapper, renders as a Markdown heading
+    if let Some((level, text)) = heading_of(ch) {
+        return format!("{} {}", "#".repeat(level as usize), text);
+    }
+    match ch.tag().unwrap_or("") {
         "p" => {
             let p_lines = render_paragraph(ch, in_blockquote);
             if in_blockquote {
@@ -1041,15 +1019,7 @@ pub(crate) fn block_md(ch: NodeRef, in_blockquote: bool) -> String {
         "blockquote" => render_blockquote(ch),
         "pre" => render_pre(ch),
         "table" => tables::render_table(ch),
-        "div" => match heading_of(ch) {
-            Some((level, text)) => format!("{} {}", "#".repeat(level as usize), text),
-            None => render_block_container(ch, in_blockquote),
-        },
         "span" => collapse_ws(&inline_text(ch)).trim().to_string(),
-        t if heading_level(t).is_some() => match heading_of(ch) {
-            Some((level, text)) => format!("{} {}", "#".repeat(level as usize), text),
-            None => String::new(),
-        },
         _ => render_block_container(ch, in_blockquote),
     }
 }
@@ -1122,10 +1092,6 @@ fn get_parser_output(root: NodeRef) -> Option<NodeRef> {
 /// Normalize Parsoid-sectioned HTML back to the legacy flat shape: replace
 /// every <section> wrapper under the body container by its children.
 fn flatten_parsoid_sections(dom: &mut Dom, body: crate::htmldom::NodeId) {
-    let has_section = dom.ref_(body).find("section").is_some();
-    if !has_section {
-        return;
-    }
     let sections: Vec<crate::htmldom::NodeId> =
         dom.ref_(body).find_all("section").iter().map(|n| n.id()).collect();
     for sec in sections {
@@ -1203,36 +1169,23 @@ pub fn html_to_md(
         wiki_body.unwrap_or_else(|| dom.root().find("body").map_or(dom.root().id(), |b| b.id()));
     let mut title = title.map(str::to_string);
     if wiki_body.is_none() {
-        if title.is_none() {
-            title = body_h1_title(&dom, body);
-        }
-        if let Some(t) = &title {
-            drop_title_h1(&mut dom, body, t);
+        // On non-wiki pages the first in-body <h1> supplies the title when
+        // none was passed, and an <h1> equal to the output title is
+        // dropped: the `# Title` line would otherwise say it twice.
+        let h1 = dom.ref_(body).find("h1").map(|h| {
+            let text = collapse_ws(&h.text_content()).trim().to_string();
+            (h.id(), text)
+        });
+        if let Some((id, text)) = h1.filter(|(_, t)| !t.is_empty()) {
+            if title.is_none() {
+                title = Some(text.clone());
+            }
+            if title.as_deref() == Some(text.as_str()) {
+                dom.detach(id);
+            }
         }
     }
     render_article(dom, body, key_facts, title.as_deref(), lang)
-}
-
-/// The first in-body h1's collapsed text, or None when the body has no h1.
-fn body_h1_title(dom: &Dom, body: NodeId) -> Option<String> {
-    let h1 = dom.ref_(body).find("h1")?;
-    let text = collapse_ws(&h1.text_content()).trim().to_string();
-    if text.is_empty() { None } else { Some(text) }
-}
-
-/// Remove the first in-body h1 when its text equals `title`: the `# Title`
-/// line would otherwise say it twice.
-fn drop_title_h1(dom: &mut Dom, body: NodeId, title: &str) {
-    let id = {
-        let scope = dom.ref_(body);
-        match scope.find("h1") {
-            Some(h1) if collapse_ws(&h1.text_content()).trim() == title => Some(h1.id()),
-            _ => None,
-        }
-    };
-    if let Some(id) = id {
-        dom.detach(id);
-    }
 }
 
 #[cfg(test)]

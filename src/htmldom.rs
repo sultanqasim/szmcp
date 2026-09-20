@@ -20,8 +20,8 @@ pub enum NodeKind {
         attrs: Vec<(String, String)>,
     },
     Text(String),
+    /// Comments, processing instructions and doctypes: never rendered.
     Comment,
-    ProcessingInstruction,
     Document,
 }
 
@@ -145,27 +145,16 @@ impl Dom {
     /// lxml's `drop_tag`: replace the element with its children, merging
     /// its own text into the surrounding text (no-op when detached).
     pub fn drop_tag(&mut self, id: NodeId) {
-        let Some(parent) = self.parent_of(id) else { return };
-        let children = std::mem::take(&mut self.nodes[id].children);
-        if children.is_empty() {
+        let parent = self.parent_of(id);
+        if self.nodes[id].children.is_empty() {
             // Nothing inside: the element vanishes, its tail stays.
-            self.nodes[parent].children.retain(|&c| c != id);
-            self.nodes[id].parent = None;
-            merge_sibling_text(&mut self.nodes, parent);
-            return;
+            self.detach(id);
+        } else {
+            self.replace_with_children(id);
         }
-        if let Some(pos) = self.nodes[parent].children.iter().position(|&c| c == id) {
-            for (offset, &child) in children.iter().enumerate() {
-                self.nodes[child].parent = Some(parent);
-                if offset == 0 {
-                    self.nodes[parent].children[pos] = child;
-                } else {
-                    self.nodes[parent].children.insert(pos + offset, child);
-                }
-            }
+        if let Some(parent) = parent {
+            self.merge_text(parent);
         }
-        self.nodes[id].parent = None;
-        merge_sibling_text(&mut self.nodes, parent);
     }
 
     /// Deep-copy the subtree rooted at `id` into a fresh standalone `Dom`
@@ -207,11 +196,11 @@ fn build(nodes: &mut Vec<Node>, rcdom: &markup5ever_rcdom::Handle) -> NodeId {
         NodeData::Text { contents } => {
             push_node(nodes, NodeKind::Text(contents.borrow().to_string()))
         }
-        NodeData::Comment { .. } => push_node(nodes, NodeKind::Comment),
-        NodeData::ProcessingInstruction { .. } => {
-            push_node(nodes, NodeKind::ProcessingInstruction)
-        }
-        NodeData::Doctype { .. } => push_node(nodes, NodeKind::Comment), // not renderable
+        // Comments, processing instructions and doctypes are all
+        // non-renderable; the converter treats them identically.
+        NodeData::Comment { .. }
+        | NodeData::ProcessingInstruction { .. }
+        | NodeData::Doctype { .. } => push_node(nodes, NodeKind::Comment),
         NodeData::Element { name, attrs, .. } => {
             let tag = name.local.to_string().to_lowercase();
             let attrs = attrs
@@ -250,18 +239,13 @@ fn merge_sibling_text(nodes: &mut Vec<Node>, parent: NodeId) {
     for child in children {
         if let NodeKind::Text(t) = &nodes[child].kind {
             let t = t.clone();
-            match merged.last().copied() {
-                Some(last) if matches!(nodes[last].kind, NodeKind::Text(_)) => {
-                    if let NodeKind::Text(prev) = &mut nodes[last].kind {
-                        prev.push_str(&t);
-                    }
-                    nodes[child].parent = None; // folded away, unreachable
-                }
-                _ => merged.push(child),
+            if let Some(NodeKind::Text(prev)) = merged.last().map(|&last| &mut nodes[last].kind) {
+                prev.push_str(&t);
+                nodes[child].parent = None; // folded away, unreachable
+                continue;
             }
-        } else {
-            merged.push(child);
         }
+        merged.push(child);
     }
     nodes[parent].children = merged;
 }
@@ -273,9 +257,7 @@ fn clone_into(source: &[Node], id: NodeId, nodes: &mut Vec<Node>) -> NodeId {
             attrs: attrs.clone(),
         },
         NodeKind::Text(t) => NodeKind::Text(t.clone()),
-        NodeKind::Comment => NodeKind::Comment,
-        NodeKind::ProcessingInstruction => NodeKind::ProcessingInstruction,
-        NodeKind::Document => NodeKind::Document,
+        other @ (NodeKind::Comment | NodeKind::Document) => other.clone(),
     };
     let copy = push_node(nodes, kind);
     for &child in &source[id].children {
@@ -345,8 +327,9 @@ impl<'a> NodeRef<'a> {
         self.dom.tail_of(self.id)
     }
 
-    pub fn parent(&self) -> Option<NodeRef<'a>> {
-        self.dom.parent_of(self.id).map(|p| self.dom.ref_(p))
+    /// The ancestor chain (immediate parent upwards), self excluded.
+    pub fn ancestors(&self) -> Ancestors<'a> {
+        Ancestors { dom: self.dom, cur: self.dom.parent_of(self.id) }
     }
 
     /// The previous element/comment sibling (text nodes are tails).
@@ -404,6 +387,22 @@ impl<'a> NodeRef<'a> {
             .into_iter()
             .filter(|n| n.tag() == Some(tag))
             .collect()
+    }
+}
+
+/// Iterator over a node's ancestors (immediate parent upwards).
+pub struct Ancestors<'a> {
+    dom: &'a Dom,
+    cur: Option<NodeId>,
+}
+
+impl<'a> Iterator for Ancestors<'a> {
+    type Item = NodeRef<'a>;
+
+    fn next(&mut self) -> Option<NodeRef<'a>> {
+        let id = self.cur?;
+        self.cur = self.dom.parent_of(id);
+        Some(self.dom.ref_(id))
     }
 }
 

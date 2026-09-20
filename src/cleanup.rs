@@ -25,23 +25,20 @@ pub(crate) fn is_dropped_section(heading: &str, lang: Option<&str>) -> bool {
 
 /// Split the flat block stream at heading lines and drop dropped-section
 /// bodies (the heading + everything under deeper headings).
-fn drop_section_blocks(body_md: &str, lang: Option<&str>) -> (Vec<String>, Vec<(u32, String, Vec<String>)>) {
+fn drop_section_blocks(
+    body_md: &str,
+    lang: Option<&str>,
+) -> (Vec<String>, Vec<(u32, String, Vec<String>)>) {
     let mut intro: Vec<String> = Vec::new();
-    struct Sec {
-        level: u32,
-        heading: String,
-        body: Vec<String>,
-    }
-    let mut sections: Vec<Sec> = Vec::new();
+    let mut sections: Vec<(u32, String, Vec<String>)> = Vec::new(); // (level, heading, body)
     let mut skip_until = 0u32;
     for blk in body_md.split("\n\n") {
-        let mut is_heading = None;
-        if let Some(caps) = re(r"(?s)^(#{2,6}) (.+)$").captures(blk) {
-            is_heading = Some((caps.get(1).unwrap().len() as u32, caps.get(2).unwrap().as_str()));
-        }
-        match is_heading {
-            Some((level, heading_raw)) => {
-                let heading = collapse_ws(heading_raw).trim().to_string();
+        let heading = re(r"(?s)^(#{2,6}) (.+)$")
+            .captures(blk)
+            .map(|c| (c.get(1).unwrap().len() as u32, c.get(2).unwrap().as_str()));
+        match heading {
+            Some((level, raw)) => {
+                let heading = collapse_ws(raw).trim().to_string();
                 if skip_until > 0 {
                     if level <= skip_until {
                         skip_until = 0;
@@ -53,20 +50,20 @@ fn drop_section_blocks(body_md: &str, lang: Option<&str>) -> (Vec<String>, Vec<(
                     skip_until = level;
                     continue;
                 }
-                sections.push(Sec { level, heading, body: Vec::new() });
+                sections.push((level, heading, Vec::new()));
             }
             None => {
                 if skip_until > 0 {
                     continue;
                 }
                 match sections.last_mut() {
-                    Some(sec) => sec.body.push(blk.to_string()),
+                    Some((_, _, body)) => body.push(blk.to_string()),
                     None => intro.push(blk.to_string()),
                 }
             }
         }
     }
-    (intro, sections.into_iter().map(|s| (s.level, s.heading, s.body)).collect())
+    (intro, sections)
 }
 
 /// Split rendered blocks into sections, drop dropped sections and apply
@@ -152,19 +149,25 @@ fn protected_lines(md: &str) -> Vec<bool> {
     prot
 }
 
+/// Record a masked-off span, return its `\x00N\x00` placeholder.
+fn stash(items: &mut Vec<String>, span: &str) -> String {
+    items.push(span.to_string());
+    format!("\x00{}\x00", items.len() - 1)
+}
+
 /// Mask URLs (`\S*://\S*`) as `\x00N\x00` placeholders so the punctuation
 /// repairs cannot touch them; returns the masked text plus the extracted
 /// URLs in order of appearance.  (Without a literal `"://"` nothing can
 /// match, so the text is returned unchanged.)
 fn mask_urls(s: &str) -> (String, Vec<String>) {
-    if !s.contains("://") {
-        return (s.to_string(), Vec::new());
-    }
     let mut urls: Vec<String> = Vec::new();
-    let masked = fre_sub(fre(r"\S*://\S*"), s, |c| {
-        urls.push(c.get(0).map(|m| m.as_str()).unwrap_or("").to_string());
-        format!("\x00{}\x00", urls.len() - 1)
-    });
+    let masked = if s.contains("://") {
+        fre_sub(fre(r"\S*://\S*"), s, |c| {
+            stash(&mut urls, c.get(0).map(|m| m.as_str()).unwrap_or(""))
+        })
+    } else {
+        s.to_string()
+    };
     (masked, urls)
 }
 
@@ -198,10 +201,8 @@ fn unmask(s: &str, items: &[String]) -> String {
 /// masked first, so a `](` inside one cannot start a destination.
 fn mask_code_dests(ln: &str) -> (String, Vec<String>) {
     let mut items: Vec<String> = Vec::new();
-    // Inline code spans: a backtick run, its content, the matching run.
     let mut masked = fre_sub(fre(r"(`+)(.*?)\1"), ln, |c| {
-        items.push(c.get(0).map(|m| m.as_str()).unwrap_or("").to_string());
-        format!("\x00{}\x00", items.len() - 1)
+        stash(&mut items, c.get(0).map(|m| m.as_str()).unwrap_or(""))
     });
     if masked.contains("](") {
         let b = masked.as_bytes();
@@ -226,8 +227,7 @@ fn mask_code_dests(ln: &str) -> (String, Vec<String>) {
                     j += 1;
                 };
                 out.push_str(&masked[last..i]);
-                items.push(masked[i..end].to_string());
-                out.push_str(&format!("\x00{}\x00", items.len() - 1));
+                out.push_str(&stash(&mut items, &masked[i..end]));
                 i = end;
                 last = end;
             } else {
@@ -241,9 +241,12 @@ fn mask_code_dests(ln: &str) -> (String, Vec<String>) {
 }
 
 /// Generic punctuation/whitespace residue repair for one output line.
-/// URLs are masked off for the duration (see [`mask_urls`]).
+/// URLs are masked off for the duration.
 fn repair_line(ln: &str) -> String {
     let (mut s, urls) = mask_urls(ln);
+    // The `contains` checks are pure shortcuts — each pattern fails
+    // without its trigger characters — but skipping the regex runs (the
+    // lookbehind ones are expensive) keeps large articles fast.
     if s.contains('(') {
         s = re(r"\(\s*\)").replace_all(&s, "").into_owned();
         s = fre_sub(fre(r"\(\s+(?=\S)"), &s, |_| "(".to_string());

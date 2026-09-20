@@ -15,14 +15,29 @@ pub(crate) fn is_infobox_container(el: NodeRef) -> bool {
 
 /// Nearest enclosing <table> ancestor of `el`, or None.
 fn nearest_table(el: NodeRef) -> Option<NodeRef> {
-    let mut anc = el.parent();
-    while let Some(a) = anc {
-        if a.tag() == Some("table") {
-            return Some(a);
+    el.ancestors().find(|a| a.tag() == Some("table"))
+}
+
+/// Top-level <table> descendants of `scope`: those whose ancestor chain
+/// up to `scope` holds no other <table>. `keep` must hold for the table
+/// and for every ancestor below `scope`.
+pub(crate) fn top_level_tables(scope: NodeRef, keep: impl Fn(NodeRef) -> bool) -> Vec<NodeRef> {
+    let mut out = Vec::new();
+    'outer: for tbl in scope.find_all("table") {
+        if !keep(tbl) {
+            continue;
         }
-        anc = a.parent();
+        for anc in tbl.ancestors() {
+            if anc.id() == scope.id() {
+                out.push(tbl);
+                continue 'outer;
+            }
+            if anc.tag() == Some("table") || !keep(anc) {
+                continue 'outer;
+            }
+        }
     }
-    None
+    out
 }
 
 /// Rows of `tbl` itself (rows belonging to nested tables excluded).
@@ -51,31 +66,11 @@ pub(crate) fn span_attr(el: NodeRef, name: &str) -> Option<u32> {
     digits[..end].parse().ok()
 }
 
-/// Top-level nested tables of `tbl`: descendant <table> elements whose
-/// nearest enclosing table is `tbl` and whose ancestor chain up to `tbl`
-/// survives the drop rules.
+/// Top-level nested tables of `tbl` that survive the drop rules (a
+/// dropped table, or a dropped element between it and `tbl`, rejects the
+/// nesting level).
 fn nested_tables(tbl: NodeRef) -> Vec<NodeRef> {
-    let mut out = Vec::new();
-    'outer: for t in tbl.find_all("table") {
-        if is_dropped(t) {
-            continue;
-        }
-        let mut anc = t.parent();
-        while let Some(a) = anc {
-            if a.id() == tbl.id() {
-                out.push(t);
-                continue 'outer;
-            }
-            if !a.is_element() || is_dropped(a) {
-                continue 'outer;
-            }
-            if a.tag() == Some("table") {
-                continue 'outer; // one nesting level deeper
-            }
-            anc = a.parent();
-        }
-    }
-    out
+    top_level_tables(tbl, |el| !is_dropped(el))
 }
 
 /// Rendered text of the table's <caption> element ('' when none).
@@ -288,11 +283,10 @@ fn is_multicol_table(tbl: NodeRef) -> bool {
     // Defensive fallback for parsers that emit the cells' col-break classes
     // without the template's role.
     if tbl.attr("role") == Some("presentation") {
-        for c in tbl.find_all("td") {
-            if c.class_tokens().any(is_multicol_col_class) {
-                return true;
-            }
-        }
+        return tbl
+            .find_all("td")
+            .into_iter()
+            .any(|c| c.class_tokens().any(is_multicol_col_class));
     }
     false
 }
