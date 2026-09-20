@@ -22,7 +22,7 @@ axum = "0.7"
 tower-http = { version = "0.5", features = ["cors"] }
 xapian2 = { path = "xapian2" }
 memmap2 = "0.9"
-zstd = "0.13"
+zstd = "0.14"
 xz2 = "0.1"
 base64 = "0.23.1"
 unicode-normalization = "0.1"
