@@ -369,6 +369,36 @@ mod tests {
     }
 
     #[test]
+    fn e2e_get_base64_encodes_non_utf8_content() {
+        let dir = tempfile::tempdir().unwrap();
+        let content = [TestEntry {
+            namespace: b'C',
+            url: "Binary",
+            title: "Binary",
+            mime: 0,
+            body: b"\xff\xfe\x00binary",
+        }];
+        let bytes = build_archive(&["application/octet-stream"], &content, &[], 0, None);
+        std::fs::write(dir.path().join("bin.zim"), &bytes).unwrap();
+        let library = Arc::new(ZimLibrary::scan(dir.path()).unwrap());
+        let server = ZimMcpServer::new(library);
+
+        let params = serde_json::from_value::<ZimGetDirParams>(
+            serde_json::json!({ "zim": "bin.zim", "path": "C/Binary" }),
+        )
+        .unwrap();
+        let result = block_on(ZimGetDirTool::invoke(&server, params)).unwrap();
+        assert_eq!(result.mime_type.as_deref(), Some("application/octet-stream"));
+        assert_eq!(result.content_encoding, "base64");
+        // Decoding the payload with the standard engine round-trips the
+        // original (non-UTF-8) bytes.
+        let decoded = base64::engine::general_purpose::STANDARD
+            .decode(&result.content)
+            .unwrap();
+        assert_eq!(decoded, b"\xff\xfe\x00binary");
+    }
+
+    #[test]
     fn e2e_get_section() {
         let (server, _keep) = test_server();
 

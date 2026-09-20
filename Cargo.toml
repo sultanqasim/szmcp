@@ -24,7 +24,7 @@ xapian2 = { path = "xapian2" }
 memmap2 = "0.9"
 zstd = "0.13"
 xz2 = "0.1"
-base64 = "0.22"
+base64 = "0.23.1"
 unicode-normalization = "0.1"
 html5ever = "0.40.1"
 regex = "1.13.1"
