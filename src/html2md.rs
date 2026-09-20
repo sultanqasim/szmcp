@@ -101,42 +101,59 @@ pub(crate) fn is_dropped(el: NodeRef) -> bool {
     if DROP_TAGS.contains(&tag) {
         return true;
     }
-    if el.attr("role") == Some("navigation") {
+    // One pass over the attributes for the lookups below (each used to
+    // cost its own linear `attr()` scan); first occurrence wins, like
+    // `attr()`.
+    let (mut role, mut type_of, mut style, mut aria_hidden, mut id, mut class) =
+        (None, None, None, None, None, None);
+    if let NodeKind::Element { attrs, .. } = el.kind() {
+        for (name, value) in attrs {
+            let slot = match name.as_str() {
+                "role" => &mut role,
+                "typeof" => &mut type_of,
+                "style" => &mut style,
+                "aria-hidden" => &mut aria_hidden,
+                "class" => &mut class,
+                "id" => &mut id,
+                _ => continue,
+            };
+            if slot.is_none() {
+                *slot = Some(value.as_str());
+            }
+        }
+    }
+    if role == Some("navigation") {
         return true;
     }
     if tag == "a" && is_wikidata_badge(el) {
         return true;
     }
-    if el.has_any_class(DROP_CLASSES) {
+    if class.unwrap_or("").split_whitespace().any(|c| DROP_CLASSES.contains(&c)) {
         return true;
     }
-    if el
-        .attr("typeof")
-        .unwrap_or("")
-        .split_whitespace()
-        .any(|t| t == "mw:File")
-    {
+    if type_of.unwrap_or("").split_whitespace().any(|t| t == "mw:File") {
         return true;
     }
-    let sty = el.attr("style").unwrap_or("");
-    if sty.replace(' ', "").contains("display:none") || sty.contains("display: none") {
-        // MediaWiki renders formulas twice: a visible image fallback plus a
-        // hidden MathML twin; a display:none element carrying <math>
-        // survives so its alttext LaTeX can be extracted.
-        if !carries_math(el) {
-            return true;
+    if let Some(sty) = style {
+        // Only styled elements with a `display` in the style reach the
+        // de-spaced copy the check needs.
+        if sty.contains("display")
+            && (sty.replace(' ', "").contains("display:none") || sty.contains("display: none"))
+        {
+            // MediaWiki renders formulas twice: a visible image fallback plus a
+            // hidden MathML twin; a display:none element carrying <math>
+            // survives so its alttext LaTeX can be extracted.
+            if !carries_math(el) {
+                return true;
+            }
         }
     }
-    if el.attr("aria-hidden") == Some("true") && matches!(tag, "span" | "sup" | "div") {
+    if aria_hidden == Some("true") && matches!(tag, "span" | "sup" | "div") {
         return true;
     }
     if tag == "sup" {
         // Note-reference superscripts vanish with the References machinery.
-        let ident = format!(
-            "{} {}",
-            el.attr("id").unwrap_or(""),
-            el.attr("class").unwrap_or("")
-        );
+        let ident = format!("{} {}", id.unwrap_or(""), class.unwrap_or(""));
         if ["cite", "citation", "ref"].iter().any(|w| ident.contains(w)) {
             return true;
         }

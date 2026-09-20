@@ -712,27 +712,29 @@ fn parse_infobox_table(tbl: NodeRef, fallback_title: &str, above_text: &str) -> 
 /// Containers nested inside another container are excluded.
 pub(crate) fn extract_infoboxes(dom: &Dom) -> Vec<Infobox> {
     let root = dom.root();
-    // article title (h1#firstHeading) as a last-resort subbox title
+    // One pre-order pass gathers the article title (the h1#firstHeading
+    // text, else the first h1's — a last-resort subbox title) and the
+    // infobox containers, in document order: classed <table class="infobox">
+    // and the frwiki wrapper <div class="infobox_v2|v3 infobox">.
     let mut fallback_title = String::new();
-    for h1 in root.find_all("h1") {
-        if h1.attr("id") == Some("firstHeading") || fallback_title.is_empty() {
-            fallback_title = collapse_ws(&h1.text_content()).trim().to_string();
+    let mut title_set = false;
+    let mut containers: Vec<NodeRef> = Vec::new();
+    for el in root.self_and_descendants() {
+        if !title_set && el.tag() == Some("h1") {
+            if el.attr("id") == Some("firstHeading") {
+                title_set = true;
+            }
+            if title_set || fallback_title.is_empty() {
+                fallback_title = collapse_ws(&el.text_content()).trim().to_string();
+            }
         }
-        if h1.attr("id") == Some("firstHeading") {
-            break;
+        if el.is_element()
+            && matches!(el.tag(), Some("table") | Some("div"))
+            && el.has_class("infobox")
+        {
+            containers.push(el);
         }
     }
-    // Infobox containers in document order: classed <table class="infobox">
-    // and the frwiki wrapper <div class="infobox_v2|v3 infobox">.
-    let containers: Vec<NodeRef> = root
-        .self_and_descendants()
-        .into_iter()
-        .filter(|el| {
-            el.is_element()
-                && matches!(el.tag(), Some("table") | Some("div"))
-                && el.has_class("infobox")
-        })
-        .collect();
     if containers.is_empty() {
         return Vec::new();
     }

@@ -56,7 +56,9 @@ impl Dom {
         let rcdom: RcDom = parse_document(RcDom::default(), opts)
             .from_utf8()
             .one(html.as_bytes());
-        let mut nodes = Vec::new();
+        // ~40 bytes of HTML per arena node on real pages; a single
+        // capacity guess avoids most of the growth reallocations.
+        let mut nodes = Vec::with_capacity(html.len() / 40);
         let doc = build(&mut nodes, &rcdom.document);
         // The spec's tree builder always inserts an <html> element; a
         // fragment without one would still get it.
@@ -202,16 +204,11 @@ fn build(nodes: &mut Vec<Node>, rcdom: &markup5ever_rcdom::Handle) -> NodeId {
         | NodeData::ProcessingInstruction { .. }
         | NodeData::Doctype { .. } => push_node(nodes, NodeKind::Comment),
         NodeData::Element { name, attrs, .. } => {
-            let tag = name.local.to_string().to_lowercase();
+            let tag = lower_name(&name.local);
             let attrs = attrs
                 .borrow()
                 .iter()
-                .map(|a| {
-                    (
-                        a.name.local.to_string().to_lowercase(),
-                        a.value.to_string(),
-                    )
-                })
+                .map(|a| (lower_name(&a.name.local), a.value.to_string()))
                 .collect();
             push_node(nodes, NodeKind::Element { tag, attrs })
         }
@@ -223,6 +220,18 @@ fn build(nodes: &mut Vec<Node>, rcdom: &markup5ever_rcdom::Handle) -> NodeId {
     }
     merge_sibling_text(nodes, id);
     id
+}
+
+/// A tag/attribute name as a String, ASCII-lower-cased only when it has
+/// uppercase (html5ever already lower-cases HTML names; only foreign
+/// names arrive mixed-case and the converter matches lower-case tags).
+/// One allocation, versus `to_string().to_lowercase()`'s two.
+fn lower_name(name: &str) -> String {
+    let mut s = name.to_string();
+    if s.bytes().any(|b| b.is_ascii_uppercase()) {
+        s.make_ascii_lowercase();
+    }
+    s
 }
 
 fn push_node(nodes: &mut Vec<Node>, kind: NodeKind) -> NodeId {
@@ -237,15 +246,22 @@ fn merge_sibling_text(nodes: &mut Vec<Node>, parent: NodeId) {
     let children = std::mem::take(&mut nodes[parent].children);
     let mut merged: Vec<NodeId> = Vec::with_capacity(children.len());
     for child in children {
-        if let NodeKind::Text(t) = &nodes[child].kind {
-            let t = t.clone();
-            if let Some(NodeKind::Text(prev)) = merged.last().map(|&last| &mut nodes[last].kind) {
-                prev.push_str(&t);
-                nodes[child].parent = None; // folded away, unreachable
-                continue;
-            }
+        let merges = matches!(&nodes[child].kind, NodeKind::Text(_))
+            && merged.last().is_some_and(|&last| matches!(&nodes[last].kind, NodeKind::Text(_)));
+        if !merges {
+            merged.push(child);
+            continue;
         }
-        merged.push(child);
+        // Move the folded child's text out (its node leaves the tree
+        // below), so no second borrow of `nodes` is held for the write.
+        let text = match &mut nodes[child].kind {
+            NodeKind::Text(t) => std::mem::take(t),
+            _ => unreachable!(),
+        };
+        let last = *merged.last().unwrap();
+        let NodeKind::Text(prev) = &mut nodes[last].kind else { unreachable!() };
+        prev.push_str(&text);
+        nodes[child].parent = None; // folded away, unreachable
     }
     nodes[parent].children = merged;
 }
@@ -362,31 +378,31 @@ impl<'a> NodeRef<'a> {
     }
 
     /// This node and all descendants, pre-order (lxml's `iter()`).
-    pub fn self_and_descendants(&self) -> Vec<NodeRef<'a>> {
-        let mut out = Vec::new();
-        collect_preorder(self.dom, self.id, true, &mut out);
-        out
+    pub fn self_and_descendants(&self) -> impl Iterator<Item = NodeRef<'a>> + 'a {
+        std::iter::once(*self).chain(self.descendants_iter())
     }
 
     /// All descendants, pre-order, self excluded (lxml's
     /// `iterdescendants()`).
     pub fn descendants(&self) -> Vec<NodeRef<'a>> {
-        let mut out = Vec::new();
-        collect_preorder(self.dom, self.id, false, &mut out);
-        out
+        self.descendants_iter().collect()
+    }
+
+    /// The lazy pre-order walk (self excluded) backing [`Self::descendants`]:
+    /// [`Self::find`] early-exits on it, [`Self::find_all`] collects only
+    /// its matches — no whole-subtree materialization.
+    fn descendants_iter(&self) -> Descendants<'a> {
+        Descendants::new(self.dom, self.id)
     }
 
     /// The first descendant (self excluded) with the given tag.
     pub fn find(&self, tag: &str) -> Option<NodeRef<'a>> {
-        self.descendants().into_iter().find(|n| n.tag() == Some(tag))
+        self.descendants_iter().find(|n| n.tag() == Some(tag))
     }
 
     /// All descendants (self excluded) with the given tag.
     pub fn find_all(&self, tag: &str) -> Vec<NodeRef<'a>> {
-        self.descendants()
-            .into_iter()
-            .filter(|n| n.tag() == Some(tag))
-            .collect()
+        self.descendants_iter().filter(|n| n.tag() == Some(tag)).collect()
     }
 }
 
@@ -406,6 +422,35 @@ impl<'a> Iterator for Ancestors<'a> {
     }
 }
 
+/// Explicit-stack pre-order walk of a node's descendants (self excluded);
+/// same visit order as the recursive collect it replaced.
+struct Descendants<'a> {
+    dom: &'a Dom,
+    /// Siblings still to visit (children are pushed in reverse, so the
+    /// first child pops first).
+    stack: Vec<NodeId>,
+}
+
+impl<'a> Descendants<'a> {
+    fn new(dom: &'a Dom, id: NodeId) -> Self {
+        Descendants {
+            dom,
+            stack: dom.children_of(id).iter().rev().copied().collect(),
+        }
+    }
+}
+
+impl<'a> Iterator for Descendants<'a> {
+    type Item = NodeRef<'a>;
+
+    fn next(&mut self) -> Option<NodeRef<'a>> {
+        let id = self.stack.pop()?;
+        let children = self.dom.children_of(id);
+        self.stack.extend(children.iter().rev().copied());
+        Some(self.dom.ref_(id))
+    }
+}
+
 fn collect_text(node: &NodeRef<'_>, out: &mut String) {
     // The leading text is one of the text children; walking the children
     // covers it and every tail exactly once.
@@ -418,16 +463,4 @@ fn collect_text(node: &NodeRef<'_>, out: &mut String) {
     }
 }
 
-fn collect_preorder<'a>(
-    dom: &'a Dom,
-    id: NodeId,
-    include_self: bool,
-    out: &mut Vec<NodeRef<'a>>,
-) {
-    if include_self {
-        out.push(dom.ref_(id));
-    }
-    for &child in dom.children_of(id) {
-        collect_preorder(dom, child, true, out);
-    }
-}
+

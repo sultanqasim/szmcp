@@ -119,6 +119,17 @@ pub(crate) fn assemble(body_md: &str, lang: Option<&str>) -> String {
     parts.join("\n\n")
 }
 
+/// True when the line contains `</table` in any ASCII letter case (the
+/// byte equivalent of `to_lowercase().contains("</table")`: lowercasing
+/// folds only ASCII letters — no character lowercases to '<' or '/' —
+/// so it cannot create or destroy the sequence).
+fn has_close_table(ln: &str) -> bool {
+    let b = ln.as_bytes();
+    (0..b.len().saturating_sub(6)).any(|i| {
+        b[i] == b'<' && b[i + 1] == b'/' && b[i + 2..i + 7].eq_ignore_ascii_case(b"table")
+    })
+}
+
 /// Boolean per-line flags: fenced code blocks and HTML table blocks are
 /// protected from the whitespace/punctuation repairs.
 fn protected_lines(md: &str) -> Vec<bool> {
@@ -135,13 +146,20 @@ fn protected_lines(md: &str) -> Vec<bool> {
             prot.push(true);
             continue;
         }
-        let low = ln.to_lowercase();
-        if !in_table && low.trim_start().starts_with("<table") {
+        // `<table` on the trimmed line, in any ASCII letter case (the
+        // byte equivalent of the old to_lowercase scan, without the
+        // per-line allocation).
+        let head = ln.trim_start().as_bytes();
+        if !in_table
+            && head.len() >= 6
+            && head[0] == b'<'
+            && head[1..6].eq_ignore_ascii_case(b"table")
+        {
             in_table = true;
         }
         if in_table {
             prot.push(true);
-            if low.contains("</table") {
+            if has_close_table(ln) {
                 in_table = false;
             }
             continue;
@@ -610,6 +628,21 @@ fn unescape_residue(md: &str) -> String {
     out.join("\n")
 }
 
+/// One pass over the text: nbsp becomes a space, the BOM and zero-width
+/// characters are dropped (one scan for the three whole-document
+/// replaces this stands in for).
+fn strip_invisibles(md: &str) -> String {
+    let mut out = String::with_capacity(md.len());
+    for c in md.chars() {
+        match c {
+            '\u{00a0}' => out.push(' '),
+            '\u{feff}' | '\u{200b}' => {}
+            _ => out.push(c),
+        }
+    }
+    out
+}
+
 /// The final cleanup pass: entity decode (leaving fenced code blocks,
 /// inline code spans and link destinations literal — see
 /// [`unescape_residue`]), nbsp/feff collapse, edit-link
@@ -619,10 +652,7 @@ fn unescape_residue(md: &str) -> String {
 /// period inside a URL (`example.NET`, `Page.Us`) is not a sentence end.
 pub(crate) fn cleanup(md: &str) -> String {
     let md = unescape_residue(md);
-    let md = md
-        .replace('\u{00a0}', " ")
-        .replace('\u{feff}', "")
-        .replace('\u{200b}', "");
+    let md = strip_invisibles(&md);
     let md = md.replace("[edit]", "").replace("[modifier]", "");
 
     // No doubled blank lines; rstrip line ends.
