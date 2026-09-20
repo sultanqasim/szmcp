@@ -256,19 +256,23 @@ pub(crate) fn escape_plain_asterisks(chunk: &str) -> String {
     out
 }
 
-/// (path, fragment) of an href; path has no './' prefix or query string.
+/// (path, fragment) of an href; path has no './' prefix but keeps its
+/// query string — `./Foo?x=1#Sec` yields ("Foo?x=1", "Sec") — so the
+/// wikilink target still identifies the same resource (stripping `?x=1`
+/// would collapse different queries onto one target).
 fn split_href(href: &str) -> (String, String) {
     let href = href.strip_prefix("./").unwrap_or(href);
     let (path, frag) = match href.split_once('#') {
         Some((p, f)) => (p, f),
         None => (href, ""),
     };
-    let path = path.split('?').next().unwrap_or("");
     (path.to_string(), frag.to_string())
 }
 
 /// The wikilink target from already-split href parts (percent-decoded,
 /// underscores folded, `#fragment` appended unless it is a citation).
+/// The path may carry a query string (`Foo?x=1`); it decodes and folds
+/// like the rest of the target.
 fn link_target_parts(path: &str, frag: &str) -> Option<String> {
     if path.is_empty() {
         return None;
@@ -684,7 +688,9 @@ fn render_anchor(el: NodeRef, ctx: InlineCtx) -> String {
         return format!("{}[{}]({}){}", lead, label_stripped, md_link_url(href), trail);
     }
 
-    // internal link (or interwiki / fragment-only)
+    // internal link (or interwiki / fragment-only); the citation-residue
+    // check reads the raw href — a '#…' href has an empty path by
+    // construction, so `#cite_note…` is detected there and not via frag.
     let (path, frag) = split_href(href);
     if path.is_empty() {
         if href.starts_with("#cite_note") {
@@ -707,7 +713,8 @@ fn render_anchor(el: NodeRef, ctx: InlineCtx) -> String {
             return emph_wikilink(mark, &target, core);
         }
     }
-    // omit |label when the label equals the target page title
+    // omit |label when the label equals the target page title (query
+    // string included, since split_href keeps it)
     let bare = path.replace('_', " ");
     let label_cmp = label_stripped.replace('_', " ");
     if label_cmp == bare || label_cmp == target {
@@ -1296,6 +1303,28 @@ mod tests {
             Some("T"),
             None,
         )
+    }
+
+    /// A query string stays part of the internal link target: stripping it
+    /// would collapse `Foo?x=1` and `Foo?x=2` onto the same `Foo` target.
+    #[test]
+    fn internal_link_keeps_its_query_string() {
+        let md = wiki_doc("<p>See <a href=\"./Foo?x=1\">L</a> here.</p>");
+        assert_eq!(md, "# T\n\nSee [[Foo?x=1|L]] here.\n");
+    }
+
+    /// Query and fragment combine in the target, in href order.
+    #[test]
+    fn internal_link_keeps_query_and_fragment() {
+        let md = wiki_doc("<p>See <a href=\"./Foo?x=1#Sec\">L</a> here.</p>");
+        assert_eq!(md, "# T\n\nSee [[Foo?x=1#Sec|L]] here.\n");
+    }
+
+    /// A query-free internal link renders exactly as before.
+    #[test]
+    fn internal_link_without_query_is_unchanged() {
+        let md = wiki_doc("<p>See <a href=\"./Foo\">L</a> here.</p>");
+        assert_eq!(md, "# T\n\nSee [[Foo|L]] here.\n");
     }
 
     /// A <dd> with both inline text and a sub-list: the definition goes on
