@@ -216,7 +216,7 @@ async fn serve(zim_path: &Path, bind: String, port: u16) -> Result<(), String> {
         let config = StreamableHttpServerConfig::default()
             .with_allowed_hosts(["localhost", "127.0.0.1", "::1"]); // block DNS rebinding
         let cors_layer = CorsLayer::permissive()
-            .allow_origin(AllowOrigin::predicate(|origin, _headers| {
+            .allow_origin(AllowOrigin::predicate(|origin, _parts| {
                 origin.to_str().ok().map_or(false, |s| {
                     s.starts_with("http://localhost:")
                         || s == "http://localhost"
