@@ -170,6 +170,23 @@ XDoc *xapian2_db_get_document(const Xapian::Database *db, uint32_t did) {
     return nullptr;
 }
 
+// The metadata value stored under `key` ("" when unset), read back through a
+// per-thread scratch buffer valid until the next call on this thread. Mirrors
+// Xapian::Database::get_metadata; used to verify set_metadata().
+const char *xapian2_db_get_metadata(const Xapian::Database *db, const char *key,
+                                    uint32_t key_len, uint32_t *out_len) {
+    thread_local std::string scratch;
+    try {
+        scratch = db->get_metadata(std::string_view(key, key_len));
+        *out_len = static_cast<uint32_t>(scratch.size());
+        return scratch.data();
+    } catch (const Xapian::Error &e) {
+        g_error = describe(e);
+        *out_len = 0;
+    }
+    return nullptr;
+}
+
 // Compact to `output` as a glass *directory*.
 int xapian2_db_compact(Xapian::Database *db, const char *output) {
     try {
@@ -222,6 +239,18 @@ int xapian2_doc_set_data(XDoc *d, const char *data, uint32_t len) {
     return -1;
 }
 
+// Remove `term` from the document. Xapian throws (InvalidArgumentError) when
+// the document does not index the term - surfaced as an error.
+int xapian2_doc_remove_term(XDoc *d, const char *term, uint32_t len) {
+    try {
+        d->doc.remove_term(std::string_view(term, len));
+        return 0;
+    } catch (const Xapian::Error &e) {
+        g_error = describe(e);
+    }
+    return -1;
+}
+
 int xapian2_doc_add_term(XDoc *d, const char *term, uint32_t len, uint32_t increment) {
     try {
         d->doc.add_term(std::string_view(term, len), increment);
@@ -256,6 +285,30 @@ uint32_t xapian2_doc_termlist_count(const XDoc *d) {
         return static_cast<uint32_t>(d->doc.termlist_count());
     } catch (const Xapian::Error &e) {
         g_error = describe(e);
+    }
+    return 0;
+}
+
+// libzim's sizeOfIndexedText (writer/xapianIndexer.cpp): the indexed volume
+// the title-abort check compares against - the sum over the document's terms,
+// excluding the Z-prefixed stems, of wdf * term length. `ok` is 0 when Xapian
+// failed (e.g. the termlist of a DB_NO_TERMLIST database document, which glass
+// does not store; libzim only calls this on in-flight documents).
+uint64_t xapian2_doc_indexed_text_size(const XDoc *d, int *ok) {
+    try {
+        *ok = 1;
+        uint64_t total = 0;
+        for (auto it = d->doc.termlist_begin(); it != d->doc.termlist_end(); ++it) {
+            const std::string &term = *it;
+            if (!term.empty() && term[0] != 'Z') {
+                total += static_cast<uint64_t>(it.get_wdf())
+                       * static_cast<uint64_t>(term.size());
+            }
+        }
+        return total;
+    } catch (const Xapian::Error &e) {
+        g_error = describe(e);
+        *ok = 0;
     }
     return 0;
 }
@@ -356,6 +409,31 @@ int xapian2_tg_set_stemming_strategy(XTermGen *tg, int strategy) {
     return -1;
 }
 
+// Toggle TermGenerator feature flags (raw passthrough of the Xapian flag
+// bitmask). libzim's indexers set FLAG_NGRAMS (aka FLAG_CJK_NGRAM = 2048) so
+// CJK text is indexed as per-character ngrams. Returns 0 on success.
+int xapian2_tg_set_flags(XTermGen *tg, uint32_t flags) {
+    try {
+        tg->tg.set_flags(static_cast<Xapian::TermGenerator::flags>(flags));
+        return 0;
+    } catch (const Xapian::Error &e) {
+        g_error = describe(e);
+    }
+    return -1;
+}
+
+// Drop words longer than `n` characters entirely from indexing (libzim sets
+// 240 for titles, MAX_INDEXABLE_TITLE_WORD_SIZE).
+int xapian2_tg_set_max_word_length(XTermGen *tg, uint32_t n) {
+    try {
+        tg->tg.set_max_word_length(n);
+        return 0;
+    } catch (const Xapian::Error &e) {
+        g_error = describe(e);
+    }
+    return -1;
+}
+
 int xapian2_tg_set_document(XTermGen *tg, const XDoc *d) {
     try {
         tg->tg.set_document(d->doc);
@@ -437,6 +515,39 @@ int xapian2_wdb_commit(Xapian::WritableDatabase *db) {
         return 0;
     } catch (const Xapian::Error &e) {
         g_error = describe(e);
+    }
+    return -1;
+}
+
+// Store `value` under `key` in the database's user metadata (an empty value
+// removes the key), the way libzim's indexer records valuesmap/kind/data/
+// language/stopwords on the index databases it builds.
+int xapian2_wdb_set_metadata(Xapian::WritableDatabase *db, const char *key,
+                             uint32_t key_len, const char *value, uint32_t value_len) {
+    try {
+        db->set_metadata(std::string_view(key, key_len),
+                         std::string_view(value, value_len));
+        return 0;
+    } catch (const Xapian::Error &e) {
+        g_error = describe(e);
+    }
+    return -1;
+}
+
+// Compact to a **single-file** glass database at path `output` with the FULL
+// compaction level - the path form of what libzim's
+// XapianIndexer::indexingPostlude does after the final commit
+// (writableDatabase.compact(indexPath, DBCOMPACT_SINGLE_FILE | Compactor::FULL)):
+// the item that ends up embedded in the ZIM archive. DBCOMPACT_SINGLE_FILE=16,
+// Compactor::FULL=1, block_size 0 (glass default 8192).
+int xapian2_wdb_compact_single_file_full(Xapian::WritableDatabase *db, const char *output) {
+    try {
+        db->compact(output, Xapian::DBCOMPACT_SINGLE_FILE | Xapian::Compactor::FULL, 0);
+        return 0;
+    } catch (const Xapian::Error &e) {
+        g_error = describe(e);
+    } catch (const std::exception &e) {
+        g_error = e.what();
     }
     return -1;
 }

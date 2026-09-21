@@ -83,6 +83,12 @@ mod ffi {
         pub fn xapian2_db_termfreq(db: *mut c_void, term: *const c_char, len: u32) -> u32;
         pub fn xapian2_db_wdf(db: *mut c_void, did: u32, term: *const c_char, len: u32) -> u32;
         pub fn xapian2_db_get_document(db: *mut c_void, did: u32) -> *mut c_void;
+        pub fn xapian2_db_get_metadata(
+            db: *mut c_void,
+            key: *const c_char,
+            key_len: u32,
+            out_len: *mut u32,
+        ) -> *const c_char;
         pub fn xapian2_db_compact(db: *mut c_void, output: *const c_char) -> c_int;
         pub fn xapian2_db_compact_single_file(db: *mut c_void, output: *const c_char) -> c_int;
         pub fn xapian2_db_free(db: *mut c_void);
@@ -91,9 +97,11 @@ mod ffi {
         pub fn xapian2_doc_new() -> *mut c_void;
         pub fn xapian2_doc_set_data(d: *mut c_void, data: *const c_char, len: u32) -> c_int;
         pub fn xapian2_doc_add_term(d: *mut c_void, term: *const c_char, len: u32, increment: u32) -> c_int;
+        pub fn xapian2_doc_remove_term(d: *mut c_void, term: *const c_char, len: u32) -> c_int;
         pub fn xapian2_doc_set_value(d: *mut c_void, slot: u32, value: *const c_char, len: u32) -> c_int;
         pub fn xapian2_doc_id(d: *mut c_void) -> u32;
         pub fn xapian2_doc_termlist_count(d: *mut c_void) -> u32;
+        pub fn xapian2_doc_indexed_text_size(d: *mut c_void, ok: *mut c_int) -> u64;
         pub fn xapian2_doc_data(d: *mut c_void, out_len: *mut u32) -> *const c_char;
         pub fn xapian2_doc_value(d: *mut c_void, slot: u32, out_len: *mut u32) -> *const c_char;
         pub fn xapian2_doc_free(d: *mut c_void);
@@ -103,12 +111,22 @@ mod ffi {
         pub fn xapian2_wdb_open_inmemory() -> *mut c_void;
         pub fn xapian2_wdb_add_document(db: *mut c_void, d: *mut c_void) -> u32;
         pub fn xapian2_wdb_commit(db: *mut c_void) -> c_int;
+        pub fn xapian2_wdb_set_metadata(
+            db: *mut c_void,
+            key: *const c_char,
+            key_len: u32,
+            value: *const c_char,
+            value_len: u32,
+        ) -> c_int;
+        pub fn xapian2_wdb_compact_single_file_full(db: *mut c_void, output: *const c_char) -> c_int;
         pub fn xapian2_wdb_free(db: *mut c_void);
 
         // TermGenerator
         pub fn xapian2_tg_new() -> *mut c_void;
         pub fn xapian2_tg_set_stemmer(tg: *mut c_void, language: *const c_char) -> c_int;
         pub fn xapian2_tg_set_stemming_strategy(tg: *mut c_void, strategy: c_int) -> c_int;
+        pub fn xapian2_tg_set_flags(tg: *mut c_void, flags: u32) -> c_int;
+        pub fn xapian2_tg_set_max_word_length(tg: *mut c_void, n: u32) -> c_int;
         pub fn xapian2_tg_set_document(tg: *mut c_void, d: *mut c_void) -> c_int;
         pub fn xapian2_tg_index_text_without_positions(
             tg: *mut c_void,
@@ -350,6 +368,39 @@ pub mod parse_flags {
     pub const FLAG_DEFAULT: u32 = FLAG_PHRASE | FLAG_BOOLEAN | FLAG_LOVEHATE;
 }
 
+/// Feature flags for [`TermGenerator::set_flags`], matching
+/// `Xapian::TermGenerator::FLAG_*` values.
+pub mod tg_flags {
+    /// Xapian's default: no extra features.
+    pub const FLAG_DEFAULT: u32 = 0;
+    /// Index CJK (Chinese/Japanese/Korean) text as per-character ngrams
+    /// instead of dropping it (these scripts have no word boundaries).
+    /// Xapian 1.4.23 named this `FLAG_CJK_NGRAM`; `FLAG_NGRAMS` is the
+    /// preferred 2.x name. This is what libzim's indexers set.
+    pub const FLAG_NGRAMS: u32 = 2048;
+    /// Old alias of [`FLAG_NGRAMS`].
+    pub const FLAG_CJK_NGRAM: u32 = FLAG_NGRAMS;
+}
+
+/// Flags for opening **writable** databases (`Xapian::DB_*`), passed to
+/// [`WritableDatabase::create_with_flags`].
+pub mod wdb_flags {
+    /// `DB_CREATE_OR_OVERWRITE`: create the database, replacing any existing
+    /// one. What libzim's indexer opens its throwaway databases with.
+    pub const DB_CREATE_OR_OVERWRITE: i32 = 0x01;
+    /// `DB_CREATE`: create the database, failing if it already exists.
+    pub const DB_CREATE: i32 = 0x02;
+    /// `DB_OPEN`: open an existing database, failing if it is absent.
+    pub const DB_OPEN: i32 = 0x03;
+    /// `DB_NO_SYNC`: don't fsync (faster, less crash-safe).
+    pub const DB_NO_SYNC: i32 = 0x04;
+    /// `DB_NO_TERMLIST`: don't store per-document term lists. What libzim's
+    /// indexer sets (documents read back from such a database have no
+    /// termlist: `termlist_count`/`indexed_text_size` fail on them, but
+    /// posting lists, values and data work).
+    pub const DB_NO_TERMLIST: i32 = 0x20;
+}
+
 /// How query terms are stemmed, matching `Xapian::QueryParser::stem_strategy`
 /// (the same values also serve [`TermGenerator::set_stemming_strategy`]'s
 /// `Xapian::TermGenerator::stem_strategy`).
@@ -508,6 +559,28 @@ impl Database {
         Error::from_ptr(ptr, "failed to fetch document").map(|ptr| Document { ptr })
     }
 
+    /// The user metadata stored under `key`, or empty when unset.
+    ///
+    /// Metadata is a small string-keyed string map a writer stores on the
+    /// database (libzim's indexers record `valuesmap`, `kind`, `data`,
+    /// `language` and `stopwords` this way); it is written with
+    /// [`WritableDatabase::set_metadata`] and survives compaction.
+    pub fn get_metadata(&self, key: &str) -> Result<String> {
+        let key = cstr(key)?;
+        let mut len = 0u32;
+        // SAFETY: `key` is a valid NUL-terminated string for the call; the
+        // shim guarantees `len` bytes at the returned pointer, valid until
+        // the next call on this thread.
+        let ptr = unsafe {
+            ffi::xapian2_db_get_metadata(self.handle(), key.as_ptr(), key.as_bytes().len() as u32, &mut len)
+        };
+        if ptr.is_null() {
+            return Err(Error::last_error("failed to read database metadata"));
+        }
+        let bytes = unsafe { std::slice::from_raw_parts(ptr as *const u8, len as usize) };
+        String::from_utf8(bytes.to_vec()).map_err(|e| Error::new(e.to_string()))
+    }
+
     /// Produce a compacted glass *directory* at `output`.
     pub fn compact_to(&self, output: impl AsRef<Path>) -> Result<()> {
         let c_out = cstr(&output.as_ref().to_string_lossy())?;
@@ -582,6 +655,26 @@ impl Document {
         unsafe { ffi::xapian2_doc_termlist_count(self.handle()) }
     }
 
+    /// The document's total *indexed* volume: the sum over its terms,
+    /// excluding the `Z`-prefixed stems, of `wdf * term.len()` - libzim's
+    /// `sizeOfIndexedText` (writer/xapianIndexer.cpp), the value its title
+    /// indexer compares against the anchor term before deciding a title lost
+    /// too much data during indexing.
+    ///
+    /// Fails for documents read back from a `DB_NO_TERMLIST` database (glass
+    /// does not store their term lists); in-flight documents - what the
+    /// title indexer holds - always have one.
+    pub fn indexed_text_size(&self) -> Result<u64> {
+        let mut ok = 0;
+        // SAFETY: the handle is valid for the lifetime of `self`; `ok` is
+        // written before return.
+        let size = unsafe { ffi::xapian2_doc_indexed_text_size(self.handle(), &mut ok) };
+        if ok == 0 {
+            return Err(Error::last_error("failed to iterate the document termlist"));
+        }
+        Ok(size)
+    }
+
     /// The document's data blob.
     ///
     /// Xapian 2.x returns document data by value, so this is one C++-side
@@ -633,6 +726,20 @@ impl Document {
         // SAFETY: `bytes` is a valid byte slice; the shim copies it.
         let status = unsafe {
             ffi::xapian2_doc_add_term(self.handle(), bytes.as_ptr() as *const _, bytes.len() as u32, increment)
+        };
+        Error::from_status(status)
+    }
+
+    /// Remove `term` from the document.
+    ///
+    /// Fails when the document does not index the term (Xapian throws
+    /// `InvalidArgumentError`) - libzim's title indexer relies on this to
+    /// replace the anchor term of wordless titles.
+    pub fn remove_term(&mut self, term: &str) -> Result<()> {
+        let bytes = term.as_bytes();
+        // SAFETY: `bytes` is a valid byte slice; the shim copies it.
+        let status = unsafe {
+            ffi::xapian2_doc_remove_term(self.handle(), bytes.as_ptr() as *const _, bytes.len() as u32)
         };
         Error::from_status(status)
     }
@@ -826,6 +933,27 @@ impl TermGenerator {
         Error::from_status(status)
     }
 
+    /// Toggle TermGenerator feature flags (a raw passthrough of Xapian's
+    /// `Xapian::TermGenerator::FLAG_*` bitmask; see [`tg_flags`]).
+    ///
+    /// libzim's indexers set [`tg_flags::FLAG_NGRAMS`] (2048) so CJK text is
+    /// indexed as per-character ngrams rather than dropped.
+    pub fn set_flags(&mut self, flags: u32) -> Result<()> {
+        // SAFETY: the handle is valid for the duration of the call.
+        let status = unsafe { ffi::xapian2_tg_set_flags(self.handle(), flags) };
+        Error::from_status(status)
+    }
+
+    /// Drop words longer than `n` characters from indexing entirely (words
+    /// longer than the cap index nothing at all). libzim sets 240 for titles
+    /// (`MAX_INDEXABLE_TITLE_WORD_SIZE`) and leaves the fulltext default
+    /// (Xapian's own limit) alone.
+    pub fn set_max_word_length(&mut self, n: u32) -> Result<()> {
+        // SAFETY: the handle is valid for the duration of the call.
+        let status = unsafe { ffi::xapian2_tg_set_max_word_length(self.handle(), n) };
+        Error::from_status(status)
+    }
+
     /// Start indexing into a fresh document (the given document's data and
     /// values are kept; indexed terms accumulate on the copy the generator
     /// holds). Call this before each document's
@@ -893,9 +1021,23 @@ impl WritableDatabase {
     /// Create or open a writable database at `path` (a directory, for the
     /// default glass backend).
     pub fn create(path: impl AsRef<Path>) -> Result<Self> {
+        Self::create_with_flags(path, 0)
+    }
+
+    /// Create or open a writable database at `path` with explicit open flags
+    /// (a passthrough of the `Xapian::DB_*` bits; see [`wdb_flags`]).
+    ///
+    /// libzim's indexers build their throwaway per-index databases at a
+    /// temporary path with
+    /// `DB_CREATE_OR_OVERWRITE | DB_NO_TERMLIST` (`0x21`) - overwrite any
+    /// stale database and skip the per-document term lists, which nothing
+    /// reads back once the index is compacted to the single file embedded in
+    /// the ZIM archive.
+    pub fn create_with_flags(path: impl AsRef<Path>, flags: i32) -> Result<Self> {
         let c_path = cstr(&path.as_ref().to_string_lossy())?;
-        // SAFETY: see Database::open_with_flags.
-        let ptr = unsafe { ffi::xapian2_wdb_open(c_path.as_ptr(), 0) };
+        // SAFETY: c_path is a valid NUL-terminated string for the duration
+        // of the call; Xapian copies it.
+        let ptr = unsafe { ffi::xapian2_wdb_open(c_path.as_ptr(), flags as c_int) };
         Error::from_ptr(ptr, "failed to open writable database").map(|ptr| Self { ptr })
     }
 
@@ -925,6 +1067,47 @@ impl WritableDatabase {
     pub fn commit(&mut self) -> Result<()> {
         // SAFETY: the handle is valid for the lifetime of `self`.
         let status = unsafe { ffi::xapian2_wdb_commit(self.handle()) };
+        Error::from_status(status)
+    }
+
+    /// Store `value` under `key` in the database's user metadata (an empty
+    /// value removes the key); read it back with
+    /// [`Database::get_metadata`].
+    ///
+    /// libzim's indexers record `valuesmap`, `kind`, `data`, `language` and
+    /// `stopwords` this way before committing; ZIM readers read the same
+    /// keys back to interpret the index.
+    pub fn set_metadata(&mut self, key: &str, value: &str) -> Result<()> {
+        let key_bytes = key.as_bytes();
+        let value_bytes = value.as_bytes();
+        // SAFETY: both byte slices are valid for the duration of the call;
+        // the shim copies them.
+        let status = unsafe {
+            ffi::xapian2_wdb_set_metadata(
+                self.handle(),
+                key_bytes.as_ptr() as *const _,
+                key_bytes.len() as u32,
+                value_bytes.as_ptr() as *const _,
+                value_bytes.len() as u32,
+            )
+        };
+        Error::from_status(status)
+    }
+
+    /// Produce a compacted **single-file** glass database at path `output`,
+    /// written with the FULL compaction level - the path form of what libzim's
+    /// `XapianIndexer::indexingPostlude` runs after the final commit
+    /// (`db.compact(indexPath, DBCOMPACT_SINGLE_FILE | Compactor::FULL)`),
+    /// producing exactly the item libzim embeds in a ZIM archive as its
+    /// `X/<name>/xapian` entry.
+    ///
+    /// The output is openable with [`Database::open_at`]`(&output, 0, ..)`
+    /// (Xapian 2.x has no single-file-by-path open).
+    pub fn compact_to_path(&self, output: impl AsRef<Path>) -> Result<()> {
+        let c_out = cstr(&output.as_ref().to_string_lossy())?;
+        // SAFETY: c_out is a valid NUL-terminated string for the duration of
+        // the call; Xapian copies it.
+        let status = unsafe { ffi::xapian2_wdb_compact_single_file_full(self.handle(), c_out.as_ptr()) };
         Error::from_status(status)
     }
 

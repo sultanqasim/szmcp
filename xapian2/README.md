@@ -21,15 +21,15 @@ there is no `open_memview`, the default query operator is `Or`, etc.).
 
 | Type | Key methods | Send / Sync |
 | --- | --- | --- |
-| `Database` | `open(path)`, `open_at(path, offset)`, `doc_count()`, `average_length()`, `doc_length(id)`, `termfreq(t)`, `wdf(id, t)`, `get_document(id)`, `compact_to(dir)`, `compact_single_file(path)` | `Send` only |
-| `Document` | `id()`, `data()`, `value(slot)`, `termlist_count()`, `set_data/add_term/set_value` (mutable) | `Send` only |
+| `Database` | `open(path)`, `open_at(path, offset)`, `doc_count()`, `average_length()`, `doc_length(id)`, `termfreq(t)`, `wdf(id, t)`, `get_document(id)`, `get_metadata(key)`, `compact_to(dir)`, `compact_single_file(path)` | `Send` only |
+| `Document` | `id()`, `data()`, `value(slot)`, `termlist_count()`, `indexed_text_size()`, `set_data/add_term/remove_term/set_value` (mutable) | `Send` only |
 | `Query` | `term(t)`, `match_all()`, `combine(op, a, b)`, `terms()` | `Send + Sync` |
 | `QueryParser` | `new()`, `parse_query(s)`, `set_default_op(op)`, `add_prefix`, `add_boolean_prefix`, `set_stemmer`, `set_database` | `Send` only |
 | `Enquire` | `new(&db)`, `new_writable(&wdb)`, `set_query(&q)`, `set_sort_by_relevance()`, `set_weighting(scheme, params)`, `get_mset(first, max, atleast)` | `Send` only |
 | `MSet` | `size()`, `docid/weight/percent/rank(i)`, `termfreq(t)`, `document(i)`, `iter()` | `Send + Sync` |
-| `WritableDatabase` | `create(path)`, `in_memory()`, `add_document(&doc)`, `commit()` (minimal, for tests/tooling) | `Send` only |
+| `WritableDatabase` | `create(path)`, `create_with_flags(path, flags)` (`wdb_flags`, e.g. `DB_CREATE_OR_OVERWRITE \| DB_NO_TERMLIST` = 0x21), `set_metadata(key, value)`, `compact_to_path(path)` (single-file, `DBCOMPACT_SINGLE_FILE \| Compactor::FULL` - what libzim's indexer does), `in_memory()`, `add_document(&doc)`, `commit()` | `Send` only |
 | `bm25_weight` | free function: Xapian 2.0's default BM25 for one document from collection statistics (the pooled re-ranking behind `szmcp`'s cross-archive full-text merge) | pure `f64` math |
-| `TermGenerator` | `new()`, `set_stemmer(lang)`, `set_stemming_strategy(strategy)`, `set_document(&doc)`, `index_text_without_positions(text)`, `get_document()` | `Send` only |
+| `TermGenerator` | `new()`, `set_stemmer(lang)`, `set_stemming_strategy(strategy)`, `set_flags(flags)` (`tg_flags::FLAG_NGRAMS` = 2048, CJK ngram indexing), `set_max_word_length(n)`, `set_document(&doc)`, `index_text_without_positions(text)`, `get_document()` | `Send` only |
 
 Errors: Xapian exceptions are captured per-thread and surfaced as
 `xapian2::Error` (implements `std::error::Error`, so `?` works into
