@@ -450,7 +450,8 @@ mod tests {
         )
         .unwrap();
         let result = block_on(ZimGetTool::invoke(&server, params)).unwrap();
-        assert_eq!(result.title, "Apple");
+        // Dirent title "Apple" == path (omitted by the writer) -> full path.
+        assert_eq!(result.title, "C/Apple");
         assert_eq!(result.path, "C/Apple");
         assert!(result.content.contains("10,000 years"));
 
@@ -492,7 +493,8 @@ mod tests {
         )
         .unwrap();
         let result = block_on(ZimGetDirTool::invoke(&server, params)).unwrap();
-        assert_eq!(result.title, "Banana");
+        // Dirent title "Banana" == path (omitted by the writer) -> full path.
+        assert_eq!(result.title, "C/Banana");
 
         // Unfiltered, the search covers all archives; with the filter, only
         // the named file is searched.

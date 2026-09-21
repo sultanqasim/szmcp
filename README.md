@@ -142,6 +142,61 @@ depending on the article's MIME type, so Markdown articles yield clean
 plain-text search text and Markdown section content; everything else
 behaves the same.
 
+## Converting an HTML ZIM to Markdown (`convert`)
+
+`szmcp convert` is a Rust port of `wikizim_parser/zim2zim.py`: one streaming
+pass over the source archive converts every `text/html` article to Markdown
+(`text/markdown`, same paths, infoboxes on), recreates every redirect whose
+chain resolves to a source HTML article (targets resolved transitively,
+cycle-safe), copies the core metadata and the 48x48 illustration, and builds
+fresh fulltext + title Xapian indexes exactly like libzim 9.8.2 does (values
+slots, anchor-term title indexing with positions, FLAG_CJK_NGRAM, stemmer
+chosen via the ICU primary language of the source's `Language` metadata,
+DB_NO_TERMLIST + single-file compaction, index language metadata = the raw
+code). Core metadata keys are copied verbatim; the accent folding libzim
+expects is always applied to the indexed text.
+
+```
+szmcp convert <input.zim> <output.zim> [--limit N] [--index-intro-only] [--index-redirect-titles]
+```
+
+- `--limit N` processes only the first N source entries (every entry counts
+  one) — a development aid; articles beyond the cutoff are not converted, so
+  the output may contain dangling redirects (dropped at finalization).
+- `--index-intro-only` fulltext-indexes each article's intro (title line plus
+  paragraphs before the first `## ` heading, hatnotes removed) instead of the
+  whole Markdown.
+- `--index-redirect-titles` gives recreated redirects the FRONT_ARTICLE hint
+  so their titles enter the title index (default: excluded, zim2zim's
+  `--no-redirect-titles` behavior; redirects resolve either way).
+- Progress and the summary go to stderr; the output is a ZIM 6.x archive
+  readable by libzim/Kiwix and this tool.
+
+Verified against python `zim2zim.py` reference builds of the same input
+(`--limit 3000`, with and without redirect titles, and with
+`--index-intro-only`): header fields, checksum, mime list, the full dirent
+sequence (paths, stored titles, mime strings, resolved redirect targets),
+metadata values, `M/Counter`, the title-ordered listing (byte-equal), index
+document counts, per-document data/value slots (title docs identical in
+docid order; fulltext compared keyed by path) and term sets with posting
+statistics all match, except for the divergences below.
+
+Divergences from the python reference, all deliberate or inherent:
+
+- Fulltext documents are added in deterministic conversion order; libzim
+  adds them from racing worker threads (the doc *sets* are equal).
+- No stopword lists are bundled — matching zim2zim's ZIMs, whose 3-letter
+  language codes never load a libzim stopword resource.
+- Accent folding is simplified: only Latin combining marks
+  (U+0300..U+036F) are stripped. zim2zim strips every Unicode mark, which
+  also normalizes Arabic-script words (`إ` → `ا`, kasras dropped), so
+  Arabic-script etymology terms differ from the python build's.
+- The stemmer is Xapian 2.0.0's bundled Snowball; the python reference
+  bundles Xapian 1.4.23. Stem forms differ for some languages — including
+  English (`university` → `universiti`, `internal` → `internal` vs
+  `intern`), so a few Z-prefixed title terms and fulltext stems differ;
+  surface forms, document sets and counts do not.
+
 ## Build
 
 Requires a [Xapian 2.x](https://xapian.org/) installation (e.g. `brew install

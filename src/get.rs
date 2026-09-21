@@ -241,7 +241,10 @@ mod tests {
         )
         .unwrap();
         let result = block_on(ZimGetDirTool::invoke(&server, params)).unwrap();
-        assert_eq!(result.title, "Apple");
+        // The dirent title "Apple" equals the path, so the writer's
+        // tiny-string packing omits it and the tool reports the full path
+        // (the shape every modern openZIM archive produces).
+        assert_eq!(result.title, "C/Apple");
         assert_eq!(result.path, "C/Apple");
         assert_eq!(result.mime_type.as_deref(), Some("text/html"));
         assert_eq!(result.content_encoding, "utf-8");
@@ -303,7 +306,8 @@ mod tests {
         .unwrap();
         let result = block_on(ZimGetDirTool::invoke(&server, params)).unwrap();
         assert_eq!(result.path, "C/Salt");
-        assert_eq!(result.title, "Salt");
+        // Dirent title "Salt" == path (omitted by the writer) -> full path.
+        assert_eq!(result.title, "C/Salt");
 
         // A multi-word title maps to the underscored path - a bare path
         // containing a space could never resolve by itself.
@@ -322,7 +326,8 @@ mod tests {
         .unwrap();
         let result = block_on(ZimGetSectionDirTool::invoke(&server, params)).unwrap();
         assert_eq!(result.section, "_intro");
-        assert_eq!(result.title, "Salt");
+        // Dirent title "Salt" == path (omitted by the writer) -> full path.
+        assert_eq!(result.title, "C/Salt");
         assert!(result.content.contains("Salt is a mineral"), "{:?}", result.content);
 
         // A title that matches nothing errors with the converted path.
@@ -407,7 +412,8 @@ mod tests {
         )
         .unwrap();
         let result = block_on(ZimGetSectionDirTool::invoke(&server, params)).unwrap();
-        assert_eq!(result.title, "Apple");
+        // Dirent title "Apple" == path (omitted by the writer) -> full path.
+        assert_eq!(result.title, "C/Apple");
         assert_eq!(result.section, "History");
         assert!(result.content.contains("10,000 years"), "{:?}", result.content);
         // Includes the subsection, stops at the next h2.

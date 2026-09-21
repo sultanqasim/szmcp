@@ -289,6 +289,23 @@ uint32_t xapian2_doc_termlist_count(const XDoc *d) {
     return 0;
 }
 
+// The document's first termlist term (libzim's title-index collapse removes
+// *termlist_begin(), not the ANCHOR_TERM literal, whose trailing space never
+// reaches a stored term). Empty result + *ok = 0 on error.
+const char *xapian2_doc_first_term(XDoc *d, uint32_t *out_len, int *ok) {
+    try {
+        *ok = 1;
+        d->scratch = *d->doc.termlist_begin();
+        *out_len = static_cast<uint32_t>(d->scratch.size());
+        return d->scratch.data();
+    } catch (const Xapian::Error &e) {
+        g_error = describe(e);
+        *ok = 0;
+    }
+    *out_len = 0;
+    return nullptr;
+}
+
 // libzim's sizeOfIndexedText (writer/xapianIndexer.cpp): the indexed volume
 // the title-abort check compares against - the sum over the document's terms,
 // excluding the Z-prefixed stems, of wdf * term length. `ok` is 0 when Xapian
@@ -445,11 +462,30 @@ int xapian2_tg_set_document(XTermGen *tg, const XDoc *d) {
 }
 
 // Index `text` into the current document without positional data (the ZIM
-// full-text indexes carry none either, and positions cost memory).
+// full-text indexes carry none either, and positions cost memory). Each
+// occurrence counts `wdf_inc` toward the term's within-document frequency -
+// libzim's fulltext indexer re-indexes the title at
+// getTitleBoostFactor(content length) = content.size()/500 + 1.
 int xapian2_tg_index_text_without_positions(XTermGen *tg, const char *text,
-                                            uint32_t len) {
+                                            uint32_t len, uint32_t wdf_inc) {
     try {
-        tg->tg.index_text_without_positions(std::string_view(text, len));
+        tg->tg.index_text_without_positions(
+            std::string_view(text, len), static_cast<Xapian::termcount>(wdf_inc));
+        return 0;
+    } catch (const Xapian::Error &e) {
+        g_error = describe(e);
+    }
+    return -1;
+}
+
+// Index `text` into the current document WITH positional data (wdf per
+// occurrence = `wdf_inc`): what libzim's title indexer runs
+// ("0posanchor " + title, weight 1) so the title words carry positions.
+int xapian2_tg_index_text(XTermGen *tg, const char *text, uint32_t len,
+                          uint32_t wdf_inc) {
+    try {
+        tg->tg.index_text(std::string_view(text, len),
+                          static_cast<Xapian::termcount>(wdf_inc));
         return 0;
     } catch (const Xapian::Error &e) {
         g_error = describe(e);

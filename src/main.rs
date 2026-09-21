@@ -1,10 +1,12 @@
 mod cleanup;
+mod convert;
 mod entities;
 mod get;
 mod html;
 mod html2md;
 mod htmldom;
 mod infobox_html;
+mod lang_map;
 mod markdown;
 mod search;
 mod tables;
@@ -12,6 +14,8 @@ mod tools;
 mod util;
 mod wikil10n;
 mod zim;
+mod zimcommon;
+mod zimwrite;
 
 use clap::{Parser, Subcommand};
 use get::{get_article, get_section};
@@ -76,6 +80,30 @@ enum Command {
         /// instead (only affects text/html pages)
         #[arg(long)]
         raw: bool,
+    },
+    /// Convert an HTML ZIM into a ZIM of Markdown articles with fresh
+    /// search indexes (a port of wikizim_parser's zim2zim.py)
+    Convert {
+        /// Path to the source ZIM file (HTML articles)
+        input_zim: PathBuf,
+        /// Path of the ZIM file to write
+        output_zim: PathBuf,
+        /// Process only the first N entries of the source, counting every
+        /// entry alike (articles, redirects, media, metadata; -1 = all).
+        /// Development/testing aid: articles beyond the cutoff are not
+        /// converted, so the output may contain dangling redirects
+        #[arg(long, default_value_t = -1)]
+        limit: i64,
+        /// Full-text-index only each article's intro (lead before the first
+        /// "## " heading, hatnotes removed, title kept) instead of the whole
+        /// Markdown; shrinks the index, keeps lead-level search
+        #[arg(long = "index-intro-only")]
+        index_intro_only: bool,
+        /// Include redirect titles in the title index (default: exclude
+        /// them, zim2zim's --no-redirect-titles behavior; redirects still
+        /// resolve)
+        #[arg(long = "index-redirect-titles")]
+        index_redirect_titles: bool,
     },
     /// Get one section of an article from a ZIM file, by its heading text
     GetSection {
@@ -167,6 +195,11 @@ async fn run(command: Command) -> Result<(), String> {
             } else {
                 print_result(&result)
             }
+        }
+        Command::Convert { input_zim, output_zim, limit, index_intro_only, index_redirect_titles } => {
+            // Synchronous, blocking: no await point is involved (the tokio
+            // runtime simply hosts this call).
+            convert::convert(&input_zim, &output_zim, limit, index_intro_only, index_redirect_titles)
         }
         Command::GetSection { zim_path, path, section, content, raw } => {
             let library = open_single_zim(&zim_path)?;

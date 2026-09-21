@@ -101,6 +101,7 @@ mod ffi {
         pub fn xapian2_doc_set_value(d: *mut c_void, slot: u32, value: *const c_char, len: u32) -> c_int;
         pub fn xapian2_doc_id(d: *mut c_void) -> u32;
         pub fn xapian2_doc_termlist_count(d: *mut c_void) -> u32;
+        pub fn xapian2_doc_first_term(d: *mut c_void, out_len: *mut u32, ok: *mut c_int) -> *const c_char;
         pub fn xapian2_doc_indexed_text_size(d: *mut c_void, ok: *mut c_int) -> u64;
         pub fn xapian2_doc_data(d: *mut c_void, out_len: *mut u32) -> *const c_char;
         pub fn xapian2_doc_value(d: *mut c_void, slot: u32, out_len: *mut u32) -> *const c_char;
@@ -132,6 +133,13 @@ mod ffi {
             tg: *mut c_void,
             text: *const c_char,
             len: u32,
+            wdf_inc: u32,
+        ) -> c_int;
+        pub fn xapian2_tg_index_text(
+            tg: *mut c_void,
+            text: *const c_char,
+            len: u32,
+            wdf_inc: u32,
         ) -> c_int;
         pub fn xapian2_tg_get_document(tg: *mut c_void) -> *mut c_void;
         pub fn xapian2_tg_free(tg: *mut c_void);
@@ -697,6 +705,24 @@ impl Document {
         String::from_utf8(self.data()?).map_err(|e| Error::new(e.to_string()))
     }
 
+    /// The document's first termlist term, or an error when the termlist is
+    /// empty/unreadable. This is what libzim's title indexer removes when a
+    /// title indexes to a single term (the stored anchor term, whose trailing
+    /// space never becomes part of a Xapian term).
+    pub fn first_term(&self) -> Result<String> {
+        let mut len = 0u32;
+        let mut ok = 0;
+        // SAFETY: the handle is valid; `len`/`ok` are written before return.
+        let ptr = unsafe { ffi::xapian2_doc_first_term(self.handle(), &mut len, &mut ok) };
+        if ok == 0 || ptr.is_null() {
+            return Err(Error::last_error("failed to read the document's first term"));
+        }
+        // SAFETY: the shim guarantees `len` bytes at `ptr`, valid until the
+        // next call on this document.
+        let bytes = unsafe { std::slice::from_raw_parts(ptr as *const u8, len as usize).to_vec() };
+        String::from_utf8(bytes).map_err(|e| Error::new(e.to_string()))
+    }
+
     /// The value stored in `slot` (Xapian value slots are 0-based), or
     /// empty if none is set.
     pub fn value(&mut self, slot: u32) -> Result<Vec<u8>> {
@@ -970,6 +996,19 @@ impl TermGenerator {
     /// word occurrence bumps its term's within-document frequency and the
     /// document length, like the indexer libzim runs over ZIM article text.
     pub fn index_text_without_positions(&mut self, text: &str) -> Result<()> {
+        self.index_text_without_positions_with_wdf(text, 1)
+    }
+
+    /// [`index_text_without_positions`][Self::index_text_without_positions]
+    /// with an explicit per-occurrence weight: libzim's fulltext indexer
+    /// re-indexes the title at `getTitleBoostFactor(contentLength)` =
+    /// `content.size()/500 + 1` so titles rank proportionally to the article
+    /// they lead.
+    pub fn index_text_without_positions_with_wdf(
+        &mut self,
+        text: &str,
+        wdf_inc: u32,
+    ) -> Result<()> {
         let bytes = text.as_bytes();
         // SAFETY: `bytes` is a valid byte slice; the shim copies it.
         let status = unsafe {
@@ -977,6 +1016,28 @@ impl TermGenerator {
                 self.handle(),
                 bytes.as_ptr() as *const _,
                 bytes.len() as u32,
+                wdf_inc,
+            )
+        };
+        Error::from_status(status)
+    }
+
+    /// Index `text` into the current document **with positional data**: each
+    /// word occurrence stores its position (at `wdf_inc` weight), the way
+    /// libzim's title indexer runs `"0posanchor " + unaccentedTitle` with
+    /// weight 1 - the anchor term plus positions let a reader tell whether
+    /// the document indexed only the anchor (a title with no word
+    /// characters). TermGenerator supports positional indexing for one text
+    /// per document; libzim uses it for titles only.
+    pub fn index_text(&mut self, text: &str, wdf_inc: u32) -> Result<()> {
+        let bytes = text.as_bytes();
+        // SAFETY: `bytes` is a valid byte slice; the shim copies it.
+        let status = unsafe {
+            ffi::xapian2_tg_index_text(
+                self.handle(),
+                bytes.as_ptr() as *const _,
+                bytes.len() as u32,
+                wdf_inc,
             )
         };
         Error::from_status(status)

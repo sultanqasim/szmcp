@@ -72,7 +72,7 @@ pub struct SearchResults {
 /// U+0300..=U+036F are stripped - every mark a Latin, Greek, or Cyrillic
 /// letter decomposes to sits in that range, no measured archive carries
 /// more (Hebrew nikkud, Arabic harakat, Indic signs).
-fn fold_accents(text: &str) -> String {
+pub(crate) fn fold_accents(text: &str) -> String {
     use unicode_normalization::UnicodeNormalization;
     text.to_lowercase()
         .nfd()

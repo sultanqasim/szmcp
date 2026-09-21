@@ -16,11 +16,12 @@ use std::sync::{Arc, Mutex, OnceLock};
 
 use xapian2::Database as XapianDatabase;
 
-const ZIM_MAGIC: u32 = 72173914;
-/// Directory-entry mimetype sentinels.
-const MIME_REDIRECT: u16 = 0xffff;
-const MIME_LINKTARGET: u16 = 0xfffe;
-const MIME_DELETED: u16 = 0xfffd;
+use crate::zimcommon::{
+    dirent_order, u16le, u32le, u64le, CLUSTER_COMPRESSION_MASK, CLUSTER_EXTENDED_BIT,
+    CLUSTER_LZMA, CLUSTER_UNCOMPRESSED, CLUSTER_ZSTD, MIME_DELETED, MIME_LINKTARGET,
+    MIME_REDIRECT, ZIM_MAGIC,
+};
+
 const MAX_REDIRECT_HOPS: u32 = 50;
 /// Upper bound on how much of a directory entry we ever need to read.
 const DIRENT_WINDOW: u64 = 64 * 1024;
@@ -135,18 +136,9 @@ impl Store {
     }
 }
 
-/// Parsed ZIM header (the fields we care about).
-#[derive(Debug, Clone)]
-pub struct Header {
-    pub major: u16,
-    pub minor: u16,
-    pub entry_count: u32,
-    pub cluster_count: u32,
-    pub url_ptr_pos: u64,
-    pub cluster_ptr_pos: u64,
-    pub mime_list_pos: u64,
-    pub checksum_pos: u64,
-}
+/// The parsed ZIM file header: the shared [`crate::zimcommon::ZimHeader`],
+/// so the reader and the writer speak the same field names.
+pub use crate::zimcommon::ZimHeader;
 
 /// What a directory entry points at.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -181,7 +173,7 @@ struct BlobLocation {
 /// A ZIM archive.
 pub struct Zim {
     store: Store,
-    pub header: Header,
+    pub header: ZimHeader,
     mime_types: Vec<String>,
 }
 
@@ -198,19 +190,6 @@ fn upper_first(s: &str) -> String {
 /// the shape MediaWiki gives article URLs.
 fn title_case(s: &str) -> String {
     s.split('_').map(upper_first).collect::<Vec<_>>().join("_")
-}
-
-#[inline]
-fn u16le(b: &[u8]) -> u16 {
-    u16::from_le_bytes([b[0], b[1]])
-}
-#[inline]
-fn u32le(b: &[u8]) -> u32 {
-    u32::from_le_bytes([b[0], b[1], b[2], b[3]])
-}
-#[inline]
-fn u64le(b: &[u8]) -> u64 {
-    u64::from_le_bytes(b.try_into().unwrap())
 }
 
 /// Read a blob-table entry (`sz` = 4 or 8 bytes wide) at byte offset `off`.
@@ -233,10 +212,10 @@ struct ClusterDecoder<'a> {
 impl<'a> ClusterDecoder<'a> {
     fn new(compression: u8, body: &'a [u8]) -> io::Result<ClusterDecoder<'a>> {
         let stream: Box<dyn io::Read + 'a> = match compression {
-            5 => Box::new(zstd::stream::read::Decoder::with_buffer(body)?),
+            CLUSTER_ZSTD => Box::new(zstd::stream::read::Decoder::with_buffer(body)?),
             // liblzma's auto decoder transparently handles the LZMA
             // streams ZIM clusters store.
-            4 => Box::new(xz2::read::XzDecoder::new(body)),
+            CLUSTER_LZMA => Box::new(xz2::read::XzDecoder::new(body)),
             other => {
                 return Err(io::Error::new(
                     ErrorKind::InvalidData,
@@ -307,16 +286,7 @@ impl Zim {
         if hlen < 80 || u32le(&hdr[0..4]) != ZIM_MAGIC {
             return Err(io::Error::new(ErrorKind::InvalidData, format!("not a ZIM file: {}", path.display())));
         }
-        let header = Header {
-            major: u16le(&hdr[4..6]),
-            minor: u16le(&hdr[6..8]),
-            entry_count: u32le(&hdr[24..28]),
-            cluster_count: u32le(&hdr[28..32]),
-            url_ptr_pos: u64le(&hdr[32..40]),
-            cluster_ptr_pos: u64le(&hdr[48..56]),
-            mime_list_pos: u64le(&hdr[56..64]),
-            checksum_pos: u64le(&hdr[72..80]),
-        };
+        let header = ZimHeader::parse(&hdr);
         if !(5..=6).contains(&header.major) {
             return Err(io::Error::new(
                 ErrorKind::InvalidData,
@@ -418,7 +388,10 @@ impl Zim {
         while lo < hi {
             let mid = lo + (hi - lo) / 2;
             let entry = self.get_entry(mid)?;
-            let ord = (entry.namespace, entry.url.as_bytes()).cmp(&(namespace, url.as_bytes()));
+            let ord = dirent_order(
+                (entry.namespace, entry.url.as_bytes()),
+                (namespace, url.as_bytes()),
+            );
             match ord {
                 std::cmp::Ordering::Less => lo = mid + 1,
                 _ => hi = mid,
@@ -487,11 +460,11 @@ impl Zim {
     fn locate_blob(&self, cluster: u32, blob: u32) -> io::Result<BlobLocation> {
         let (start, end) = self.cluster_range(cluster)?;
         let info = self.store.read(start, 1)?[0];
-        let compression = info & 0x0f;
-        if compression != 0 && compression != 1 {
+        let compression = info & CLUSTER_COMPRESSION_MASK;
+        if compression != 0 && compression != CLUSTER_UNCOMPRESSED {
             return Ok(BlobLocation { compression, file_offset: None, length: 0 });
         }
-        let sz = if (info & 0x10) != 0 { 8 } else { 4 }; // 64-bit blob offsets
+        let sz = if (info & CLUSTER_EXTENDED_BIT) != 0 { 8 } else { 4 }; // 64-bit blob offsets
         let tbl0 = start + 1 + blob as u64 * sz;
         let (s0, s1) = if sz == 8 {
             let a = u64le(&self.store.read(tbl0, 8)?);
@@ -528,7 +501,7 @@ impl Zim {
         let (start, end) = self.cluster_range(cluster)?;
         let body = self.store.read(start + 1, end - start - 1)?;
         let info = self.store.read(start, 1)?[0];
-        let sz = if (info & 0x10) != 0 { 8 } else { 4 }; // 64-bit blob offsets
+        let sz = if (info & CLUSTER_EXTENDED_BIT) != 0 { 8 } else { 4 }; // 64-bit blob offsets
         let mut dec = ClusterDecoder::new(loc.compression, body.as_ref())?;
         // The decompressed data starts with the blob-offset table, whose
         // first entry gives the table's own byte size; blob data follows.
@@ -1078,22 +1051,6 @@ pub(crate) mod testutil {
         TestEntry { namespace: b'M', url: "Language", title: "", mime: 0, body: code.as_bytes() }
     }
 
-    fn push_zstring(buf: &mut Vec<u8>, s: &str) {
-        buf.extend_from_slice(s.as_bytes());
-        buf.push(0);
-    }
-
-    /// Build an uncompressed single-blob cluster body for `data`.
-    fn build_cluster(data: &[u8]) -> Vec<u8> {
-        let mut c = Vec::new();
-        c.push(0u8); // info byte: comp=0 (uncompressed), not extended.
-        let first = 8u32; // 2 offsets * 4 bytes.
-        c.extend_from_slice(&first.to_le_bytes());
-        c.extend_from_slice(&(first + data.len() as u32).to_le_bytes());
-        c.extend_from_slice(data);
-        c
-    }
-
     /// Build a minimal archive whose only cluster stores `blobs` under
     /// `compression` (4 = lzma, 5 = zstd), for compressed-read tests.
     fn build_cluster_archive(compression: u8, blobs: &[&[u8]]) -> Vec<u8> {
@@ -1111,14 +1068,14 @@ pub(crate) mod testutil {
         }
         let mut cluster = vec![compression]; // info byte
         match compression {
-            4 => {
+            CLUSTER_LZMA => {
                 std::io::Read::read_to_end(
                     &mut xz2::read::XzEncoder::new(data.as_slice(), 6),
                     &mut cluster,
                 )
                 .unwrap();
             }
-            5 => cluster.extend_from_slice(&zstd::encode_all(data.as_slice(), 0).unwrap()),
+            CLUSTER_ZSTD => cluster.extend_from_slice(&zstd::encode_all(data.as_slice(), 0).unwrap()),
             _ => cluster.extend_from_slice(&data),
         }
         // Header for one cluster and no directory entries; `read_blob_prefix`
@@ -1154,10 +1111,25 @@ pub(crate) mod testutil {
         build_archive_indexes(mime_types, content, redirects, main_page_content, index, None)
     }
 
-    /// Assemble a complete in-memory ZIM. `fulltext_index`/`title_index`,
+    /// Assemble a complete in-memory ZIM by writing it with the crate's own
+    /// ZIM writer ([`crate::zimwrite::ZimCreator`]) — the tests therefore
+    /// exercise reader and writer against each other instead of maintaining
+    /// a second hand-rolled byte assembler. `fulltext_index`/`title_index`,
     /// when given, are stored as uncompressed `X/fulltext/xapian` /
-    /// `X/title/xapian` content entries (single-blob clusters), like a real
-    /// archive's embedded Xapian databases.
+    /// `X/title/xapian` content entries, like a real archive's embedded
+    /// Xapian databases.
+    ///
+    /// Differences from a fully explicit byte assembly (both are libzim's
+    /// own creator semantics, not accidents):
+    /// - the archive gains the writer's standard `M/Counter` and
+    ///   `X/listing/titleOrdered/v1` entries, and its MIME list is sorted;
+    /// - a dirent title equal to the path is omitted from the bytes
+    ///   (libzim's tiny-string packing), so such entries read back with an
+    ///   empty title and callers apply their usual title fallbacks;
+    /// - `main_page_content` is accepted for helper API compatibility but
+    ///   unused: the synthetic fixtures never read the header's mainPage
+    ///   field (the writer only sets it via a `W/mainPage` redirect, which
+    ///   would change the dirent set the convert fixtures assert on).
     pub fn build_archive_indexes(
         mime_types: &[&str],
         content: &[TestEntry],
@@ -1166,151 +1138,40 @@ pub(crate) mod testutil {
         fulltext_index: Option<&[u8]>,
         title_index: Option<&[u8]>,
     ) -> Vec<u8> {
-        let has_index = fulltext_index.is_some();
-        let has_title_index = title_index.is_some();
-        let entry_count = (content.len() + redirects.len() + has_index as usize + has_title_index as usize) as u32;
-        let cluster_count = (content.len() + has_index as usize + has_title_index as usize) as u32;
-
-        let mut mime_blob = Vec::new();
-        for m in mime_types {
-            push_zstring(&mut mime_blob, m);
-        }
-        mime_blob.push(0);
-
-        enum Logical<'a> {
-            Content { e: &'a TestEntry, cluster: u32 },
-            Redirect { r: &'a TestRedirect },
-            Index { url: &'static str, cluster: u32 },
-        }
-        let mut logical: Vec<(u8, &str, Logical)> = Vec::new();
-        for (ci, e) in content.iter().enumerate() {
-            logical.push((e.namespace, e.url, Logical::Content { e, cluster: ci as u32 }));
+        let _ = main_page_content;
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("fixture.zim");
+        let mut zc = crate::zimwrite::ZimCreator::new(&out).unwrap();
+        for e in content {
+            zc.add_item_in_namespace(
+                e.namespace,
+                e.url,
+                e.title,
+                mime_types[e.mime as usize],
+                // Store fixture bodies uncompressed, like the hand-rolled
+                // builder did; the reader handles both cluster kinds.
+                false,
+                e.namespace == b'C',
+                e.body.to_vec(),
+            )
+            .unwrap();
         }
         for r in redirects {
-            logical.push((r.namespace, r.url, Logical::Redirect { r }));
+            // Test redirects always point at C-namespace articles: that is
+            // the only shape `ZimCreator::add_redirection` writes (libzim's
+            // user-facing redirections are C-only too).
+            assert_eq!(r.namespace, b'C', "test redirects are C-namespace");
+            zc.add_redirection(r.url, r.title, content[r.target_content].url, true)
+                .unwrap();
         }
-        let mut next_cluster = content.len() as u32;
-        if let Some(_ix) = fulltext_index {
-            logical.push((b'X', "fulltext/xapian", Logical::Index { url: "fulltext/xapian", cluster: next_cluster }));
-            next_cluster += 1;
-        }
-        if let Some(_ix) = title_index {
-            logical.push((b'X', "title/xapian", Logical::Index { url: "title/xapian", cluster: next_cluster }));
-        }
-        logical.sort_by(|a, b| (a.0, a.1).cmp(&(b.0, b.1)));
-
-        let mut index_of_url: std::collections::HashMap<(u8, &str), u32> = std::collections::HashMap::new();
-        for (i, (ns, url, _)) in logical.iter().enumerate() {
-            index_of_url.insert((*ns, *url), i as u32);
-        }
-
-        let mut entry_bodies: Vec<Vec<u8>> = Vec::new();
-        for (ns, _url, item) in &logical {
-            let mut b = Vec::new();
-            match item {
-                Logical::Content { e, cluster } => {
-                    b.extend_from_slice(&e.mime.to_le_bytes());
-                    b.push(0);
-                    b.push(*ns);
-                    b.extend_from_slice(&0u32.to_le_bytes());
-                    b.extend_from_slice(&cluster.to_le_bytes());
-                    b.extend_from_slice(&0u32.to_le_bytes());
-                    push_zstring(&mut b, e.url);
-                    push_zstring(&mut b, e.title);
-                }
-                Logical::Redirect { r } => {
-                    let target = index_of_url[&(
-                        content[r.target_content].namespace,
-                        content[r.target_content].url,
-                    )];
-                    b.extend_from_slice(&MIME_REDIRECT.to_le_bytes());
-                    b.push(0);
-                    b.push(*ns);
-                    b.extend_from_slice(&0u32.to_le_bytes());
-                    b.extend_from_slice(&target.to_le_bytes());
-                    push_zstring(&mut b, r.url);
-                    push_zstring(&mut b, r.title);
-                }
-                Logical::Index { url, cluster } => {
-                    b.extend_from_slice(&0u16.to_le_bytes());
-                    b.push(0);
-                    b.push(*ns);
-                    b.extend_from_slice(&0u32.to_le_bytes());
-                    b.extend_from_slice(&cluster.to_le_bytes());
-                    b.extend_from_slice(&0u32.to_le_bytes());
-                    push_zstring(&mut b, url);
-                    push_zstring(&mut b, "Xapian index");
-                }
-            }
-            entry_bodies.push(b);
-        }
-
-        let mut clusters: Vec<Vec<u8>> = content.iter().map(|e| build_cluster(e.body)).collect();
         if let Some(ix) = fulltext_index {
-            clusters.push(build_cluster(ix));
+            zc.add_xapian_index_bytes("fulltext/xapian", ix).unwrap();
         }
         if let Some(ix) = title_index {
-            clusters.push(build_cluster(ix));
+            zc.add_xapian_index_bytes("title/xapian", ix).unwrap();
         }
-
-        let mime_pos = 80u64;
-        let url_ptr_pos = mime_pos + mime_blob.len() as u64;
-        let title_ptr_pos = url_ptr_pos + entry_count as u64 * 8;
-        let cluster_ptr_pos = title_ptr_pos + entry_count as u64 * 4;
-        let entries_pos = cluster_ptr_pos + cluster_count as u64 * 8;
-
-        let mut entry_offsets = Vec::new();
-        let mut cur = entries_pos;
-        for b in &entry_bodies {
-            entry_offsets.push(cur);
-            cur += b.len() as u64;
-        }
-        let mut cluster_offsets = Vec::new();
-        for c in &clusters {
-            cluster_offsets.push(cur);
-            cur += c.len() as u64;
-        }
-        let checksum_pos = cur;
-
-        let main_page_idx = index_of_url[&(
-            content[main_page_content].namespace,
-            content[main_page_content].url,
-        )];
-
-        let mut out = vec![0u8; 80];
-        out[0..4].copy_from_slice(&ZIM_MAGIC.to_le_bytes());
-        out[4..6].copy_from_slice(&6u16.to_le_bytes()); // major
-        out[6..8].copy_from_slice(&1u16.to_le_bytes()); // minor
-        out[24..28].copy_from_slice(&entry_count.to_le_bytes());
-        out[28..32].copy_from_slice(&cluster_count.to_le_bytes());
-        out[32..40].copy_from_slice(&url_ptr_pos.to_le_bytes());
-        out[40..48].copy_from_slice(&title_ptr_pos.to_le_bytes());
-        out[48..56].copy_from_slice(&cluster_ptr_pos.to_le_bytes());
-        out[56..64].copy_from_slice(&mime_pos.to_le_bytes());
-        out[64..68].copy_from_slice(&main_page_idx.to_le_bytes());
-        out[68..72].copy_from_slice(&0xffff_ffffu32.to_le_bytes());
-        out[72..80].copy_from_slice(&checksum_pos.to_le_bytes());
-
-        out.extend_from_slice(&mime_blob);
-        for off in &entry_offsets {
-            out.extend_from_slice(&off.to_le_bytes());
-        }
-        // Title pointer list: entry_count u32 indices (URL order is good
-        // enough for the tests - szmcp never reads the title ordering).
-        for i in 0..entry_count {
-            out.extend_from_slice(&i.to_le_bytes());
-        }
-        for off in &cluster_offsets {
-            out.extend_from_slice(&off.to_le_bytes());
-        }
-        for b in &entry_bodies {
-            out.extend_from_slice(b);
-        }
-        for c in &clusters {
-            out.extend_from_slice(c);
-        }
-        out.extend_from_slice(&[0u8; 16]);
-        out
+        zc.finish().unwrap();
+        std::fs::read(&out).unwrap()
     }
 
     fn open_bytes(bytes: &[u8]) -> (Zim, tempfile::NamedTempFile) {
@@ -1360,7 +1221,10 @@ pub(crate) mod testutil {
         let (a, _f) = sample_archive();
         let art = a.get_article("Banana").unwrap();
         assert_eq!(art.bytes, b"<html><body><h2>Bananas</h2><p>A delicious fruit.</p></body></html>");
-        assert_eq!(art.title, "Banana");
+        // The dirent title "Banana" equals the path, so the writer's
+        // tiny-string packing omits it; `get_article` falls back to the
+        // full path (same value a modern openZIM archive yields).
+        assert_eq!(art.title, "C/Banana");
         assert_eq!(art.mime_type.as_deref(), Some("text/html"));
     }
 
@@ -1375,7 +1239,9 @@ pub(crate) mod testutil {
         assert!(a.get_article("/C/Apple_fruit").is_ok());
         let art = a.get_article("C/Apple_fruit").unwrap();
         assert!(art.bytes.starts_with(b"<html><head>"));
-        assert_eq!(art.title, "Apple");
+        // Terminal article C/Apple: its dirent title ("Apple") equals the
+        // path and is omitted, so the full path is the reported title.
+        assert_eq!(art.title, "C/Apple");
         assert_eq!(art.full_path, "C/Apple");
     }
     #[test]
@@ -1419,7 +1285,9 @@ pub(crate) mod testutil {
     fn preview_reads_only_prefix() {
         let (a, _f) = sample_archive();
         let (title, mime, bytes) = a.article_preview("Apple", 64).unwrap().unwrap();
-        assert_eq!(title, "Apple");
+        // `article_preview` reports the RAW dirent title; the dirent title
+        // "Apple" equals the path and is omitted by the writer.
+        assert_eq!(title, "");
         assert_eq!(mime.as_deref(), Some("text/html"));
         assert_eq!(bytes.len(), 64);
     }
@@ -1431,7 +1299,7 @@ pub(crate) mod testutil {
             b"middle blob payload, long enough to make offsets interesting",
             b"zeta-last-blob",
         ];
-        for compression in [4u8, 5] {
+        for compression in [CLUSTER_LZMA, CLUSTER_ZSTD] {
             let (z, _f) = open_bytes(&build_cluster_archive(compression, blobs));
             let (len1, len2) = (blobs[1].len() as u64, blobs[2].len() as u64);
             // max < len: truncated prefix of the first blob.
@@ -1486,7 +1354,8 @@ pub(crate) mod testutil {
         assert_eq!(lib.archives[0].name, "sample.zim");
         assert_eq!(lib.root, dir.path());
         let art = lib.archives[0].get_article("C/Apple").unwrap();
-        assert_eq!(art.title, "Apple");
+        // Dirent title "Apple" == path (omitted): the full path is reported.
+        assert_eq!(art.title, "C/Apple");
     }
 
     #[test]
