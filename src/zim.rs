@@ -26,13 +26,34 @@ use crate::zimcommon::{
 const MAX_REDIRECT_HOPS: u32 = 50;
 /// Upper bound on how much of a directory entry we ever need to read.
 const DIRENT_WINDOW: u64 = 64 * 1024;
+/// Reads at or above this size bypass the mapping (direct file I/O): the
+/// cluster bodies of a multi-GB archive would otherwise map their pages
+/// into the reader's resident set as the convert pass walks the archive.
+const BIG_READ: u64 = 256 * 1024;
 
 /// One OS file (the whole archive, or one chunk) mapped into memory.
 struct Part {
     path: PathBuf,
+    file: File,
     mmap: Mmap,
     /// Virtual offset of the start of this part within the archive.
     start: u64,
+}
+
+impl Part {
+    /// Direct unbuffered read of `len` bytes at in-file offset `off`.
+    fn pread(&self, off: u64, len: u64) -> io::Result<Vec<u8>> {
+        let mut buf = vec![0u8; len as usize];
+        self.pread_into(off, &mut buf)?;
+        Ok(buf)
+    }
+
+    fn pread_into(&self, off: u64, buf: &mut [u8]) -> io::Result<()> {
+        use std::os::unix::fs::FileExt;
+        self.file
+            .read_exact_at(buf, off)
+            .map_err(|e| io::Error::new(e.kind(), format!("pread failed: {e}")))
+    }
 }
 
 /// Read view over a (possibly chunked) ZIM archive.
@@ -52,7 +73,7 @@ impl Store {
             let mmap = unsafe { Mmap::map(&file) }
                 .map_err(|e| io::Error::new(ErrorKind::InvalidData, format!("cannot map {}: {e}", path.display())))?;
             return Ok(Store {
-                parts: vec![Part { path: path.to_path_buf(), mmap, start: 0 }],
+                parts: vec![Part { path: path.to_path_buf(), file, mmap, start: 0 }],
                 len,
             });
         }
@@ -76,7 +97,7 @@ impl Store {
                 let len = file.metadata()?.len();
                 let mmap = unsafe { Mmap::map(&file) }
                     .map_err(|e| io::Error::new(ErrorKind::InvalidData, format!("cannot map {chunk:?}: {e}")))?;
-                parts.push(Part { path: chunk, mmap, start });
+                parts.push(Part { path: chunk, file, mmap, start });
                 start += len;
             }
         }
@@ -91,7 +112,11 @@ impl Store {
     }
 
     /// Read `len` bytes at virtual offset `off`. Returns a borrowed view when
-    /// the range lies inside a single part.
+    /// the range lies inside a single part. Reads of [`BIG_READ`] bytes or
+    /// more go through direct file I/O instead of the mapping: an 8+ GB
+    /// archive's cluster pages would otherwise accumulate in this process's
+    /// page-cache-resident RSS as the convert pass touches them (clean
+    /// mapped pages the kernel only reclaims under pressure).
     fn read<'a>(&'a self, off: u64, len: u64) -> io::Result<std::borrow::Cow<'a, [u8]>> {
         if off > self.len || len > self.len - off {
             return Err(io::Error::new(ErrorKind::InvalidData, "read out of bounds in ZIM archive"));
@@ -105,18 +130,32 @@ impl Store {
         let part = &self.parts[idx];
         let rel = (off - part.start) as usize;
         let part_len = part.mmap.len();
+        if len >= BIG_READ {
+            return Ok(std::borrow::Cow::Owned(part.pread(off - part.start, len)?));
+        }
         if rel + len as usize <= part_len {
             return Ok(std::borrow::Cow::Borrowed(&part.mmap[rel..rel + len as usize]));
         }
-        // Spans part boundaries: concatenate.
-        let mut buf: Vec<u8> = part.mmap[rel..].to_vec();
-        for p in &self.parts[idx + 1..] {
-            buf.extend_from_slice(&p.mmap[..]);
+        // Spans part boundaries: pread the needed ranges.
+        let mut buf: Vec<u8> = Vec::with_capacity(len as usize);
+        let mut at = off;
+        let mut need = len;
+        for p in &self.parts[idx..] {
+            if need == 0 {
+                break;
+            }
+            let avail = p.mmap.len() as u64 - (at - p.start);
+            let take = avail.min(need);
+            let from = buf.len();
+            buf.resize(from + take as usize, 0);
+            p.pread_into(at - p.start, &mut buf[from..])?;
+            at += take;
+            need -= take;
         }
-        if buf.len() < len as usize {
+        if need > 0 {
             return Err(io::Error::new(ErrorKind::InvalidData, "read out of bounds in ZIM archive"));
         }
-        Ok(std::borrow::Cow::Owned(buf[..len as usize].to_vec()))
+        Ok(std::borrow::Cow::Owned(buf))
     }
 
     fn part_index(&self, voff: u64) -> Option<usize> {

@@ -2,20 +2,30 @@
 //! turn a Kiwix HTML ZIM into a ZIM of Markdown articles with fresh search
 //! indexes.
 //!
-//! The conversion is one streaming pass over the source directory (path
-//! order): every entry is either converted (text/html article → markdown
-//! item), recreated (redirect whose chain resolves to a source HTML article)
-//! or skipped and tallied by MIME. Fulltext and title Xapian indexes are
-//! built as libzim 9.8.2 would build them (see `mcp_stuff/convert_notes.md`),
-//! with one deliberate divergence: the fulltext documents are added in
-//! deterministic conversion order, not libzim's worker-race order — the two
-//! are equivalent as sets keyed by document data.
+//! The conversion is two passes over the source directory (path order):
+//! ONE full parallel walk (a pool of worker threads over fixed 512-entry
+//! chunks) converts HTML articles to markdown items, builds both Xapian
+//! documents OUTSIDE the database mutexes and stores a 12-byte record per
+//! entry (a redirect's resolved terminal rides in its record); membership
+//! is then pure arithmetic over the record flags, and a single-threaded
+//! finalize walks the members' dirent headers exactly once to stream the
+//! dirents in source order and build the title-ordered listing. Every
+//! entry is either converted (text/html article → markdown item),
+//! recreated (redirect whose chain resolves to a converted source HTML
+//! article) or skipped and tallied by MIME. Fulltext and title Xapian
+//! indexes are built as libzim 9.8.2 would build them (see
+//! `mcp_stuff/convert_notes.md`), with libzim's own nondeterministic
+//! document order: the parallel adds race the same way its workers do, and
+//! the two are equivalent as sets keyed by document data.
 
 use crate::zim::{Target, Zim};
 use crate::zimcommon::MIME_REDIRECT;
-use crate::zimwrite::ZimCreator;
-use std::collections::{HashMap, HashSet};
+use crate::zimwrite::{BlobRef, DirentOut, ZimCreator};
+use std::collections::HashMap;
+use std::io;
 use std::path::Path;
+use std::sync::atomic::{AtomicU32, AtomicU64, AtomicU8, Ordering};
+use std::sync::Mutex;
 use std::time::Instant;
 use xapian2::{
     Document, Stem, StemStrategy, TermGenerator, WritableDatabase,
@@ -189,25 +199,6 @@ fn main_entry_path(z: &Zim) -> Option<String> {
     None
 }
 
-/// Follow the redirect chain starting at `idx` in the SOURCE to the first
-/// non-redirect entry (transitively, cycle-safe). `None` when the chain
-/// leaves the entry range or cycles - a dangling redirect, like
-/// `zim2zim.redirect_target`.
-fn redirect_terminal(z: &Zim, idx: u32) -> Option<u32> {
-    let mut seen: HashSet<u32> = HashSet::new();
-    let mut cur = idx;
-    loop {
-        if cur >= z.entry_count() || !seen.insert(cur) {
-            return None;
-        }
-        let entry = z.get_entry(cur).ok()?;
-        match entry.target {
-            Target::Redirect(next) => cur = next,
-            _ => return Some(cur),
-        }
-    }
-}
-
 /// The mime tally key for a skipped entry: the MIME string from the archive's
 /// mime list, or "unknown/<id>".
 fn skip_mime_key(z: &Zim, mime: u16) -> String {
@@ -260,13 +251,17 @@ impl IndexLang {
 /// our job; libzim indexes custom IndexData verbatim) content without
 /// positions, then the folded title again at
 /// `boost = folded_content.len()/500 + 1` (getTitleBoostFactor).
-fn add_fulltext_document(
-    wdb: &mut WritableDatabase,
+///
+/// The document builds WITHOUT the database: the TermGenerator/Document FFI
+/// never touches the WDB pointer (exactly libzim's own worker design, which
+/// indexes into Document objects on worker threads), so pass-1 workers
+/// build outside the mutex and only `add_document` serializes.
+fn build_fulltext_document(
     lang: &IndexLang,
     path: &str,
     folded_title: &str,
     folded_content: &str,
-) -> Result<(), String> {
+) -> Result<Document, String> {
     let mut indexer = TermGenerator::new().map_err(|e| e.to_string())?;
     indexer.set_flags(tg_flags::FLAG_NGRAMS).map_err(|e| e.to_string())?;
     lang.set_stemmer(&mut indexer, true)?;
@@ -292,8 +287,7 @@ fn add_fulltext_document(
             .index_text_without_positions_with_wdf(folded_title, boost as u32)
             .map_err(|e| e.to_string())?;
     }
-    wdb.add_document(&doc).map_err(|e| e.to_string())?;
-    Ok(())
+    Ok(doc)
 }
 
 /// One title-index document, the way libzim's XapianIndexer::indexTitle does:
@@ -302,14 +296,14 @@ fn add_fulltext_document(
 /// indexed WITH positions behind libzim's anchor term, STEM_SOME,
 /// FLAG_NGRAMS, a 240-character word cap. A title made solely of non-word
 /// characters leaves only the anchor term: it is removed and the whole title
-/// added as one term when it fits (libzim's collapse).
-fn add_title_document(
-    wdb: &mut WritableDatabase,
+/// added as one term when it fits (libzim's collapse). Built WITHOUT the
+/// database, like [`build_fulltext_document`].
+fn build_title_document(
     lang: &IndexLang,
     path: &str,
     title: &str,
     target_path: Option<&str>,
-) -> Result<(), String> {
+) -> Result<Document, String> {
     let mut indexer = TermGenerator::new().map_err(|e| e.to_string())?;
     indexer.set_max_word_length(240).map_err(|e| e.to_string())?;
     indexer.set_flags(tg_flags::FLAG_NGRAMS).map_err(|e| e.to_string())?;
@@ -354,8 +348,35 @@ fn add_title_document(
             }
         }
     }
-    wdb.add_document(&doc).map_err(|e| e.to_string())?;
-    Ok(())
+    Ok(doc)
+}
+
+/// Create one throwaway Xapian database with libzim's indexing prelude
+/// (xapianIndexer.cpp): DB_CREATE_OR_OVERWRITE | DB_NO_TERMLIST plus the
+/// metadata pairs libzim's indexer records. `kind`/`valuesmap` are the only
+/// parts that differ between the fulltext and the title database.
+fn create_index_wdb(
+    path: &Path,
+    kind: &str,
+    valuesmap: &str,
+    language: &str,
+) -> Result<WritableDatabase, String> {
+    let mut wdb = WritableDatabase::create_with_flags(
+        path,
+        wdb_flags::DB_CREATE_OR_OVERWRITE | wdb_flags::DB_NO_TERMLIST,
+    )
+    .map_err(|e| format!("{kind} index: {e}"))?;
+    for (key, value) in [
+        ("valuesmap", valuesmap),
+        ("kind", kind),
+        ("data", "fullPath"),
+        ("language", language),
+        ("stopwords", ""),
+    ] {
+        wdb.set_metadata(key, value)
+            .map_err(|e| format!("{kind} index metadata {key}: {e}"))?;
+    }
+    Ok(wdb)
 }
 
 // ---------------------------------------------------------------------------
@@ -431,6 +452,239 @@ fn copy_illustration(z: &Zim, creator: &mut ZimCreator) -> Result<(), String> {
 }
 
 // ---------------------------------------------------------------------------
+// Parallel-pass infrastructure
+// ---------------------------------------------------------------------------
+
+/// Worker-pulled chunk size: fixed ranges keep each worker's work
+/// contiguous while the shared atomic counter hands chunks out
+/// dynamically, so heterogeneous cores stay busy.
+const CHUNK_ENTRIES: u64 = 512;
+
+/// Record flags: bit 0 = the article was converted and its blob entered an
+/// output cluster; bit 1 = that blob lives in a compressed cluster; bit 2 =
+/// a redirect whose resolved terminal is in `a`; bit 3 = that terminal's
+/// MIME is text/html.
+const REC_ARTICLE: u8 = 1;
+const REC_COMPRESS: u8 = 2;
+const REC_REDIRECT: u8 = 4;
+const REC_TARGET_HTML: u8 = 8;
+
+/// One per-entry record (12 bytes), a union discriminated by the flags byte
+/// — an entry is either an article or a redirect, never both: an article
+/// stores its blob's cluster GENERATION in `a` and the blob index in `b`; a
+/// redirect stores its terminal source index in `a` (u32::MAX when the
+/// chain died or cycled) and never touches `b`. Skipped entries stay
+/// all-zero; the flags gate every read after the join, so no sentinels.
+/// Atomics because the vector is shared; each slot is written once by the
+/// worker that owns it (disjoint slots) and read after the join.
+#[derive(Default)]
+struct RecSlot {
+    a: AtomicU32,
+    b: AtomicU32,
+    flags: AtomicU8,
+}
+
+/// The NUL-terminated title at `off` in the finalize listing's bump arena
+/// (the terminator separates rows; titles derive from dirent titles and
+/// paths, which cannot contain NUL).
+fn arena_title(arena: &[u8], off: usize) -> &[u8] {
+    let end = arena[off..]
+        .iter()
+        .position(|&b| b == 0)
+        .expect("row title terminator")
+        + off;
+    &arena[off..end]
+}
+
+/// Output entry index of a member source index: cumulative popcounts per
+/// 64-bit word (~3 MB at 50M entries) plus a popcount tail.
+struct Rank<'a> {
+    words: &'a [u64],
+    cum: Vec<u32>,
+}
+
+impl<'a> Rank<'a> {
+    fn new(words: &'a [u64]) -> Self {
+        let mut cum = Vec::with_capacity(words.len());
+        let mut total = 0u32;
+        for w in words {
+            cum.push(total);
+            total += w.count_ones();
+        }
+        Rank { words, cum }
+    }
+
+    fn rank(&self, i: usize) -> u32 {
+        self.cum[i / 64] + (self.words[i / 64] & ((1u64 << (i % 64)) - 1)).count_ones()
+    }
+}
+
+/// Counters and tallies shared by the worker threads (atomic because every
+/// worker fetch-adds; the skip tally sits behind a mutex). `ft_docs` IS the
+/// converted-article count: every successful conversion adds exactly one
+/// fulltext document.
+#[derive(Default)]
+struct Shared {
+    next: AtomicU64,
+    processed: AtomicU64,
+    failed: AtomicU64,
+    md_bytes: AtomicU64,
+    ft_docs: AtomicU64,
+    ti_docs: AtomicU64,
+    skipped: Mutex<HashMap<String, usize>>,
+}
+
+/// Run `worker` on `threads` scoped threads; each pulls fixed
+/// [`CHUNK_ENTRIES`] chunks from `next` until the range `end` is
+/// exhausted. A worker's first error stops it and surfaces to the caller.
+fn run_chunk_workers(
+    threads: usize,
+    next: &AtomicU64,
+    end: u32,
+    worker: impl Fn(u32, u32) -> Result<(), String> + Sync,
+) -> Result<(), String> {
+    let error: Mutex<Option<String>> = Mutex::new(None);
+    std::thread::scope(|s| {
+        for _ in 0..threads {
+            s.spawn(|| loop {
+                let c = next.fetch_add(1, Ordering::Relaxed);
+                if c * CHUNK_ENTRIES >= end as u64 {
+                    return;
+                }
+                let start = (c * CHUNK_ENTRIES) as u32;
+                let stop = ((c + 1) * CHUNK_ENTRIES).min(end as u64) as u32;
+                if let Err(e) = worker(start, stop) {
+                    let mut g = error.lock().unwrap();
+                    if g.is_none() {
+                        *g = Some(e);
+                    }
+                    return;
+                }
+            });
+        }
+    });
+    match error.into_inner().unwrap() {
+        Some(e) => Err(e),
+        None => Ok(()),
+    }
+}
+
+/// A small shared cache of decompressed clusters: consecutive source
+/// entries usually share a cluster, so the workers turning N articles into
+/// markdown turn ~N/cluster_size decompressions into one per cluster. FIFO
+/// eviction by a total-bytes and an entry-count cap.
+struct ClusterCache {
+    inner: Mutex<CacheInner>,
+}
+
+struct CacheInner {
+    map: HashMap<u32, std::sync::Arc<Vec<u8>>>,
+    order: std::collections::VecDeque<u32>,
+    bytes: usize,
+}
+
+const CACHE_BYTES: usize = 128 * 1024 * 1024;
+const CACHE_ENTRIES: usize = 32;
+
+impl ClusterCache {
+    fn new() -> Self {
+        ClusterCache {
+            inner: Mutex::new(CacheInner {
+                map: HashMap::new(),
+                order: std::collections::VecDeque::new(),
+                bytes: 0,
+            }),
+        }
+    }
+
+    /// The cluster's decompressed payload: a hit clones the shared Arc; a
+    /// miss decompresses OUTSIDE the lock and inserts under it (two workers
+    /// missing the same cluster decompress twice; the second insert
+    /// replaces and the byte count is corrected).
+    fn cluster(&self, z: &Zim, cluster: u32) -> io::Result<std::sync::Arc<Vec<u8>>> {
+        if let Some(d) = self.inner.lock().unwrap().map.get(&cluster) {
+            return Ok(d.clone());
+        }
+        let data = std::sync::Arc::new(z.decompress_cluster(cluster)?);
+        let mut c = self.inner.lock().unwrap();
+        c.bytes += data.len();
+        if let Some(old) = c.map.insert(cluster, data.clone()) {
+            c.bytes -= old.len();
+        }
+        c.order.push_back(cluster);
+        while c.order.len() > CACHE_ENTRIES || (c.bytes > CACHE_BYTES && c.order.len() > 1) {
+            let evict = c.order.pop_front().unwrap();
+            if let Some(d) = c.map.remove(&evict) {
+                c.bytes -= d.len();
+            }
+        }
+        Ok(data)
+    }
+}
+
+/// An article's HTML bytes: compressed clusters come from the shared cache
+/// (the whole cluster decodes once per worker wave), uncompressed clusters
+/// are borrowed straight from the mmap (`read_blob` would copy).
+enum HtmlSource<'a> {
+    Shared(std::sync::Arc<Vec<u8>>, u64, u64),
+    Raw(std::borrow::Cow<'a, [u8]>),
+}
+
+impl HtmlSource<'_> {
+    fn bytes(&self) -> &[u8] {
+        match self {
+            HtmlSource::Shared(d, s, e) => &d[*s as usize..*e as usize],
+            HtmlSource::Raw(cow) => cow,
+        }
+    }
+}
+
+/// Fetch one article blob through the cache (compressed) or a direct mmap
+/// view (uncompressed).
+fn article_html<'a>(
+    z: &'a Zim,
+    cache: &ClusterCache,
+    cluster: u32,
+    blob: u32,
+) -> io::Result<HtmlSource<'a>> {
+    if z.cluster_is_compressed(cluster)? {
+        let data = cache.cluster(z, cluster)?;
+        let (s, e) = z.blob_span(cluster, blob)?;
+        Ok(HtmlSource::Shared(data, s, e))
+    } else {
+        Ok(HtmlSource::Raw(z.raw_blob(cluster, blob)?))
+    }
+}
+
+/// Convert one article: fetch the HTML blob and decode + convert it.
+/// `Ok(None)` is a failed read/decode - counted as a conversion failure
+/// with the reference's warning, never fatal.
+fn convert_article_html(
+    z: &Zim,
+    cache: &ClusterCache,
+    cluster: u32,
+    blob: u32,
+    path: &str,
+    title: &str,
+    lang: &str,
+) -> Result<Option<String>, String> {
+    let html = match article_html(z, cache, cluster, blob) {
+        Ok(html) => html,
+        Err(e) => {
+            eprintln!("warning: failed to convert {path:?}: {e}");
+            return Ok(None);
+        }
+    };
+    match std::str::from_utf8(html.bytes()) {
+        Ok(html) => Ok(Some(crate::html2md::html_to_md(html, Some(title), Some(lang)))),
+        Err(_) => {
+            eprintln!("warning: failed to convert {path:?}: content is not valid UTF-8");
+            Ok(None)
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // The conversion pass (zim2zim.convert)
 // ---------------------------------------------------------------------------
 
@@ -482,320 +736,451 @@ pub fn convert(
         (limit as u64).min(entry_count as u64) as u32
     };
 
-    // The two Xapian databases are built under a unique temp dir, compacted
-    // to single files and streamed into the archive (no RAM concern). The
-    // counter keeps concurrent conversions (test threads) apart.
+    // The two Xapian databases are built under a unique temp dir NEXT TO THE
+    // OUTPUT (huge archives need the output filesystem's space for the
+    // throwaway databases), compacted to single files and streamed into the
+    // archive. The counter keeps concurrent conversions (test threads)
+    // apart.
     static TMP_COUNTER: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
     let n = TMP_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let tmp = std::env::temp_dir().join(format!(
-        "szmcp-convert-{}-{n}-{}",
-        std::process::id(),
-        outfile.file_name().and_then(|n| n.to_str()).unwrap_or("zim")
-    ));
+    let tmp = outfile
+        .parent()
+        .unwrap_or_else(|| Path::new("."))
+        .join(format!(
+            ".szmcp-convert-{}-{n}-{}",
+            std::process::id(),
+            outfile.file_name().and_then(|n| n.to_str()).unwrap_or("zim")
+        ));
     if tmp.exists() {
         let _ = std::fs::remove_dir_all(&tmp);
     }
     std::fs::create_dir_all(&tmp)
         .map_err(|e| format!("cannot create temp dir {}: {e}", tmp.display()))?;
 
-    let outcome = run_pass(Pass {
-        z: &z,
-        zimfile,
-        outfile,
-        entry_count,
-        limit_entries,
-        index_intro_only,
-        index_redirect_titles,
-        conv_lang: &conv_lang,
-        lang: &lang,
-        main_entry_path: &main_entry_path,
-        tmp: &tmp,
-        t0,
-    });
-    let _ = std::fs::remove_dir_all(&tmp);
-    outcome
-}
+    // The inner closure exists only so the temp dir is removed on every
+    // error path; inside, the code reads top to bottom in execution order:
+    // setup, the single parallel walk, the post-join membership scan, the
+    // finalize walk.
+    let outcome = (|| -> Result<(), String> {
+        // The walk range: the LIMIT (not the full entry count) — --limit
+        // runs never allocate proportional to the archive.
+        let end = limit_entries;
+        let mut creator = ZimCreator::new(outfile)
+            .map_err(|e| format!("cannot create {}: {e}", outfile.display()))?;
 
-/// Everything one conversion run needs, bundled to keep `run_pass`'s
-/// signature flat.
-struct Pass<'a> {
-    z: &'a Zim,
-    zimfile: &'a Path,
-    outfile: &'a Path,
-    entry_count: u32,
-    limit_entries: u32,
-    index_intro_only: bool,
-    index_redirect_titles: bool,
-    conv_lang: &'a str,
-    lang: &'a IndexLang,
-    main_entry_path: &'a Option<String>,
-    tmp: &'a Path,
-    t0: Instant,
-}
+        // Creator preamble (zim2zim's `with creator:` block): metadata and
+        // the illustration are copied before the walk; the article MIME is
+        // registered once here instead of per article (the writer sorts the
+        // MIME list at begin_write, so registration order is irrelevant).
+        let metadata_language = copy_metadata(&z, &mut creator, &conv_lang)?;
+        copy_illustration(&z, &mut creator)?;
+        creator.register_mime("text/markdown").map_err(|e| format!("mime: {e}"))?;
+        // The preamble is done; from here the workers share the creator
+        // behind its mutex (short blob adds only).
+        let creator = Mutex::new(creator);
 
-/// One conversion pass: creator setup, the streaming scan, the two index
-/// postludes and the finalization.
-fn run_pass(p: Pass) -> Result<(), String> {
-    let mut creator =
-        ZimCreator::new(p.outfile).map_err(|e| format!("cannot create {}: {e}", p.outfile.display()))?;
+        // Both Xapian databases live in the temp dir NEXT TO THE OUTPUT
+        // (huge archives need the output filesystem's space for the
+        // throwaway databases) and are compacted to the single files libzim
+        // embeds (xapianIndexer.cpp indexingPrelude).
+        let ft_path = tmp.join("fulltext.idx");
+        let ti_path = tmp.join("title.idx");
+        let ft_wdb = Mutex::new(create_index_wdb(
+            &tmp.join("fulltext.idx.tmp"),
+            "fulltext",
+            "title:0;wordcount:1;geo.position:2",
+            &lang.raw,
+        )?);
+        let ti_wdb = Mutex::new(create_index_wdb(
+            &tmp.join("title.idx.tmp"),
+            "title",
+            "title:0;targetPath:1",
+            &lang.raw,
+        )?);
 
-    // Creator preamble (zim2zim's `with creator:` block): metadata and the
-    // illustration are copied before the scan.
-    let metadata_language = copy_metadata(p.z, &mut creator, p.conv_lang)?;
-    copy_illustration(p.z, &mut creator)?;
+        // Thread pool: N workers over fixed 512-entry chunks pulled from a
+        // shared atomic counter - dynamic, so heterogeneous cores stay busy.
+        // No queues: a worker converts its chunk's articles one at a time
+        // and pushes each result through short mutex-locked adds; the mutex
+        // IS the backpressure (a worker holds at most one article's working
+        // set).
+        let threads = std::env::var("SZMCP_CONVERT_THREADS")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .filter(|n| *n > 0)
+            .unwrap_or_else(|| std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1));
+        eprintln!("  {threads} conversion threads");
 
-    // Fulltext database prelude (xapianIndexer.cpp indexingPrelude, FULL
-    // mode): libzim opens its throwaway database at <path>.tmp with
-    // DB_CREATE_OR_OVERWRITE | DB_NO_TERMLIST and records the metadata.
-    let ft_tmp = p.tmp.join("fulltext.idx.tmp");
-    let ft_path = p.tmp.join("fulltext.idx");
-    let mut ft_wdb = WritableDatabase::create_with_flags(
-        &ft_tmp,
-        wdb_flags::DB_CREATE_OR_OVERWRITE | wdb_flags::DB_NO_TERMLIST,
-    )
-    .map_err(|e| format!("fulltext index: {e}"))?;
-    for (key, value) in [
-        ("valuesmap", "title:0;wordcount:1;geo.position:2"),
-        ("kind", "fulltext"),
-        ("data", "fullPath"),
-        ("language", p.lang.raw.as_str()),
-        ("stopwords", ""),
-    ] {
-        ft_wdb
-            .set_metadata(key, value)
-            .map_err(|e| format!("fulltext index metadata {key}: {e}"))?;
-    }
+        let cache = ClusterCache::new();
+        let shared = Shared::default();
+        // Per-entry records, preallocated exactly once for the LIMIT (not
+        // the full entry count): 12 bytes per entry is the dominant
+        // constant-RAM structure (600 MB at 50M entries).
+        let recs: Vec<RecSlot> = (0..end).map(|_| RecSlot::default()).collect();
 
-    eprintln!("Converting entries...");
-    let mut converted = 0usize;
-    let mut failed = 0usize;
-    let mut written = 0usize;
-    let mut processed = 0u32;
-    let mut skipped_mimes: HashMap<String, usize> = HashMap::new();
-    // Paths written as articles: a recreated redirect survives the creator's
-    // dangling-redirect cleanup only when its terminal target is one of
-    // these, and only surviving front articles make it into the title index.
-    let mut written_paths: HashSet<String> = HashSet::new();
-    // Title-index records (path, title, redirect target path): articles
-    // always, redirects only with the FRONT_ARTICLE hint. Filtered to
-    // survivors and built in sorted path order after the scan - libzim
-    // iterates the sorted dirent set, so docids follow that order.
-    let mut title_records: Vec<(String, String, Option<String>)> = Vec::new();
-    let mut main_converted = false;
-    let mut first_converted_path: Option<String> = None;
-
-    let mut idx = 0u32;
-    while idx < p.entry_count {
-        let entry = p
-            .z
-            .get_entry(idx)
-            .map_err(|e| format!("reading entry {idx}: {e}"))?;
-        let item_path = entry.url.clone();
-        let dirent_title = entry.title;
-        let mime = entry.mime;
-        if mime == MIME_REDIRECT {
-            let title = entry_title(&dirent_title, &item_path);
-            // Resolve the ultimate target through the redirect chain in the
-            // SOURCE (transitively, cycle-safe): libzim resolves
-            // redirect->redirect transitively, so the recreated redirect
-            // must point at a real article of the new ZIM too. A redirect
-            // that resolves to a non-HTML entry is silently skipped.
-            let Target::Redirect(target_idx) = entry.target else {
-                unreachable!("mime == MIME_REDIRECT implies a redirect target");
-            };
-            if let Some(t_idx) = redirect_terminal(p.z, target_idx) {
-                let t_entry = p
-                    .z
-                    .get_entry(t_idx)
-                    .map_err(|e| format!("reading redirect target of {item_path:?}: {e}"))?;
-                if p.z.mime_type(t_entry.mime).is_some_and(|m| m.starts_with("text/html")) {
-                    // Without FRONT_ARTICLE the redirect still resolves but
-                    // its title stays out of the title index.
-                    if let Err(e) = creator.add_redirection(
-                        &item_path,
-                        &title,
-                        &t_entry.url,
-                        p.index_redirect_titles,
-                    ) {
-                        eprintln!("warning: redirect {item_path:?}: {e}");
-                    } else if p.index_redirect_titles {
-                        title_records.push((item_path.clone(), title, Some(t_entry.url.clone())));
-                    }
-                }
-            }
-        } else if p.z.mime_type(mime).is_some_and(|m| m.starts_with("text/html")) {
-            // An HTML article: read, convert, add, fulltext-index.
-            let title = entry_title(&dirent_title, &item_path);
-            let html = match entry.target {
-                Target::Cluster(cluster, blob) => p.z.read_blob(cluster, blob),
-                _ => Err(std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    "entry has no content",
-                )),
-            };
-            match html.ok().and_then(|bytes| String::from_utf8(bytes).ok()) {
-                Some(html) => {
-                    let md = crate::html2md::html_to_md(&html, Some(&title), Some(p.conv_lang));
-                    creator
-                        .add_item(
-                            &item_path,
-                            &title,
-                            "text/markdown",
-                            true,
-                            true,
-                            md.clone().into_bytes(),
-                        )
-                        .map_err(|e| format!("item {item_path:?}: {e}"))?;
-                    let indexed = if p.index_intro_only {
-                        intro_for_index(&md)
-                    } else {
-                        md.clone()
-                    };
-                    let folded_title = crate::search::fold_accents(&title);
-                    let folded_content = crate::search::fold_accents(&indexed);
-                    add_fulltext_document(
-                        &mut ft_wdb,
-                        p.lang,
-                        &item_path,
-                        &folded_title,
-                        &folded_content,
-                    )
-                    .map_err(|e| format!("indexing {item_path:?}: {e}"))?;
-                    converted += 1;
-                    written += md.len();
-                    written_paths.insert(item_path.clone());
-                    if first_converted_path.is_none() {
-                        first_converted_path = Some(item_path.clone());
-                    }
-                    if p.main_entry_path.as_deref() == Some(item_path.as_str()) {
-                        main_converted = true;
-                    }
-                    title_records.push((item_path, title, None));
-                }
-                None => {
-                    failed += 1;
+        // ---- pass 1: the only full walk — convert every HTML article,
+        // build BOTH Xapian documents outside the mutexes, add them under
+        // short locks, add the blob, store the record.
+        run_chunk_workers(threads, &shared.next, end, |start, stop| {
+            for idx in start..stop {
+                let n = shared.processed.fetch_add(1, Ordering::Relaxed);
+                if n % 10000 == 9999 {
                     eprintln!(
-                        "warning: failed to convert {item_path:?}: content is not valid UTF-8"
+                        "[{}/{}] entries: {} articles converted ({:.1} MB written)",
+                        n + 1,
+                        end,
+                        shared.ft_docs.load(Ordering::Relaxed),
+                        shared.md_bytes.load(Ordering::Relaxed) as f64 / 1e6
                     );
                 }
+                let (mime, target) = z
+                    .entry_head(idx)
+                    .map_err(|e| format!("reading entry {idx}: {e}"))?;
+                if mime == MIME_REDIRECT {
+                    // A redirect: resolve its terminal and the terminal's mime
+                    // NOW (dirent headers only, no blobs) and store both in the
+                    // record; liveness is decided after the join, when the
+                    // terminal's own conversion outcome is final.
+                    let slot = &recs[idx as usize];
+                    match z.redirect_terminal(idx) {
+                        Some(t) => {
+                            let (tmime, _) = z
+                                .entry_head(t)
+                                .map_err(|e| format!("reading redirect target of entry {idx}: {e}"))?;
+                            slot.a.store(t, Ordering::Relaxed);
+                            slot.flags.store(
+                                REC_REDIRECT
+                                    | if z
+                                        .mime_type(tmime)
+                                        .is_some_and(|m| m.starts_with("text/html"))
+                                    {
+                                        REC_TARGET_HTML
+                                    } else {
+                                        0
+                                    },
+                                Ordering::Relaxed,
+                            );
+                        }
+                        None => slot.flags.store(REC_REDIRECT, Ordering::Relaxed),
+                    }
+                    continue;
+                }
+                if !z.mime_type(mime).is_some_and(|m| m.starts_with("text/html")) {
+                    // Media/metadata/whatever: skipped, tallied by MIME.
+                    let key = skip_mime_key(&z, mime);
+                    *shared.skipped.lock().unwrap().entry(key).or_insert(0) += 1;
+                    continue;
+                }
+                // An HTML article: read, convert, index, add.
+                let entry = z.get_entry(idx)
+                    .map_err(|e| format!("reading entry {idx}: {e}"))?;
+                let item_path = entry.url;
+                let title = entry_title(&entry.title, &item_path);
+                let Target::Cluster(cluster, blob) = target else {
+                    continue;
+                };
+                let Some(md) = convert_article_html(
+                    &z,
+                    &cache,
+                    cluster,
+                    blob,
+                    &item_path,
+                    &title,
+                    &conv_lang,
+                )?
+                else {
+                    shared.failed.fetch_add(1, Ordering::Relaxed);
+                    continue;
+                };
+                // Both documents build OUTSIDE the database mutexes — the
+                // TermGenerator/Document FFI never touches the WDB pointer
+                // (exactly libzim's own worker design), so only add_document
+                // serializes. Commits every 10k documents bound the uncommitted
+                // glass buffers (they hold every indexed term in RAM until
+                // committed — tens of KB per document).
+                let folded_title = crate::search::fold_accents(&title);
+                let folded_content = if index_intro_only {
+                    crate::search::fold_accents(&intro_for_index(&md))
+                } else {
+                    crate::search::fold_accents(&md)
+                };
+                let ft_doc = build_fulltext_document(&lang, &item_path, &folded_title, &folded_content)
+                    .map_err(|e| format!("indexing {item_path:?}: {e}"))?;
+                let ti_doc = build_title_document(&lang, &item_path, &title, None)
+                    .map_err(|e| format!("title indexing {item_path:?}: {e}"))?;
+                {
+                    let mut wdb = ft_wdb.lock().unwrap();
+                    wdb.add_document(&ft_doc)
+                        .map_err(|e| format!("indexing {item_path:?}: {e}"))?;
+                    let d = shared.ft_docs.fetch_add(1, Ordering::Relaxed) + 1;
+                    if d % 10_000 == 0 {
+                        wdb.commit()
+                            .map_err(|e| format!("fulltext index commit: {e}"))?;
+                    }
+                }
+                {
+                    let mut wdb = ti_wdb.lock().unwrap();
+                    wdb.add_document(&ti_doc)
+                        .map_err(|e| format!("title indexing {item_path:?}: {e}"))?;
+                    let d = shared.ti_docs.fetch_add(1, Ordering::Relaxed) + 1;
+                    if d % 10_000 == 0 {
+                        wdb.commit().map_err(|e| format!("title index commit: {e}"))?;
+                    }
+                }
+                // Writer add in its own lock scope (no nesting): the blob lands
+                // in an open cluster and the record carries its ref — the
+                // ARTICLE flag replaces the old written bitset.
+                {
+                    let mut zc = creator.lock().unwrap();
+                    let b = zc
+                        .add_blob(true, md.as_bytes())
+                        .map_err(|e| format!("item {item_path:?}: {e}"))?;
+                    let slot = &recs[idx as usize];
+                    slot.a.store(b.generation, Ordering::Relaxed);
+                    slot.b.store(b.blob, Ordering::Relaxed);
+                    slot.flags.store(
+                        REC_ARTICLE | if b.compress { REC_COMPRESS } else { 0 },
+                        Ordering::Relaxed,
+                    );
+                }
+                shared.md_bytes.fetch_add(md.len() as u64, Ordering::Relaxed);
             }
-        } else {
-            // Media/metadata/whatever: skipped, tallied by MIME.
-            *skipped_mimes.entry(skip_mime_key(p.z, mime)).or_insert(0) += 1;
-        }
-        processed += 1;
-        if processed % 100 == 0 {
-            eprintln!(
-                "[{}/{}] entries: {} articles converted ({:.1} MB written)",
-                processed,
-                p.limit_entries,
-                converted,
-                written as f64 / 1e6
-            );
-        }
-        if processed >= p.limit_entries {
-            break;
-        }
-        idx += 1;
-    }
+            Ok(())
+        })?;
 
-    // Main path, set late (after all items, before finalization): the main
-    // entry's own path if its article was written, else the first written
-    // article's path.
-    let main_path = if main_converted {
-        p.main_entry_path.clone()
-    } else {
-        None
-    }
-    .or_else(|| first_converted_path.clone());
-    if let Some(mp) = &main_path {
-        creator.set_main_path(mp);
-    }
+        // ---- post-join: final commits; the mutexes end here and the serial
+        // rest owns both databases outright.
+        let mut ft = ft_wdb.into_inner().unwrap();
+        ft.commit().map_err(|e| format!("fulltext index commit: {e}"))?;
+        let mut ti = ti_wdb.into_inner().unwrap();
+        ti.commit().map_err(|e| format!("title index commit: {e}"))?;
 
-    eprintln!();
-    eprintln!("Writing Xapian indexes and finalizing (this may take a while)...");
+        // Membership is pure arithmetic over the record flags, no IO: an
+        // article is a member iff it was written; a redirect iff its chain
+        // resolved to an HTML terminal that was written. The --limit cutoff is
+        // encoded in the ARTICLE flag itself (only entries below the limit ever
+        // got it) and the check runs AFTER the join, so a redirect whose target
+        // converts later in path order is still live.
+        let mut member = vec![0u64; end.div_ceil(64) as usize];
+        for idx in 0..end {
+            let s = &recs[idx as usize];
+            let f = s.flags.load(Ordering::Relaxed);
+            let live = if f & REC_ARTICLE != 0 {
+                true
+            } else if f & (REC_REDIRECT | REC_TARGET_HTML) == REC_REDIRECT | REC_TARGET_HTML {
+                let t = s.a.load(Ordering::Relaxed);
+                t != u32::MAX
+                    && t < end
+                    && recs[t as usize].flags.load(Ordering::Relaxed) & REC_ARTICLE != 0
+            } else {
+                false
+            };
+            if live {
+                member[idx as usize / 64] |= 1 << (idx % 64);
+            }
+        }
+        let rank = Rank::new(&member);
 
-    // Fulltext postlude: commit + compact to the single-file database libzim
-    // embeds (DBCOMPACT_SINGLE_FILE | FULL); an index with no documents is
-    // not embedded at all.
-    if converted > 0 {
-        ft_wdb.commit().map_err(|e| format!("fulltext index commit: {e}"))?;
-        ft_wdb
-            .compact_to_path(&ft_path)
-            .map_err(|e| format!("fulltext index compact: {e}"))?;
+        // Opt-in redirect title documents (the default build has none): value 1
+        // = the terminal article's path, like the pass-1 article adds. Serial;
+        // commits paced every 10k documents. This sits BEFORE the title
+        // database's compaction, and the finalize walk below needs no dirent
+        // read from it in the default build.
+        if index_redirect_titles {
+            let mut added = 0u64;
+            for idx in 0..end {
+                if member[idx as usize / 64] & (1 << (idx % 64)) == 0
+                    || recs[idx as usize].flags.load(Ordering::Relaxed) & REC_REDIRECT == 0
+                {
+                    continue;
+                }
+                let entry = z.get_entry(idx)
+                    .map_err(|e| format!("reading entry {idx}: {e}"))?;
+                let title = entry_title(&entry.title, &entry.url);
+                if title.is_empty() {
+                    continue;
+                }
+                let t = recs[idx as usize].a.load(Ordering::Relaxed);
+                let t_entry = z.get_entry(t)
+                    .map_err(|e| format!("reading entry {t}: {e}"))?;
+                let doc = build_title_document(&lang, &entry.url, &title, Some(&t_entry.url))
+                    .map_err(|e| format!("title indexing {:?}: {e}", entry.url))?;
+                ti.add_document(&doc)
+                    .map_err(|e| format!("title indexing {:?}: {e}", entry.url))?;
+                added += 1;
+                if added % 10_000 == 0 {
+                    ti.commit().map_err(|e| format!("title index commit: {e}"))?;
+                }
+            }
+            shared.ti_docs.fetch_add(added, Ordering::Relaxed);
+            ti.commit().map_err(|e| format!("title index commit: {e}"))?;
+        }
+
+        // Compaction postlude: single-file databases (DBCOMPACT_SINGLE_FILE |
+        // FULL); an index with no documents is not embedded at all.
+        let converted = shared.ft_docs.load(Ordering::Relaxed);
+        let ti_docs = shared.ti_docs.load(Ordering::Relaxed);
+        let mut ft_file = None;
+        let mut ti_file = None;
+        if converted > 0 {
+            ft.compact_to_path(&ft_path)
+                .map_err(|e| format!("fulltext index compact: {e}"))?;
+            ft_file = Some(&ft_path);
+        }
+        if ti_docs > 0 {
+            ti.compact_to_path(&ti_path)
+                .map_err(|e| format!("title index compact: {e}"))?;
+            ti_file = Some(&ti_path);
+        }
+
+        // ---- finalize (single-threaded): ONE dirent-header walk over the
+        // members — emit the dirents in SOURCE order and build the title-ordered
+        // listing rows, then the writer's tail. The listing's sort key is the
+        // derived title in a bump arena; the tie-break is the member's OUTPUT
+        // index, which IS member path order (the source dirents are path-sorted
+        // and all members are C-namespace), reproducing the old (title, path)
+        // comparator without re-parsing dirents per comparison.
+        eprintln!("Finalizing (this may take a while)...");
+        // The source index of the main-page PATH (its terminal article), for the
+        // resolved W/mainPage target below.
+        let main_src_idx = main_entry_path
+            .as_deref()
+            .and_then(|mp| z.find_entry(b'C', mp).ok().flatten());
+
+        // Embedded index blobs first (the content order libzim's finish
+        // produces: fulltext, title, then counter and listing at finish_write).
+        if let Some(path) = ft_file {
+            creator
+                .lock()
+                .unwrap()
+                .add_xapian_index("fulltext/xapian", path)
+                .map_err(|e| format!("fulltext index: {e}"))?;
+        }
+        if let Some(path) = ti_file {
+            creator
+                .lock()
+                .unwrap()
+                .add_xapian_index("title/xapian", path)
+                .map_err(|e| format!("title index: {e}"))?;
+        }
+        creator.lock().unwrap().begin_write().map_err(|e| format!("finalizing: {e}"))?;
+
+        // Member dirents in SOURCE order (the archive's entry order); the
+        // terminal of a member redirect rides in its record — no re-resolution,
+        // no error path. The listing row is built while the dirent is already
+        // parsed; the title bytes go into a NUL-terminated bump arena (titles
+        // derive from dirent titles and paths, which cannot contain NUL).
+        let mut first_member_article = None;
+        let mut rows: Vec<u64> = Vec::new();
+        let mut arena: Vec<u8> = Vec::new();
+        for idx in 0..end {
+            if member[idx as usize / 64] & (1 << (idx % 64)) == 0 {
+                continue;
+            }
+            let rec = &recs[idx as usize];
+            let entry = z.get_entry(idx)
+                .map_err(|e| format!("reading entry {idx}: {e}"))?;
+            let title = entry_title(&entry.title, &entry.url);
+            let out_idx = rank.rank(idx as usize);
+            let article = rec.flags.load(Ordering::Relaxed) & REC_ARTICLE != 0;
+            if article || index_redirect_titles {
+                if arena.len() + title.len() + 1 > u32::MAX as usize {
+                    return Err("listing title arena exceeds 4 GiB".to_string());
+                }
+                let off = arena.len() as u64;
+                arena.extend_from_slice(title.as_bytes());
+                arena.push(0);
+                rows.push((off << 32) | out_idx as u64);
+            }
+            if article {
+                creator.lock().unwrap().emit_dirent(DirentOut::Item {
+                    ns: b'C',
+                    path: entry.url.clone(),
+                    title,
+                    mime: "text/markdown".to_string(),
+                    blob: BlobRef {
+                        compress: rec.flags.load(Ordering::Relaxed) & REC_COMPRESS != 0,
+                        generation: rec.a.load(Ordering::Relaxed),
+                        blob: rec.b.load(Ordering::Relaxed),
+                    },
+                })
+                .map_err(|e| format!("writing {:?}: {e}", entry.url))?;
+                if first_member_article.is_none() {
+                    first_member_article = Some(out_idx);
+                }
+            } else {
+                creator.lock().unwrap().emit_dirent(DirentOut::Redirect {
+                    ns: b'C',
+                    path: entry.url.clone(),
+                    title,
+                    target_idx: rank.rank(rec.a.load(Ordering::Relaxed) as usize),
+                })
+                .map_err(|e| format!("writing {:?}: {e}", entry.url))?;
+            }
+        }
+
+        // Sort the rows by (title, output index) and build the u32-LE listing
+        // blob of member output indexes; the arena slices are NUL-terminated, so
+        // a slice comparison compares exactly the title bytes.
+        rows.sort_unstable_by(|&a, &b| {
+            let ta = arena_title(&arena, (a >> 32) as usize);
+            let tb = arena_title(&arena, (b >> 32) as usize);
+            ta.cmp(tb).then_with(|| (a & 0xFFFF_FFFF).cmp(&(b & 0xFFFF_FFFF)))
+        });
+        let mut listing_blob = Vec::with_capacity(rows.len() * 4);
+        for &r in &rows {
+            listing_blob.extend_from_slice(&((r & 0xFFFF_FFFF) as u32).to_le_bytes());
+        }
+        drop(rows);
+        drop(arena);
+        creator.lock().unwrap().set_listing_bytes(listing_blob);
+
+        // Main path: the source main page if its article was written, else the
+        // first written article - as a RESOLVED target entry index.
+        let main_target = main_src_idx
+            .filter(|i| {
+                *i < end && recs[*i as usize].flags.load(Ordering::Relaxed) & REC_ARTICLE != 0
+            })
+            .map(|i| rank.rank(i as usize))
+            .or(first_member_article);
         creator
-            .add_xapian_index("fulltext/xapian", &ft_path)
-            .map_err(|e| format!("fulltext index: {e}"))?;
-    }
-
-    // Title index postlude: only the front-article dirents that survived the
-    // dangling-redirect cleanup (live targets), in sorted path order.
-    let mut records: Vec<(String, String, Option<String>)> = title_records
-        .into_iter()
-        .filter(|(_, _, target)| match target {
-            Some(target) => written_paths.contains(target),
-            None => true,
-        })
-        .collect();
-    records.sort_by(|a, b| a.0.as_bytes().cmp(b.0.as_bytes()));
-    if !records.is_empty() {
-        let ti_tmp = p.tmp.join("title.idx.tmp");
-        let ti_path = p.tmp.join("title.idx");
-        let mut ti_wdb = WritableDatabase::create_with_flags(
-            &ti_tmp,
-            wdb_flags::DB_CREATE_OR_OVERWRITE | wdb_flags::DB_NO_TERMLIST,
-        )
-        .map_err(|e| format!("title index: {e}"))?;
-        for (key, value) in [
-            ("valuesmap", "title:0;targetPath:1"),
-            ("kind", "title"),
-            ("data", "fullPath"),
-            ("language", p.lang.raw.as_str()),
-            ("stopwords", ""),
-        ] {
-            ti_wdb
-                .set_metadata(key, value)
-                .map_err(|e| format!("title index metadata {key}: {e}"))?;
-        }
-        for (path, title, target) in &records {
-            add_title_document(&mut ti_wdb, p.lang, path, title, target.as_deref())
-                .map_err(|e| format!("title indexing {path:?}: {e}"))?;
-        }
-        ti_wdb.commit().map_err(|e| format!("title index commit: {e}"))?;
-        ti_wdb
-            .compact_to_path(&ti_path)
-            .map_err(|e| format!("title index compact: {e}"))?;
+            .lock()
+            .unwrap()
+            .set_main_page_target(main_target);
         creator
-            .add_xapian_index("title/xapian", &ti_path)
-            .map_err(|e| format!("title index: {e}"))?;
-    }
+            .lock()
+            .unwrap()
+            .finish_write()
+            .map_err(|e| format!("finalizing {}: {e}", outfile.display()))?;
 
-    creator
-        .finish()
-        .map_err(|e| format!("finalizing {}: {e}", p.outfile.display()))?;
-
-    // Summary (stderr, like all human output of this subcommand).
-    let out_size = std::fs::metadata(p.outfile).map(|m| m.len()).unwrap_or(0);
-    let input_size = std::fs::metadata(p.zimfile).map(|m| m.len()).unwrap_or(0);
-    let elapsed = p.t0.elapsed().as_secs_f64();
-    eprintln!();
-    eprintln!("{}", "=".repeat(60));
-    eprintln!("SUMMARY");
-    eprintln!("  entries processed  : {processed} of {}", p.entry_count);
-    eprintln!("  articles converted : {converted}");
-    eprintln!("  language           : {} (metadata: {})", p.conv_lang, metadata_language);
-    eprintln!("  conversion failures: {failed}");
-    eprintln!("  skipped entries by MIME:");
-    let mut skipped: Vec<(&String, &usize)> = skipped_mimes.iter().collect();
-    skipped.sort_by_key(|(_, n)| std::cmp::Reverse(**n));
-    for (mime, count) in skipped {
-        eprintln!("    {mime:<30} {count}");
-    }
-    eprintln!("  input size : {:.1} MB", input_size as f64 / 1e6);
-    eprintln!("  output size: {:.1} MB", out_size as f64 / 1e6);
-    eprintln!("  elapsed    : {elapsed:.1} s");
-    eprintln!("{}", "=".repeat(60));
-    Ok(())
+        // Summary (stderr, like all human output of this subcommand).
+        let out_size = std::fs::metadata(outfile).map(|m| m.len()).unwrap_or(0);
+        let input_size = std::fs::metadata(zimfile).map(|m| m.len()).unwrap_or(0);
+        let elapsed = t0.elapsed().as_secs_f64();
+        let processed = shared.processed.load(Ordering::Relaxed);
+        let failed = shared.failed.load(Ordering::Relaxed);
+        let skipped_mimes = shared.skipped.into_inner().unwrap();
+        eprintln!();
+        eprintln!("{}", "=".repeat(60));
+        eprintln!("SUMMARY");
+        eprintln!("  entries processed  : {processed} of {entry_count}");
+        eprintln!("  articles converted : {converted}");
+        eprintln!("  language           : {} (metadata: {})", conv_lang, metadata_language);
+        eprintln!("  conversion failures: {failed}");
+        eprintln!("  skipped entries by MIME:");
+        let mut skipped: Vec<(&String, &usize)> = skipped_mimes.iter().collect();
+        skipped.sort_by_key(|(_, n)| std::cmp::Reverse(**n));
+        for (mime, count) in skipped {
+            eprintln!("    {mime:<30} {count}");
+        }
+        eprintln!("  input size : {:.1} MB", input_size as f64 / 1e6);
+        eprintln!("  output size: {:.1} MB", out_size as f64 / 1e6);
+        eprintln!("  elapsed    : {elapsed:.1} s");
+        eprintln!("{}", "=".repeat(60));
+        Ok(())
+    })();
+    let _ = std::fs::remove_dir_all(&tmp);
+    outcome
 }
 
 // ---------------------------------------------------------------------------
@@ -957,6 +1342,102 @@ mod e2e {
     }
 
     #[test]
+    fn many_chunks_convert_deterministically_across_workers() {
+        // A source bigger than one 512-entry chunk, so the parallel pass
+        // really distribute chunks across workers and the streaming
+        // emission must still reproduce the source order deterministically.
+        let n = 1200usize;
+        let html = "<html><body><h1>T</h1><p>An article body.</p></body></html>";
+        let mut content: Vec<TestEntry> = Vec::new();
+        let mut redirects: Vec<TestRedirect> = Vec::new();
+        for i in 0..n {
+            content.push(TestEntry {
+                namespace: b'C',
+                url: Box::leak(format!("Page_{i:05}").into_boxed_str()),
+                title: "",
+                mime: 0,
+                body: html.as_bytes(),
+            });
+            if i % 3 == 0 {
+                // A media entry (skipped) and a redirect onto Page_i every
+                // third article; content index of Page_i is i + 2*(i/3).
+                content.push(TestEntry {
+                    namespace: b'C',
+                    url: Box::leak(format!("Pic_{i:05}").into_boxed_str()),
+                    title: "",
+                    mime: 1,
+                    body: b"png",
+                });
+                redirects.push(TestRedirect {
+                    namespace: b'C',
+                    url: Box::leak(format!("Alias_{i:05}").into_boxed_str()),
+                    title: "",
+                    target_content: i + i / 3,
+                });
+            }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("src.zim");
+        std::fs::write(
+            &src,
+            build_archive(&["text/html", "image/png"], &content, &redirects, 0, None),
+        )
+        .unwrap();
+        let out = dir.path().join("out.zim");
+        convert(&src, &out, -1, false, false).unwrap();
+        let z = Zim::open(&out).unwrap();
+
+        // Every article is present as text/markdown, in SOURCE member
+        // order: the source holds all 1200 articles first (media skipped
+        // entirely), then the 400 redirects, so the output C entries are
+        // the pages at 0..n and the aliases at n..n+n/3.
+        for e in &content {
+            if e.url.starts_with("Page_") {
+                let i: usize = e.url.strip_prefix("Page_").unwrap().parse().unwrap();
+                // Sorted dirent order: the 400 "Alias_" entries sort
+                // before every "Page_" entry (the archive is path-sorted;
+                // this IS the source member order, the source being sorted).
+                let idx = z.find_entry(b'C', &e.url).unwrap().unwrap();
+                assert_eq!(idx as usize, redirects.len() + i, "order for {}", e.url);
+                let entry = z.get_entry(idx).unwrap();
+                assert_eq!(z.mime_type(entry.mime), Some("text/markdown"));
+            } else {
+                assert!(z.find_entry(b'C', &e.url).unwrap().is_none(), "{} skipped", e.url);
+            }
+        }
+        for r in &redirects {
+            let idx = z.find_entry(b'C', r.url).unwrap().unwrap();
+            assert_eq!(
+                idx as usize,
+                redirects.iter().position(|x| std::ptr::eq(x, r)).unwrap(),
+                "aliases sort among themselves in numeric order"
+            );
+            assert_eq!(z.get_entry(idx).unwrap().mime, crate::zimcommon::MIME_REDIRECT);
+        }
+
+        // The counter and both indexes know exactly the article count.
+        let counter = blob_of(&z, b'M', "Counter").unwrap();
+        assert_eq!(counter, format!("text/markdown={n}").into_bytes());
+        let ft = z.open_fulltext_xapian().unwrap().unwrap();
+        assert_eq!(ft.doc_count(), n as u32);
+        let ti = z.open_title_xapian().unwrap().unwrap();
+        assert_eq!(ti.doc_count(), n as u32);
+        // The listing lists every article once (redirect titles excluded).
+        let listing = blob_of(&z, b'X', "listing/titleOrdered/v1").unwrap();
+        assert_eq!(listing.len() / 4, n);
+
+        // The document data set resolves to the article paths (docid order
+        // races with the worker count).
+        let mut paths = std::collections::BTreeSet::new();
+        for d in 1..=ft.doc_count() {
+            paths.insert(ft.get_document(d).unwrap().data_str().unwrap());
+        }
+        for i in 0..n {
+            assert!(paths.contains(&format!("C/Page_{i:05}")), "doc {i} missing");
+        }
+    }
+
+    #[test]
     fn converts_articles_recreates_redirects_and_copies_assets() {
         let c = convert_fixture(-1, false, false);
         let z = &c.zim;
@@ -1063,17 +1544,26 @@ mod e2e {
         let z = &c.zim;
         let title = z.open_title_xapian().unwrap().unwrap();
         // Articles + both recreated redirects (both targets were converted),
-        // in sorted path order: Alt_Banana, Apple, Apple_fruit, Banana,
-        // Révolution.
+        // as DATA: Alt_Banana, Apple, Apple_fruit, Banana, Révolution. The
+        // document ids follow worker completion order (articles during the
+        // walk, redirect titles after the join), so the value checks key by
+        // data, like every other racing docid comparison.
         assert_eq!(title.doc_count(), 5);
-        let mut doc = title.get_document(1).unwrap();
-        assert_eq!(doc.data_str().unwrap(), "C/Alt_Banana");
-        assert_eq!(doc.value(0).unwrap(), b"Alternate Banana");
-        assert_eq!(doc.value(1).unwrap(), b"Banana");
-        let mut doc = title.get_document(3).unwrap();
-        assert_eq!(doc.data_str().unwrap(), "C/Apple_fruit");
-        assert_eq!(doc.value(0).unwrap(), b"Apple fruit");
-        assert_eq!(doc.value(1).unwrap(), b"Apple");
+        let doc_by_data = |data: &str| -> (Vec<u8>, Vec<u8>) {
+            for d in 1..=title.doc_count() {
+                let mut doc = title.get_document(d).unwrap();
+                if doc.data_str().unwrap() == data {
+                    return (doc.value(0).unwrap(), doc.value(1).unwrap());
+                }
+            }
+            panic!("title doc {data} missing");
+        };
+        let (v0, v1) = doc_by_data("C/Alt_Banana");
+        assert_eq!(v0, b"Alternate Banana".to_vec());
+        assert_eq!(v1, b"Banana".to_vec());
+        let (v0, v1) = doc_by_data("C/Apple_fruit");
+        assert_eq!(v0, b"Apple fruit".to_vec());
+        assert_eq!(v1, b"Apple".to_vec());
 
         // Redirect titles joined the listing too.
         let listing = blob_of(z, b'X', "listing/titleOrdered/v1").unwrap();
@@ -1211,8 +1701,10 @@ mod e2e {
         )
         .unwrap();
         let lang = IndexLang::new("eng".to_string());
-        add_title_document(&mut wdb, &lang, "!=", "!=", None).unwrap();
-        add_title_document(&mut wdb, &lang, "Apple_Pie", "Apple Pie", None).unwrap();
+        let doc = build_title_document(&lang, "!=", "!=", None).unwrap();
+        wdb.add_document(&doc).unwrap();
+        let doc = build_title_document(&lang, "Apple_Pie", "Apple Pie", None).unwrap();
+        wdb.add_document(&doc).unwrap();
         wdb.commit().unwrap();
         wdb.compact_to_path(dir.path().join("t.idx")).unwrap();
 

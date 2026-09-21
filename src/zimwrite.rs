@@ -226,6 +226,7 @@ impl WriteState {
 }
 
 #[derive(Clone)]
+#[allow(dead_code)] // the record API lives on for tests and small archives
 enum DirentKind {
     Item {
         /// MIME id in insertion order (libzim's `getMimeTypeIdx`), remapped to
@@ -245,6 +246,7 @@ enum DirentKind {
     Placeholder,
 }
 
+#[allow(dead_code)] // the record API lives on for tests and small archives
 #[derive(Clone)]
 struct Dirent {
     kind: DirentKind,
@@ -258,6 +260,7 @@ struct Dirent {
     removed: bool,
 }
 
+#[allow(dead_code)]
 impl Dirent {
     fn is_redirect(&self) -> bool {
         matches!(self.kind, DirentKind::Redirect { .. } | DirentKind::Placeholder)
@@ -287,6 +290,7 @@ pub struct ZimCreator {
     mime_insertion: Vec<String>,
     /// The main entry path (for the `W/mainPage` redirect at finish; record
     /// mode resolves it against the dirent map).
+    #[allow(dead_code)] // record API (tests and small archives)
     main_path: String,
     /// Streaming mode: the already-resolved target entry index of the
     /// `W/mainPage` redirect (`None`: no main page).
@@ -376,6 +380,7 @@ impl ZimCreator {
         })
     }
 
+    #[allow(dead_code)] // the record API lives on for tests and small archives
     /// Set the main entry path. May be called at any point before [`finish`];
     /// if `C/<main_path>` exists when finishing, a `W/mainPage` redirection is
     /// created and the header's mainPage field set to its index.
@@ -673,6 +678,7 @@ impl ZimCreator {
     /// libzim's "application/octet-stream" fallback. `front_article` is the
     /// FRONT_ARTICLE hint: only front articles appear in the
     /// `X/listing/titleOrdered/v1` listing.
+    #[allow(dead_code)] // record API (tests and small archives)
     pub fn add_item(
         &mut self,
         path: &str,
@@ -740,7 +746,7 @@ impl ZimCreator {
     }
 
     /// Add one blob to the appropriate open cluster WITHOUT creating a
-    /// dirent: the streaming convert path assigns dirents later (phase 3),
+    /// dirent: the streaming convert path assigns dirents later (finalize),
     /// carrying the returned ref in its per-article records.
     pub fn add_blob(&mut self, compress: bool, content: &[u8]) -> io::Result<BlobRef> {
         let (compress, generation, blob) = self.add_item_data(compress, content)?;
@@ -996,11 +1002,13 @@ impl ZimCreator {
         self.close_cluster(Slot::Uncompressed)?;
         let ws = self.w.as_mut().unwrap();
         let dirent_start = ws.dirent_start.unwrap_or(ws.pos);
-        let path_ptr_pos = ws.dirent_end;
-        // The path pointer table follows the dirent section; the cluster
-        // pointer table follows it. `at` tracks the true append position
-        // (ws.pos is not advanced by these writes).
+        // The pointer tables go at the current append position (right after
+        // the streamed clusters — in the streaming path the dirent section
+        // sits before trailing cluster bytes; the record path has none, so
+        // `at` equals dirent_end there). The FORMAT only cares about the
+        // header offsets.
         let mut at = ws.pos;
+        let path_ptr_pos = at;
         for &off in &ws.dirent_offsets {
             ws.out.write_all(&(dirent_start + off).to_le_bytes())?;
             at += 8;
@@ -1052,6 +1060,7 @@ impl ZimCreator {
     /// Add a redirection. If `target_path` was not added yet, a placeholder
     /// dirent is created for it and becomes a real item when `add_item` is
     /// later called with that path.
+    #[allow(dead_code)] // record API (tests and small archives)
     pub fn add_redirection(
         &mut self,
         path: &str,
@@ -1161,6 +1170,7 @@ impl ZimCreator {
     /// redirects, assign entry indexes, sort the MIME list, append the
     /// M/Counter and title-listing blobs, close the open clusters, write the
     /// file and its checksum.
+    #[allow(dead_code)] // record API (tests and small archives)
     pub fn finish(&mut self) -> io::Result<()> {
         // 1. The title listing entry ("application/octet-stream+zimlisting"),
         //    always created (its blob may be empty).

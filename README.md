@@ -144,17 +144,38 @@ behaves the same.
 
 ## Converting an HTML ZIM to Markdown (`convert`)
 
-`szmcp convert` is a Rust port of `wikizim_parser/zim2zim.py`: one streaming
-pass over the source archive converts every `text/html` article to Markdown
-(`text/markdown`, same paths, infoboxes on), recreates every redirect whose
-chain resolves to a source HTML article (targets resolved transitively,
-cycle-safe), copies the core metadata and the 48x48 illustration, and builds
-fresh fulltext + title Xapian indexes exactly like libzim 9.8.2 does (values
-slots, anchor-term title indexing with positions, FLAG_CJK_NGRAM, stemmer
-chosen via the ICU primary language of the source's `Language` metadata,
-DB_NO_TERMLIST + single-file compaction, index language metadata = the raw
-code). Core metadata keys are copied verbatim; the accent folding libzim
-expects is always applied to the indexed text.
+`szmcp convert` is a Rust port of `wikizim_parser/zim2zim.py`: a two-pass
+pipeline over the source archive converts every `text/html`
+article to Markdown (`text/markdown`, same paths, infoboxes on), recreates
+every redirect whose chain resolves to a source HTML article (targets
+resolved transitively, cycle-safe), copies the core metadata and the 48x48
+illustration, and builds fresh fulltext + title Xapian indexes exactly like
+libzim 9.8.2 does (values slots, anchor-term title indexing with positions,
+FLAG_CJK_NGRAM, stemmer chosen via the ICU primary language of the source's
+`Language` metadata, DB_NO_TERMLIST + single-file compaction, index language
+metadata = the raw code). Core metadata keys are copied verbatim; the accent
+folding libzim expects is always applied to the indexed text.
+
+Pass 1 is the only full walk: a pool of worker threads (= the CPU count,
+override with `SZMCP_CONVERT_THREADS`) converts fixed 512-entry chunks
+dynamically pulled from a shared counter, building both Xapian documents
+OUTSIDE the database mutexes so that only the `add_document` calls
+serialize; every entry leaves a 12-byte record (an article's blob
+reference, or a redirect's resolved terminal). Membership is then pure
+arithmetic over the record flags (a redirect is live iff its terminal was
+converted), and a single-threaded finalize walks the members' dirent
+headers exactly once to stream the dirents in source order, build the
+title-ordered listing and rank redirect targets. RAM stays bounded:
+content streams to disk as clusters close, dirents stream as they are
+emitted, and the only per-entry state is the 12-byte record plus the
+listing rows (~1 GB at 30M articles). Both embedded indexes commit every
+10000 documents, which bounds the uncommitted Xapian buffers — the only
+RSS term that scales with the converted-article count — at a few hundred
+MB. Entry order, metadata, counter and listing stay deterministic; cluster
+packing and the Xapian document ids follow worker completion order,
+exactly like libzim's own racing workers. Measured with 4 threads: peak
+RSS on the 8.3 GB `wikipedia_en_top_maxi_2026-06.zim` is ~0.7 GiB at
+`--limit 50000` (153.9 s with 4 threads).
 
 ```
 szmcp convert <input.zim> <output.zim> [--limit N] [--index-intro-only] [--index-redirect-titles]
@@ -177,14 +198,20 @@ Verified against python `zim2zim.py` reference builds of the same input
 `--index-intro-only`): header fields, checksum, mime list, the full dirent
 sequence (paths, stored titles, mime strings, resolved redirect targets),
 metadata values, `M/Counter`, the title-ordered listing (byte-equal), index
-document counts, per-document data/value slots (title docs identical in
-docid order; fulltext compared keyed by path) and term sets with posting
-statistics all match, except for the divergences below.
+document counts, per-document data/value slots and term sets with posting
+statistics all match — documents compared keyed by their data (the path),
+since both indexes assign document ids in worker completion order, unlike
+the python build's sorted order. The exceptions are the divergences below.
 
 Divergences from the python reference, all deliberate or inherent:
 
 - Fulltext documents are added in deterministic conversion order; libzim
   adds them from racing worker threads (the doc *sets* are equal).
+- About 1.6% of articles (12 of 759 on the reference pair) carry the
+  html2md deliberate fixes (recovered table content, deduplicated
+  definition-list text, `<br>` paragraph splits), so their Markdown,
+  fulltext `wordcount` value and the terms of that recovered text differ
+  from the python build.
 - No stopword lists are bundled — matching zim2zim's ZIMs, whose 3-letter
   language codes never load a libzim stopword resource.
 - Accent folding is simplified: only Latin combining marks
