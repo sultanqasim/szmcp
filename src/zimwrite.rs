@@ -56,6 +56,11 @@ const CLUSTER_TARGET_SIZE: u64 = 2 * 1024 * 1024;
 /// Mimetype of the `X/listing/titleOrdered/v1` entry.
 const LISTING_MIME: &str = "application/octet-stream+zimlisting";
 
+/// Blobs at or above this size stream straight to disk as their own
+/// uncompressed cluster instead of accumulating in the open cluster's RAM
+/// buffer until finish (embedded Xapian databases are the only such blobs).
+const BIG_BLOB_THRESHOLD: u64 = 1024 * 1024;
+
 /// Which open cluster an item's blob landed in (compressed or not).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Slot {
@@ -149,14 +154,78 @@ impl OpenCluster {
 }
 
 /// Location of an item's blob: which kind of open cluster, which generation
-/// of it, and the blob index within the cluster.
+/// of it, and the blob index within the cluster. Returned by
+/// [`ZimCreator::add_blob`] and carried in [`DirentOut::Item`]; the final
+/// archive cluster index is resolved by the writer at write time.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct BlobRef {
-    compress: bool,
-    generation: u32,
-    blob: u32,
+pub struct BlobRef {
+    pub compress: bool,
+    pub generation: u32,
+    pub blob: u32,
 }
 
+/// One dirent handed to the streaming writer: everything the archive body
+/// needs, already resolved except the blob's cluster index (resolved at
+/// write time) and the MIME id (resolved by string lookup).
+#[derive(Debug)]
+pub enum DirentOut {
+    Item { ns: u8, path: String, title: String, mime: String, blob: BlobRef },
+    Redirect { ns: u8, path: String, title: String, target_idx: u32 },
+}
+
+/// A dirent's serializable fields, fully resolved.
+enum DirentBytes {
+    Item { mime_idx: u16, cluster: u32, blob: u32 },
+    Redirect { target: u32 },
+}
+
+/// Streaming file state: the archive body is written to the output file as
+/// it is produced (closed clusters stream immediately, dirents as they are
+/// emitted), so RAM never holds content or dirent bytes. The MIME list and
+/// the pointer tables are patched/written at the very end.
+struct WriteState {
+    out: io::BufWriter<std::fs::File>,
+    /// Absolute write position (starts at CLUSTER_BASE_OFFSET).
+    pos: u64,
+    /// Absolute offset of every closed cluster, in close order.
+    cluster_offsets: Vec<u64>,
+    /// Relative offset of every emitted dirent (the path pointer table).
+    dirent_offsets: Vec<u64>,
+    /// Absolute offset/end of the dirent section.
+    dirent_start: Option<u64>,
+    dirent_end: u64,
+    /// Streaming mode: tail dirents registered before `begin_write`, in
+    /// sorted order, emitted interleaved with (and after) the C stream.
+    tails: Vec<((u8, String), Dirent)>,
+    tail_next: usize,
+    /// Ordinal of the W/mainPage dirent among the emitted dirents.
+    main_page_idx: Option<u32>,
+}
+
+impl WriteState {
+    /// Serialize one resolved dirent and record its path pointer.
+    fn emit(&mut self, ns: u8, path: &str, title: &str, k: &DirentBytes) -> io::Result<()> {
+        let start = *self.dirent_start.get_or_insert(self.pos);
+        if ns == b'W' && path == "mainPage" {
+            self.main_page_idx = Some(self.dirent_offsets.len() as u32);
+        }
+        self.dirent_offsets.push(self.pos - start);
+        write_dirent(&mut self.out, ns, path, title, k)?;
+        let head = match k {
+            DirentBytes::Item { .. } => 16,
+            DirentBytes::Redirect { .. } => 12,
+        };
+        // pathTitle: path, NUL, then the title only when it differs from the
+        // path — one terminating NUL is always written (libzim's
+        // PathTitleTinyString::concat writes path NUL [title] NUL).
+        let title_part = if title != path { title.len() as u64 } else { 0 };
+        self.pos += head + path.len() as u64 + 1 + title_part + 1;
+        self.dirent_end = self.pos;
+        Ok(())
+    }
+}
+
+#[derive(Clone)]
 enum DirentKind {
     Item {
         /// MIME id in insertion order (libzim's `getMimeTypeIdx`), remapped to
@@ -169,10 +238,14 @@ enum DirentKind {
         /// (namespace, path) of the target dirent.
         target: (u8, String),
     },
+    /// A redirect whose target entry index is already resolved (the
+    /// streaming path's W/mainPage, which targets a ranked member).
+    RedirectIdx(u32),
     /// Redirect target that was never filled in (libzim's `isPlaceholder`).
     Placeholder,
 }
 
+#[derive(Clone)]
 struct Dirent {
     kind: DirentKind,
     /// Stored title (may be empty; such dirents behave as if titled with their
@@ -209,16 +282,23 @@ pub struct ZimCreator {
     dirents: BTreeMap<(u8, String), Dirent>,
     /// MIME string by insertion-order id.
     mime_by_idx: Vec<String>,
-    /// The main entry path (for the `W/mainPage` redirect at finish).
+    /// The same strings in insertion order, frozen when the list is sorted
+    /// (dirents registered before the freeze carry insertion-order ids).
+    mime_insertion: Vec<String>,
+    /// The main entry path (for the `W/mainPage` redirect at finish; record
+    /// mode resolves it against the dirent map).
     main_path: String,
+    /// Streaming mode: the already-resolved target entry index of the
+    /// `W/mainPage` redirect (`None`: no main page).
+    main_target: Option<u32>,
+    /// Streaming mode: the caller-built `X/listing/titleOrdered/v1` bytes,
+    /// added to the uncompressed cluster at `finish_write`.
+    listing_bytes: Vec<u8>,
     comp_cluster: OpenCluster,
     uncomp_cluster: OpenCluster,
-    /// Closed clusters in close order; the vec index is the cluster's archive
-    /// index. Compressed/uncompressed clusters close interleaved, so each
-    /// open cluster's final index is only known at its own close.
-    closed_clusters: Vec<OpenCluster>,
     /// Number of clusters closed per compression kind (the "generation" of the
-    /// currently open clusters).
+    /// currently open clusters). Closed clusters stream straight to the
+    /// output file, so only their offsets survive.
     comp_generation: u32,
     uncomp_generation: u32,
     /// Generation -> archive cluster index, per slot.
@@ -226,6 +306,9 @@ pub struct ZimCreator {
     uncomp_gen_idx: Vec<u32>,
     /// Mime string -> count for `M/Counter` (sorted like libzim's std::map).
     mime_counter: BTreeMap<String, u64>,
+    /// Streaming file state, opened lazily on the first cluster close (or at
+    /// `begin_write`) and gone once the file is complete.
+    w: Option<WriteState>,
 }
 
 /// 16 random bytes from `/dev/urandom` (falling back to a time/pid hash if
@@ -278,15 +361,18 @@ impl ZimCreator {
             uuid: random_uuid(),
             dirents: BTreeMap::new(),
             mime_by_idx: Vec::new(),
+            mime_insertion: Vec::new(),
             main_path: String::new(),
+            main_target: None,
+            listing_bytes: Vec::new(),
             comp_cluster: OpenCluster::new(true),
             uncomp_cluster: OpenCluster::new(false),
-            closed_clusters: Vec::new(),
             comp_generation: 0,
             uncomp_generation: 0,
             comp_gen_idx: Vec::new(),
             uncomp_gen_idx: Vec::new(),
             mime_counter: BTreeMap::new(),
+            w: None,
         })
     }
 
@@ -356,41 +442,85 @@ impl ZimCreator {
     /// first when it already holds blobs and would grow past the 2 MiB target,
     /// then append the blob. Returns the blob's location: which kind of open
     /// cluster, which generation of it, and the blob index within the cluster.
-    fn add_item_data(&mut self, compress: bool, content: &[u8]) -> (bool, u32, u32) {
+    fn add_item_data(&mut self, compress: bool, content: &[u8]) -> io::Result<(bool, u32, u32)> {
         let item_size = content.len() as u64;
         if compress {
             if self.comp_cluster.count() > 0
                 && self.comp_cluster.size() + item_size >= CLUSTER_TARGET_SIZE
             {
-                self.close_cluster(Slot::Compressed);
+                self.close_cluster(Slot::Compressed)?;
             }
             let blob = self.comp_cluster.count();
             self.comp_cluster.push(content);
-            (true, self.comp_generation, blob)
+            Ok((true, self.comp_generation, blob))
         } else {
             if self.uncomp_cluster.count() > 0
                 && self.uncomp_cluster.size() + item_size >= CLUSTER_TARGET_SIZE
             {
-                self.close_cluster(Slot::Uncompressed);
+                self.close_cluster(Slot::Uncompressed)?;
             }
             let blob = self.uncomp_cluster.count();
             self.uncomp_cluster.push(content);
-            (false, self.uncomp_generation, blob)
+            Ok((false, self.uncomp_generation, blob))
         }
     }
 
     /// Stream a blob of known `len` from `reader` into the uncompressed open
     /// cluster (used for embedded Xapian databases, which can be large).
+    /// Blobs at or above [`BIG_BLOB_THRESHOLD`] stream straight to disk as
+    /// their own uncompressed cluster instead of sitting in RAM until finish.
     fn add_item_streaming(&mut self, len: u64, reader: &mut dyn Read) -> io::Result<(bool, u32, u32)> {
+        if len >= BIG_BLOB_THRESHOLD {
+            self.close_cluster(Slot::Uncompressed)?;
+            self.ensure_open()?;
+            let extended = len > u32::MAX as u64;
+            let width: u64 = if extended { 8 } else { 4 };
+            // One blob: the offset table holds the 0 start and the end.
+            let table: Vec<u8> = [0u64, len]
+                .iter()
+                .flat_map(|&off| {
+                    let v = off + 2 * width;
+                    if extended { v.to_le_bytes().to_vec() } else { (v as u32).to_le_bytes().to_vec() }
+                })
+                .collect();
+            let ws = self.w.as_mut().unwrap();
+            let offset = ws.pos;
+            let archive_idx = ws.cluster_offsets.len() as u32;
+            ws.out.write_all(&[CLUSTER_UNCOMPRESSED])?;
+            ws.out.write_all(&table)?;
+            let mut copied = 0u64;
+            let mut buf = vec![0u8; 1024 * 1024];
+            while copied < len {
+                let want = (len - copied).min(buf.len() as u64) as usize;
+                let n = reader.read(&mut buf[..want])?;
+                if n == 0 {
+                    break;
+                }
+                copied += n as u64;
+                ws.out.write_all(&buf[..n])?;
+            }
+            if copied != len {
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    format!("xapian index shorter than expected ({copied} of {len} bytes)"),
+                ));
+            }
+            ws.pos += 1 + table.len() as u64 + len;
+            ws.cluster_offsets.push(offset);
+            let generation = self.uncomp_generation;
+            self.uncomp_gen_idx.push(archive_idx);
+            self.uncomp_generation += 1;
+            return Ok((false, generation, 0));
+        }
         if self.uncomp_cluster.count() > 0
             && self.uncomp_cluster.size() + len >= CLUSTER_TARGET_SIZE
         {
-            self.close_cluster(Slot::Uncompressed);
+            self.close_cluster(Slot::Uncompressed)?;
         }
         let blob = self.uncomp_cluster.count();
         self.uncomp_cluster.blob_ends.push(self.uncomp_cluster.data_size() + len);
         let mut copied = 0u64;
-        let mut buf = [0u8; 1024 * 1024];
+        let mut buf = vec![0u8; 1024 * 1024];
         let data = &mut self.uncomp_cluster.data;
         while copied < len {
             let want = (len - copied).min(buf.len() as u64) as usize;
@@ -410,23 +540,76 @@ impl ZimCreator {
         Ok((false, self.uncomp_generation, blob))
     }
 
-    /// Map a location's cluster generation to the final archive cluster index
-    /// (all referenced clusters are closed before the file is written).
-    fn cluster_number(&self, compress: bool, generation: u32) -> u32 {
-        let table = if compress { &self.comp_gen_idx } else { &self.uncomp_gen_idx };
-        table[generation as usize]
+    /// The final archive cluster index of a blob. Closed generations map
+    /// through the generation tables; the two open clusters close at the end
+    /// of the file write (compressed first, a no-op when empty), so an open
+    /// generation's index is the next free position.
+    fn resolve_blob(&self, blob: BlobRef, closed: usize) -> io::Result<u32> {
+        match blob.compress {
+            true if (blob.generation as usize) < self.comp_gen_idx.len() => {
+                Ok(self.comp_gen_idx[blob.generation as usize])
+            }
+            true if blob.generation == self.comp_generation => Ok(closed as u32),
+            false if (blob.generation as usize) < self.uncomp_gen_idx.len() => {
+                Ok(self.uncomp_gen_idx[blob.generation as usize])
+            }
+            false if blob.generation == self.uncomp_generation => {
+                Ok(closed as u32 + u32::from(self.comp_cluster.count() > 0))
+            }
+            _ => Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "blob references an unknown cluster generation",
+            )),
+        }
     }
 
-    /// Close a cluster (it must hold at least one blob) and open a fresh one.
-    fn close_cluster(&mut self, slot: Slot) {
+    /// Open the output file and write the 80-byte header placeholder plus
+    /// the sparse MIME-list gap (the real MIME list is patched in at the
+    /// end). Idempotent; also used by the record path.
+    fn ensure_open(&mut self) -> io::Result<()> {
+        if self.w.is_some() {
+            return Ok(());
+        }
+        let f = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(&self.out_path)?;
+        let mut out = io::BufWriter::new(f);
+        out.write_all(&[0u8; HEADER_SIZE as usize])?;
+        out.write_all(&vec![0u8; (CLUSTER_BASE_OFFSET - HEADER_SIZE) as usize])?;
+        self.w = Some(WriteState {
+            out,
+            pos: CLUSTER_BASE_OFFSET,
+            cluster_offsets: Vec::new(),
+            dirent_offsets: Vec::new(),
+            dirent_start: None,
+            dirent_end: CLUSTER_BASE_OFFSET,
+            tails: Vec::new(),
+            tail_next: 0,
+            main_page_idx: None,
+        });
+        Ok(())
+    }
+
+    /// Close a cluster (it must hold at least one blob) and open a fresh
+    /// one: its bytes stream straight to the output file (clusters never
+    /// accumulate in RAM), which keeps the byte layout identical to writing
+    /// them all at finish — same close order, same offsets.
+    fn close_cluster(&mut self, slot: Slot) -> io::Result<()> {
         let count = match slot {
             Slot::Compressed => self.comp_cluster.count(),
             Slot::Uncompressed => self.uncomp_cluster.count(),
         };
         if count == 0 {
-            return;
+            return Ok(());
         }
-        let archive_idx = self.closed_clusters.len() as u32;
+        let archive_idx = self
+            .w
+            .as_ref()
+            .map(|w| w.cluster_offsets.len())
+            .unwrap_or(0) as u32;
         let cluster = match slot {
             Slot::Compressed => {
                 self.comp_gen_idx.push(archive_idx);
@@ -439,7 +622,51 @@ impl ZimCreator {
                 std::mem::replace(&mut self.uncomp_cluster, OpenCluster::new(false))
             }
         };
-        self.closed_clusters.push(cluster);
+        self.ensure_open()?;
+        let ws = self.w.as_mut().unwrap();
+        let offset = ws.pos;
+        let size = cluster.write_to(&mut ws.out)?;
+        ws.cluster_offsets.push(offset);
+        ws.pos += size;
+        Ok(())
+    }
+
+    /// Sort the MIME list (libzim's resolveMimeTypes). Dirents registered
+    /// before the freeze carry insertion-order ids: `mime_insertion` maps
+    /// them back to their string, whose sorted position is the final id.
+    fn freeze_mimes(&mut self) {
+        self.mime_insertion = std::mem::take(&mut self.mime_by_idx);
+        self.mime_by_idx = self.mime_insertion.clone();
+        self.mime_by_idx.sort();
+    }
+
+    /// The MIME id of an already-registered string (its sorted position).
+    fn mime_idx_of(&self, mime: &str) -> io::Result<u16> {
+        self.mime_by_idx
+            .binary_search_by(|m| m.as_str().cmp(mime))
+            .map(|i| i as u16)
+            .map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("mime type {mime:?} not registered before the archive was written"),
+            )
+        })
+    }
+
+    /// The insertion-order id of a registered string (tails registered after
+    /// the freeze carry insertion-order ids; emission re-derives the sorted
+    /// id from the string).
+    fn mime_insertion_idx(&self, mime: &str) -> io::Result<u16> {
+        self.mime_insertion
+            .iter()
+            .position(|m| m == mime)
+            .map(|i| i as u16)
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("mime type {mime:?} not registered before the archive was written"),
+                )
+            })
     }
 
     /// Add a content item (libzim's `Creator::addItem`). An empty `mime` gets
@@ -483,7 +710,7 @@ impl ZimCreator {
         // libzim's ensureDirentCanBeAdded: a real dirent over a real dirent is
         // an error, before any blob lands in a cluster.
         self.ensure_dirent_can_be_added(ns, path)?;
-        let blob = self.add_item_data(compress, &content);
+        let blob = self.add_item_data(compress, &content)?;
         // libzim's CounterHandler::handle(dirent, item): C-namespace items
         // counted by their parameter-stripped mime; empty mimes skipped.
         if ns == b'C' {
@@ -510,6 +737,316 @@ impl ZimCreator {
                 removed: false,
             },
         )
+    }
+
+    /// Add one blob to the appropriate open cluster WITHOUT creating a
+    /// dirent: the streaming convert path assigns dirents later (phase 3),
+    /// carrying the returned ref in its per-article records.
+    pub fn add_blob(&mut self, compress: bool, content: &[u8]) -> io::Result<BlobRef> {
+        let (compress, generation, blob) = self.add_item_data(compress, content)?;
+        Ok(BlobRef { compress, generation, blob })
+    }
+
+    /// Streaming mode: set the already-resolved target entry index of the
+    /// `W/mainPage` redirect (the caller ranks members; `None` drops the
+    /// main-page dirent, e.g. when nothing was converted).
+    pub fn set_main_page_target(&mut self, target_idx: Option<u32>) {
+        self.main_target = target_idx;
+    }
+
+    /// Streaming mode: hand over the caller-built `X/listing/titleOrdered/v1`
+    /// bytes (added to the uncompressed cluster at `finish_write`).
+    pub fn set_listing_bytes(&mut self, bytes: Vec<u8>) {
+        self.listing_bytes = bytes;
+    }
+
+    /// Register a MIME string early so the list can be finalized (sorted)
+    /// before any dirent is streamed with it.
+    pub fn register_mime(&mut self, mime: &str) -> io::Result<()> {
+        self.get_mime_idx(mime).map(|_| ())
+    }
+
+    /// Streaming mode: freeze the MIME list (everything the archive will use
+    /// is registered by now — the counter and listing mimes are added here),
+    /// open the output file and park the tail dirents registered so far.
+    /// Dirents are then emitted with [`ZimCreator::emit_dirent`];
+    /// [`ZimCreator::finish_write`] completes the file.
+    pub fn begin_write(&mut self) -> io::Result<()> {
+        self.get_mime_idx("text/plain")?;
+        self.get_mime_idx(LISTING_MIME)?;
+        self.freeze_mimes();
+        self.ensure_open()?;
+        let tails: Vec<((u8, String), Dirent)> =
+            std::mem::take(&mut self.dirents).into_iter().collect();
+        let ws = self.w.as_mut().unwrap();
+        ws.tails = tails;
+        Ok(())
+    }
+
+    /// Streaming mode: emit one dirent into the archive body. C-namespace
+    /// items are tallied for M/Counter (libzim counts them by their
+    /// parameter-stripped mime). Tail dirents sorting before this one are
+    /// flushed first (the C stream always sorts before M/W/X in practice).
+    pub fn emit_dirent(&mut self, d: DirentOut) -> io::Result<()> {
+        if let DirentOut::Item { ns, mime, .. } = &d {
+            if *ns == b'C' {
+                let clean = strip_mime_parameters(mime);
+                if !mime.is_empty() && !clean.is_empty() {
+                    *self.mime_counter.entry(clean.to_string()).or_insert(0) += 1;
+                }
+            }
+        }
+        let (ns, path) = match &d {
+            DirentOut::Item { ns, path, .. } | DirentOut::Redirect { ns, path, .. } => (*ns, path),
+        };
+        self.flush_tails_before(ns, path)?;
+        self.emit_resolved(d)
+    }
+
+    /// Emit one dirent without the counter tally (the record path tallied
+    /// through `add_item` already).
+    fn emit_resolved(&mut self, d: DirentOut) -> io::Result<()> {
+        self.ensure_open()?;
+        match d {
+            DirentOut::Item { ns, path, title, mime, blob } => {
+                let closed = self.w.as_ref().map(|w| w.cluster_offsets.len()).unwrap_or(0);
+                let kind = DirentBytes::Item {
+                    mime_idx: self.mime_idx_of(&mime)?,
+                    cluster: self.resolve_blob(blob, closed)?,
+                    blob: blob.blob,
+                };
+                let ws = self.w.as_mut().unwrap();
+                ws.emit(ns, &path, &title, &kind)
+            }
+            DirentOut::Redirect { ns, path, title, target_idx } => {
+                let ws = self.w.as_mut().unwrap();
+                ws.emit(ns, &path, &title, &DirentBytes::Redirect { target: target_idx })
+            }
+        }
+    }
+
+    /// Flush the pending tail dirents sorting before `(ns, path)`.
+    fn flush_tails_before(&mut self, ns: u8, path: &str) -> io::Result<()> {
+        loop {
+            let at = {
+                let ws = self.w.as_ref().ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::InvalidData, "begin_write first")
+                })?;
+                match ws.tails.get(ws.tail_next) {
+                    Some((key, _)) if key.0 < ns || (key.0 == ns && key.1.as_str() < path) => {
+                        ws.tail_next
+                    }
+                    _ => return Ok(()),
+                }
+            };
+            let (key, d) = {
+                let ws = self.w.as_ref().unwrap();
+                (ws.tails[at].0.clone(), ws.tails[at].1.clone())
+            };
+            self.emit_tail_dirent(&key, &d)?;
+        }
+    }
+
+    /// Resolve and emit one tail dirent (a pre-registered metadata,
+    /// illustration or Xapian-index dirent).
+    fn emit_tail_dirent(&mut self, key: &(u8, String), d: &Dirent) -> io::Result<()> {
+        let kind = match &d.kind {
+            DirentKind::Item { mime_idx, blob } => {
+                let mime = self
+                    .mime_insertion
+                    .get(*mime_idx as usize)
+                    .cloned()
+                    .ok_or_else(|| {
+                        io::Error::new(io::ErrorKind::InvalidData, "tail dirent mime out of range")
+                    })?;
+                let closed = self.w.as_ref().map(|w| w.cluster_offsets.len()).unwrap_or(0);
+                DirentBytes::Item {
+                    mime_idx: self.mime_idx_of(&mime)?,
+                    cluster: self.resolve_blob(*blob, closed)?,
+                    blob: blob.blob,
+                }
+            }
+            DirentKind::Redirect { .. } | DirentKind::Placeholder => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("unresolved tail redirect {key:?} in the streaming path"),
+                ));
+            }
+            DirentKind::RedirectIdx(t) => DirentBytes::Redirect { target: *t },
+        };
+        self.ensure_open()?;
+        let ws = self.w.as_mut().unwrap();
+        ws.emit(key.0, &key.1, &d.title, &kind)
+    }
+
+    /// Streaming mode: add the M/Counter, X/listing and W/mainPage tail
+    /// dirents (their blobs too — counter content first, then the listing,
+    /// the content order libzim's finish produces), emit every remaining
+    /// tail dirent and complete the file (pointer tables, header, checksum).
+    pub fn finish_write(&mut self) -> io::Result<()> {
+        // M/Counter content: "mime=count;..." over the C-item tally,
+        // COMPRESSED (text/plain), like the record path's finish.
+        let counter_content = self
+            .mime_counter
+            .iter()
+            .map(|(m, c)| format!("{m}={c}"))
+            .collect::<Vec<_>>()
+            .join(";");
+        let (compress, generation, blob) = self.add_item_data(true, counter_content.as_bytes())?;
+        // Tails registered after the freeze still carry insertion-order ids;
+        // emission re-derives the sorted id from the string.
+        let counter_mime_idx = self.mime_insertion_idx("text/plain")?;
+        let counter = ((b'M', "Counter".to_string()), Dirent {
+            kind: DirentKind::Item {
+                mime_idx: counter_mime_idx,
+                blob: BlobRef { compress, generation, blob },
+            },
+            title: String::new(),
+            front_article: false,
+            idx: 0,
+            removed: false,
+        });
+
+        // X/listing/titleOrdered/v1 content: the caller-built u32 LE entry
+        // indexes, UNCOMPRESSED.
+        let listing = std::mem::take(&mut self.listing_bytes);
+        let (compress, generation, blob) = self.add_item_data(false, &listing)?;
+        let listing_mime_idx = self.mime_insertion_idx(LISTING_MIME)?;
+        let listing = ((b'X', "listing/titleOrdered/v1".to_string()), Dirent {
+            kind: DirentKind::Item {
+                mime_idx: listing_mime_idx,
+                blob: BlobRef { compress, generation, blob },
+            },
+            title: String::new(),
+            front_article: false,
+            idx: 0,
+            removed: false,
+        });
+
+        // W/mainPage when the caller resolved a target.
+        let main_page = self
+            .main_target
+            .map(|t| ((b'W', "mainPage".to_string()), Dirent {
+                kind: DirentKind::RedirectIdx(t),
+                title: String::new(),
+                front_article: false,
+                idx: 0,
+                removed: false,
+            }));
+
+        {
+            let ws = self.w.as_mut().unwrap();
+            ws.tails.push(counter);
+            ws.tails.push(listing);
+            if let Some(mp) = main_page {
+                ws.tails.push(mp);
+            }
+            ws.tails.sort_by(|a, b| a.0.cmp(&b.0));
+        }
+        self.flush_all_tails()?;
+        self.finish_tail()
+    }
+
+    /// Emit every remaining tail dirent (sorted; the counter/listing
+    /// main-page ones merged in by `finish_write`).
+    fn flush_all_tails(&mut self) -> io::Result<()> {
+        loop {
+            let more = {
+                let ws = self.w.as_ref().unwrap();
+                ws.tail_next < ws.tails.len()
+            };
+            if !more {
+                return Ok(());
+            }
+            let (key, d) = {
+                let ws = self.w.as_ref().unwrap();
+                (ws.tails[ws.tail_next].0.clone(), ws.tails[ws.tail_next].1.clone())
+            };
+            self.w.as_mut().unwrap().tail_next += 1;
+            self.emit_tail_dirent(&key, &d)?;
+        }
+    }
+
+    /// Complete the streamed file: patch the MIME list into the header gap,
+    /// close the two open clusters (compressed first, like libzim), then
+    /// write the path pointer table, cluster pointer table, header and MD5
+    /// checksum.
+    fn finish_tail(&mut self) -> io::Result<()> {
+        // MIME list at offset 80 (the area was written as zeros).
+        let mut mime_blob = Vec::new();
+        for mime in &self.mime_by_idx {
+            mime_blob.extend_from_slice(mime.as_bytes());
+            mime_blob.push(0);
+        }
+        mime_blob.push(0);
+        assert!(
+            HEADER_SIZE + mime_blob.len() as u64 <= CLUSTER_BASE_OFFSET,
+            "mime type list too big"
+        );
+        {
+            let ws = self.w.as_mut().unwrap();
+            ws.out.flush()?;
+            ws.out.seek(SeekFrom::Start(HEADER_SIZE))?;
+            ws.out.write_all(&mime_blob)?;
+            let pad = CLUSTER_BASE_OFFSET - HEADER_SIZE - mime_blob.len() as u64;
+            ws.out.write_all(&vec![0u8; pad as usize])?;
+            ws.out.seek(SeekFrom::Start(ws.pos))?;
+        }
+        self.close_cluster(Slot::Compressed)?;
+        self.close_cluster(Slot::Uncompressed)?;
+        let ws = self.w.as_mut().unwrap();
+        let dirent_start = ws.dirent_start.unwrap_or(ws.pos);
+        let path_ptr_pos = ws.dirent_end;
+        // The path pointer table follows the dirent section; the cluster
+        // pointer table follows it. `at` tracks the true append position
+        // (ws.pos is not advanced by these writes).
+        let mut at = ws.pos;
+        for &off in &ws.dirent_offsets {
+            ws.out.write_all(&(dirent_start + off).to_le_bytes())?;
+            at += 8;
+        }
+        let cluster_ptr_pos = at;
+        for &off in &ws.cluster_offsets {
+            ws.out.write_all(&off.to_le_bytes())?;
+            at += 8;
+        }
+        let checksum_pos = at;
+        let header = ZimHeader {
+            major: ZIM_MAJOR,
+            minor: ZIM_MINOR_VERSION,
+            uuid: self.uuid,
+            entry_count: ws.dirent_offsets.len() as u32,
+            cluster_count: ws.cluster_offsets.len() as u32,
+            url_ptr_pos: path_ptr_pos,
+            title_ptr_pos: NO_TITLE_PTR_POS,
+            cluster_ptr_pos,
+            mime_list_pos: HEADER_SIZE,
+            main_page: ws.main_page_idx.unwrap_or(u32::MAX),
+            layout_page: NO_LAYOUT_PAGE,
+            checksum_pos,
+        }
+        .serialize();
+        ws.out.flush()?;
+        ws.out.seek(SeekFrom::Start(0))?;
+        ws.out.write_all(&header)?;
+        // MD5 over everything before checksumPos (libzim's writeChecksum):
+        // re-read the flushed file, then append the digest.
+        ws.out.flush()?;
+        let mut rf = std::fs::File::open(&self.out_path)?;
+        let mut hasher = md5::Md5::new();
+        let mut left = checksum_pos;
+        let mut buf = vec![0u8; 65536];
+        while left > 0 {
+            let want = left.min(buf.len() as u64) as usize;
+            rf.read_exact(&mut buf[..want])?;
+            hasher.update(&buf[..want]);
+            left -= want as u64;
+        }
+        let digest: [u8; 16] = hasher.finalize().into();
+        ws.out.seek(SeekFrom::Start(checksum_pos))?;
+        ws.out.write_all(&digest)?;
+        ws.out.flush()?;
+        Ok(())
     }
 
     /// Add a redirection. If `target_path` was not added yet, a placeholder
@@ -551,7 +1088,7 @@ impl ZimCreator {
         let mime_idx = self.get_mime_idx(mime)?;
         self.ensure_dirent_can_be_added(b'M', name)?;
         let compress = is_compressible_mimetype(mime);
-        let blob = self.add_item_data(compress, content);
+        let blob = self.add_item_data(compress, content)?;
         self.add_or_update(
             b'M',
             name,
@@ -686,21 +1223,10 @@ impl ZimCreator {
             d.idx = i as u32;
         }
 
-        // 5. MIME list resolved: SORTED alphabetically, dirent mime ids
-        // remapped from insertion order to the sorted position.
-        let old_mimes = std::mem::take(&mut self.mime_by_idx);
-        let mut sorted_mimes = old_mimes.clone();
-        sorted_mimes.sort();
-        let mapping: Vec<u16> = old_mimes
-            .iter()
-            .map(|m| sorted_mimes.binary_search(m).unwrap_or(0) as u16)
-            .collect();
-        self.mime_by_idx = sorted_mimes;
-        for Dirent { kind, .. } in self.dirents.values_mut() {
-            if let DirentKind::Item { mime_idx, .. } = kind {
-                *mime_idx = mapping[*mime_idx as usize];
-            }
-        }
+        // 5. MIME list resolved: SORTED alphabetically (libzim's
+        //    resolveMimeTypes). Dirent ids resolve by string lookup when the
+        //    dirents are streamed out below.
+        self.freeze_mimes();
 
         // 6. M/Counter content ("mime=count;..."), COMPRESSED (text/plain).
         let counter_content = self
@@ -709,7 +1235,7 @@ impl ZimCreator {
             .map(|(m, c)| format!("{m}={c}"))
             .collect::<Vec<_>>()
             .join(";");
-        let (compress, generation, blob_num) = self.add_item_data(true, counter_content.as_bytes());
+        let (compress, generation, blob_num) = self.add_item_data(true, counter_content.as_bytes())?;
         if let Some(Dirent { kind: DirentKind::Item { blob, .. }, .. }) =
             self.dirents.get_mut(&(b'M', "Counter".to_string()))
         {
@@ -731,7 +1257,7 @@ impl ZimCreator {
         for (_, _, idx) in &articles {
             listing_blob.extend_from_slice(&idx.to_le_bytes());
         }
-        let lb = self.add_item_data(false, &listing_blob);
+        let lb = self.add_item_data(false, &listing_blob)?;
         if let Some(Dirent { kind: DirentKind::Item { blob, .. }, .. }) = self
             .dirents
             .get_mut(&(b'X', "listing/titleOrdered/v1".to_string()))
@@ -740,10 +1266,65 @@ impl ZimCreator {
         }
 
         // 8. Close the open clusters (compressed first, then the uncompressed
-        // one — libzim's order), then write the file.
-        self.close_cluster(Slot::Compressed);
-        self.close_cluster(Slot::Uncompressed);
-        self.write_file()
+        // one — libzim's order; they stream to the file), then stream every
+        // dirent out in sorted order and complete the file.
+        self.close_cluster(Slot::Compressed)?;
+        self.close_cluster(Slot::Uncompressed)?;
+
+        // Target entry indexes: post-cleanup map position (sorted order).
+        let idx_of: HashMap<&(u8, String), u32> =
+            self.dirents.keys().enumerate().map(|(i, k)| (k, i as u32)).collect();
+        let mut items = Vec::with_capacity(self.dirents.len());
+        for ((ns, path), d) in &self.dirents {
+            items.push(match &d.kind {
+                DirentKind::Item { mime_idx, blob } => {
+                    let mime = self.mime_insertion[*mime_idx as usize].clone();
+                    DirentOut::Item {
+                        ns: *ns,
+                        path: path.clone(),
+                        title: d.title.clone(),
+                        mime,
+                        blob: *blob,
+                    }
+                }
+                DirentKind::Redirect { target } => DirentOut::Redirect {
+                    ns: *ns,
+                    path: path.clone(),
+                    title: d.title.clone(),
+                    target_idx: *idx_of.get(target).ok_or_else(|| {
+                        io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            format!("dangling redirect {}/{path} remains", *ns as char),
+                        )
+                    })?,
+                },
+                DirentKind::RedirectIdx(target) => DirentOut::Redirect {
+                    ns: *ns,
+                    path: path.clone(),
+                    title: d.title.clone(),
+                    target_idx: *target,
+                },
+                DirentKind::Placeholder => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!("unfilled placeholder {}/{path} remains", *ns as char),
+                    ));
+                }
+            });
+        }
+        self.write_stream(items.into_iter())
+    }
+
+    /// Shared file tail: stream `dirents` (already in final sorted order,
+    /// everything resolved) into the output, then the pointer tables,
+    /// header and checksum. Serves the record path (materialized dirents)
+    /// and — piecewise — the streaming path.
+    fn write_stream(&mut self, dirents: impl Iterator<Item = DirentOut>) -> io::Result<()> {
+        self.ensure_open()?;
+        for d in dirents {
+            self.emit_resolved(d)?;
+        }
+        self.finish_tail()
     }
 
     /// libzim's `detectDanglingRedirects`: a redirection whose target is still
@@ -793,6 +1374,8 @@ impl ZimCreator {
                 index += 1;
                 let next = match &self.dirents[&cur].kind {
                     DirentKind::Redirect { target } => Some(target.clone()),
+                    // A stream-mode main page never takes part in the cleanup.
+                    DirentKind::RedirectIdx(_) => break,
                     DirentKind::Placeholder => None,
                     DirentKind::Item { .. } => break,
                 };
@@ -832,160 +1415,42 @@ impl ZimCreator {
     fn drop_removed_redirects(&mut self) {
         self.dirents.retain(|_, d| !d.removed);
     }
-
-    fn write_file(&mut self) -> io::Result<()> {
-        // Dirent bytes (all known here); offsets are relative to the section.
-        let mut dirent_bytes: Vec<u8> = Vec::new();
-        let mut dirent_offsets: Vec<u64> = Vec::with_capacity(self.dirents.len());
-        for ((ns, path), d) in &self.dirents {
-            dirent_offsets.push(dirent_bytes.len() as u64);
-            write_dirent(&mut dirent_bytes, *ns, path, d, self)?;
-        }
-
-        let mut mime_blob = Vec::new();
-        for mime in &self.mime_by_idx {
-            mime_blob.extend_from_slice(mime.as_bytes());
-            mime_blob.push(0);
-        }
-        mime_blob.push(0);
-        assert!(
-            HEADER_SIZE + mime_blob.len() as u64 <= CLUSTER_BASE_OFFSET,
-            "mime type list too big"
-        );
-
-        let mut f = std::fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .open(&self.out_path)?;
-        let mut out = io::BufWriter::new(&mut f);
-        // Placeholder header (overwritten at the very end, like libzim's
-        // writeLastParts seek(0) + header.write).
-        out.write_all(&[0u8; HEADER_SIZE as usize])?;
-        out.write_all(&mime_blob)?;
-        out.write_all(&vec![0u8; (CLUSTER_BASE_OFFSET - HEADER_SIZE - mime_blob.len() as u64) as usize])?;
-
-        // Clusters at CLUSTER_BASE_OFFSET, in close order.
-        let mut cluster_offsets: Vec<u64> = Vec::with_capacity(self.closed_clusters.len());
-        let mut pos = CLUSTER_BASE_OFFSET;
-        for c in &self.closed_clusters {
-            cluster_offsets.push(pos);
-            pos += c.write_to(&mut out)? as u64;
-        }
-
-        // Dirents, then the path pointer table (u64 LE offsets per dirent).
-        let dirent_start = pos;
-        out.write_all(&dirent_bytes)?;
-        let path_ptr_pos = dirent_start + dirent_bytes.len() as u64;
-        for &off in &dirent_offsets {
-            out.write_all(&(dirent_start + off).to_le_bytes())?;
-        }
-
-        // Cluster pointer table (u64 LE absolute offsets per cluster).
-        let cluster_ptr_pos = path_ptr_pos + self.dirents.len() as u64 * 8;
-        for &off in &cluster_offsets {
-            out.write_all(&off.to_le_bytes())?;
-        }
-        let checksum_pos = cluster_ptr_pos + self.closed_clusters.len() as u64 * 8;
-
-        let main_page = self
-            .dirents
-            .get(&(b'W', "mainPage".to_string()))
-            .map(|d| d.idx)
-            .unwrap_or(u32::MAX);
-        let header = ZimHeader {
-            major: ZIM_MAJOR,
-            minor: ZIM_MINOR_VERSION,
-            uuid: self.uuid,
-            entry_count: self.dirents.len() as u32,
-            cluster_count: self.closed_clusters.len() as u32,
-            url_ptr_pos: path_ptr_pos,
-            title_ptr_pos: NO_TITLE_PTR_POS,
-            cluster_ptr_pos,
-            mime_list_pos: HEADER_SIZE,
-            main_page,
-            layout_page: NO_LAYOUT_PAGE,
-            checksum_pos,
-        }
-        .serialize();
-
-        // Write the real header at 0 (libzim writes it last), flush, then
-        // compute the checksum by re-reading the file from 0 (libzim's
-        // writeChecksum) and append the 16-byte digest.
-        out.flush()?;
-        drop(out);
-        f.seek(SeekFrom::Start(0))?;
-        f.write_all(&header)?;
-        let mut hasher = md5::Md5::new();
-        let mut left = checksum_pos;
-        let mut buf = [0u8; 65536];
-        f.seek(SeekFrom::Start(0))?;
-        while left > 0 {
-            let want = left.min(buf.len() as u64) as usize;
-            f.read_exact(&mut buf[..want])?;
-            hasher.update(&buf[..want]);
-            left -= want as u64;
-        }
-        let digest: [u8; 16] = hasher.finalize().into();
-        f.seek(SeekFrom::Start(checksum_pos))?;
-        f.write_all(&digest)?;
-        f.sync_all()?;
-        Ok(())
-    }
 }
 
 /// Serialize one dirent (libzim's `Dirent::write`): the 12/16-byte head, then
 /// the path (NUL-terminated), then the title — omitted when equal to the
 /// path (libzim's PathTitleTinyString::concat) — and a final NUL.
 fn write_dirent(
-    out: &mut Vec<u8>,
+    out: &mut impl Write,
     ns: u8,
     path: &str,
-    d: &Dirent,
-    creator: &ZimCreator,
+    title: &str,
+    k: &DirentBytes,
 ) -> io::Result<()> {
-    match &d.kind {
-        DirentKind::Item { mime_idx, blob } => {
-            let cluster = creator.cluster_number(blob.compress, blob.generation);
-            out.extend_from_slice(&mime_idx.to_le_bytes());
-            out.push(0); // parameter size
-            out.push(ns);
-            out.extend_from_slice(&0u32.to_le_bytes()); // revision
-            out.extend_from_slice(&cluster.to_le_bytes());
-            out.extend_from_slice(&blob.blob.to_le_bytes());
+    match k {
+        DirentBytes::Item { mime_idx, cluster, blob } => {
+            out.write_all(&mime_idx.to_le_bytes())?;
+            out.write_all(&[0])?; // parameter size
+            out.write_all(&[ns])?;
+            out.write_all(&0u32.to_le_bytes())?; // revision
+            out.write_all(&cluster.to_le_bytes())?;
+            out.write_all(&blob.to_le_bytes())?;
         }
-        DirentKind::Redirect { target } => {
-            let target_idx = creator
-                .dirents
-                .get(target)
-                .map(|t| t.idx)
-                .ok_or_else(|| {
-                    io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        format!("dangling redirect {}/{} remains", ns as char, path),
-                    )
-                })?;
-            out.extend_from_slice(&MIME_REDIRECT.to_le_bytes());
-            out.push(0); // parameter size
-            out.push(ns);
-            out.extend_from_slice(&0u32.to_le_bytes()); // revision
-            out.extend_from_slice(&target_idx.to_le_bytes());
-        }
-        DirentKind::Placeholder => {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("unfilled placeholder {}/{} remains", ns as char, path),
-            ));
+        DirentBytes::Redirect { target } => {
+            out.write_all(&MIME_REDIRECT.to_le_bytes())?;
+            out.write_all(&[0])?; // parameter size
+            out.write_all(&[ns])?;
+            out.write_all(&0u32.to_le_bytes())?; // revision
+            out.write_all(&target.to_le_bytes())?;
         }
     }
     // pathTitle: path, NUL, then the title only when it differs from the path.
-    out.extend_from_slice(path.as_bytes());
-    out.push(0);
-    if d.title != path {
-        out.extend_from_slice(d.title.as_bytes());
+    out.write_all(path.as_bytes())?;
+    out.write_all(&[0])?;
+    if title != path {
+        out.write_all(title.as_bytes())?;
     }
-    out.push(0);
+    out.write_all(&[0])?;
     Ok(())
 }
 
@@ -1336,7 +1801,6 @@ assert_eq!(mime_end, 196, "mime list = 6 types + terminator");
         zc.add_item("a", "A", "text/plain", false, true, b"body".to_vec()).unwrap();
         zc.add_xapian_index("title/xapian", &db_path).unwrap();
         zc.finish().unwrap();
-
         let z = Zim::open(&out_path).unwrap();
         let idx = z.find_entry(b'X', "title/xapian").unwrap().unwrap();
         let e = z.get_entry(idx).unwrap();

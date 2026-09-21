@@ -9,6 +9,7 @@
 //! `.zim` file or a chunked archive (`.zimaa`, `.zimab`, ...).
 
 use memmap2::Mmap;
+use std::collections::HashSet;
 use std::fs::File;
 use std::io::{self, ErrorKind};
 use std::path::{Path, PathBuf};
@@ -171,6 +172,9 @@ struct BlobLocation {
 }
 
 /// A ZIM archive.
+///
+/// `Zim` is `Sync` (plain fields over read-only `memmap2::Mmap`s): one
+/// `&Zim` is shared across the parallel convert pass's worker threads.
 pub struct Zim {
     store: Store,
     pub header: ZimHeader,
@@ -523,6 +527,156 @@ impl Zim {
         let take = (e - s).min(max);
         let data = dec.decode_to(s + take)?;
         Ok(data[s as usize..(s + take) as usize].to_vec())
+    }
+
+    /// Parse the directory entry at `idx`, returning only the MIME id and the
+    /// target - no path/title allocation. The lean read the parallel convert
+    /// pass uses to classify every entry before the (rarer) full reads.
+    pub fn entry_head(&self, idx: u32) -> io::Result<(u16, Target)> {
+        let off = self.dirent_offset(idx)?;
+        if off >= self.store.len() {
+            return Err(io::Error::new(ErrorKind::InvalidData, "entry offset out of bounds"));
+        }
+        let window = self.store.read(off, 16.min(self.store.len() - off))?;
+        if window.len() < 8 {
+            return Err(io::Error::new(ErrorKind::InvalidData, "truncated directory entry"));
+        }
+        let mime = u16le(&window[0..2]);
+        let target = match mime {
+            MIME_REDIRECT => {
+                if window.len() < 12 {
+                    return Err(io::Error::new(ErrorKind::InvalidData, "truncated directory entry"));
+                }
+                Target::Redirect(u32le(&window[8..12]))
+            }
+            MIME_LINKTARGET | MIME_DELETED => Target::None,
+            _ => {
+                if window.len() < 16 {
+                    return Err(io::Error::new(ErrorKind::InvalidData, "truncated directory entry"));
+                }
+                Target::Cluster(u32le(&window[8..12]), u32le(&window[12..16]))
+            }
+        };
+        Ok((mime, target))
+    }
+
+    /// Follow the redirect chain starting at entry `idx` to the first
+    /// non-redirect entry (transitively, cycle-safe, hence bounded).
+    /// `None` when the chain leaves the entry range or cycles - a dangling
+    /// redirect, like `zim2zim.redirect_target`.
+    pub fn redirect_terminal(&self, idx: u32) -> Option<u32> {
+        let mut seen: HashSet<u32> = HashSet::new();
+        let mut cur = idx;
+        loop {
+            if cur >= self.header.entry_count || !seen.insert(cur) {
+                return None;
+            }
+            let (_, target) = self.entry_head(cur).ok()?;
+            match target {
+                Target::Redirect(next) => cur = next,
+                _ => return Some(cur),
+            }
+        }
+    }
+
+    /// The whole decompressed payload of a cluster: the blob-offset table
+    /// followed by the blob bytes (everything after the cluster's info
+    /// byte). Uncompressed clusters return their raw body; compressed
+    /// clusters are decoded in full (the caller decides whether to share or
+    /// cache the result - see convert's `ClusterCache`).
+    pub fn decompress_cluster(&self, cluster: u32) -> io::Result<Vec<u8>> {
+        let (start, end) = self.cluster_range(cluster)?;
+        let info = self.store.read(start, 1)?[0];
+        let compression = info & CLUSTER_COMPRESSION_MASK;
+        if compression == 0 || compression == CLUSTER_UNCOMPRESSED {
+            return Ok(self.store.read(start + 1, end - start - 1)?[..].to_vec());
+        }
+        let body = self.store.read(start + 1, end - start - 1)?;
+        let sz = if (info & CLUSTER_EXTENDED_BIT) != 0 { 8 } else { 4 };
+        let mut dec = ClusterDecoder::new(compression, &body)?;
+        // The decompressed data starts with the blob-offset table, whose
+        // first entry gives the table's own byte size; the LAST entry is the
+        // total payload size (each offset carries that size as delta), so
+        // the full decode length is known from the table alone.
+        let tbl_size = table_int(dec.decode_to(sz as u64)?, 0, sz);
+        if tbl_size < sz as u64 || tbl_size % sz as u64 != 0 {
+            return Err(io::Error::new(ErrorKind::InvalidData, "malformed cluster blob table"));
+        }
+        let tbl = dec.decode_to(tbl_size)?;
+        let total = table_int(tbl, tbl_size as usize - sz, sz);
+        if total < tbl_size {
+            return Err(io::Error::new(ErrorKind::InvalidData, "malformed cluster blob table"));
+        }
+        Ok(dec.decode_to(total)?.to_vec())
+    }
+
+    /// The byte span `(start, end)` of blob `blob` within a cluster's
+    /// decompressed payload (the [`decompress_cluster`] indexing space).
+    /// Compressed clusters decode only their blob-offset table (a partial
+    /// decompression from the frame start); uncompressed clusters read the
+    /// table straight from the file.
+    pub fn blob_span(&self, cluster: u32, blob: u32) -> io::Result<(u64, u64)> {
+        let (start, end) = self.cluster_range(cluster)?;
+        let info = self.store.read(start, 1)?[0];
+        let compression = info & CLUSTER_COMPRESSION_MASK;
+        let sz = if (info & CLUSTER_EXTENDED_BIT) != 0 { 8u64 } else { 4u64 };
+        let body_len = end - start - 1;
+        let (s, e) = if compression == 0 || compression == CLUSTER_UNCOMPRESSED {
+            let tbl0 = start + 1 + blob as u64 * sz;
+            let (a, b) = if sz == 8 {
+                (
+                    u64le(&self.store.read(tbl0, 8)?),
+                    u64le(&self.store.read(tbl0 + 8, 8)?),
+                )
+            } else {
+                (
+                    u32le(&self.store.read(tbl0, 4)?) as u64,
+                    u32le(&self.store.read(tbl0 + 4, 4)?) as u64,
+                )
+            };
+            (a, b)
+        } else {
+            let body = self.store.read(start + 1, body_len)?;
+            let mut dec = ClusterDecoder::new(compression, &body)?;
+            let tbl_size = table_int(dec.decode_to(sz)?, 0, sz as usize);
+            if tbl_size < sz || tbl_size % sz != 0 {
+                return Err(io::Error::new(ErrorKind::InvalidData, "malformed cluster blob table"));
+            }
+            let n = tbl_size / sz; // offsets including the end sentinel
+            if blob as u64 + 1 >= n {
+                return Err(io::Error::new(ErrorKind::InvalidData, "blob index out of bounds"));
+            }
+            let tbl = dec.decode_to(tbl_size)?;
+            (
+                table_int(tbl, blob as usize * sz as usize, sz as usize),
+                table_int(tbl, (blob as usize + 1) * sz as usize, sz as usize),
+            )
+        };
+        if s > e {
+            return Err(io::Error::new(ErrorKind::InvalidData, "malformed cluster blob table"));
+        }
+        Ok((s, e))
+    }
+
+    /// The bytes of a blob in an UNCOMPRESSED cluster, borrowed from the
+    /// mmap where possible (no decompression, no copy). Compressed clusters
+    /// are rejected: their callers decode the whole cluster at once.
+    pub fn raw_blob(&self, cluster: u32, blob: u32) -> io::Result<std::borrow::Cow<'_, [u8]>> {
+        let loc = self.locate_blob(cluster, blob)?;
+        let voff = loc.file_offset.ok_or_else(|| {
+            io::Error::new(ErrorKind::InvalidData, "compressed cluster: decode it as a whole")
+        })?;
+        self.store.read(voff, loc.length)
+    }
+
+    /// Whether the cluster's payload is compressed (zstd/lzma). Uncompressed
+    /// cluster blobs are direct mmap views (see [`raw_blob`]); the parallel
+    /// convert pass caches decompressed compressed clusters only.
+    pub fn cluster_is_compressed(&self, cluster: u32) -> io::Result<bool> {
+        let (start, _) = self.cluster_range(cluster)?;
+        let info = self.store.read(start, 1)?[0];
+        let compression = info & CLUSTER_COMPRESSION_MASK;
+        Ok(compression != 0 && compression != CLUSTER_UNCOMPRESSED)
     }
 
     /// Directory names under which a ZIM may embed its two search indexes:
