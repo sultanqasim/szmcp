@@ -4,7 +4,8 @@ An [MCP](https://modelcontextprotocol.io) server and CLI that serve content
 from [Kiwix ZIM files](https://www.kiwix.org/). The ZIM articles are exposed
 through a small set of tools, either as an MCP server over the streamable
 HTTP transport (with CORS headers so it can be used from browsers) or as
-one-shot CLI subcommands.
+one-shot CLI subcommands. There is also functionality to convert ZIM archives
+from HTML to Markdown for space efficiency and readability.
 
 ## Why I made this
 
@@ -51,6 +52,15 @@ context efficient, making usage with small local LLMs on not overly powerful
 computers practical. It's also a single binary written in Rust, keeping
 deployment simple and the code relatively efficient.
 
+I also wanted good quality conversion of Wikipedia pages from HTML to Markdown,
+in a manner that uses Markdown syntax effectively, makes infoboxes easily
+readable, preserves complex tables as HTML while keeping simple tables pure
+Markdown, and which generally produces nice clean-looking output on all pages.
+I wrote a bunch of custom HTML to Markdown conversion logic to nicely handle
+Wikipedia pages, while also providing a more generic HTML to Markdown conversion
+path for non-wiki pages. The HTML to Markdown and ZIM rewriting code is
+horrendously complicated and far from beautiful, but it works.
+
 This project is unashamedly almost entirely vibe coded. I made it with GLM 5.3
 Flash mostly. Even this README was all LLM generated, aside from this one section.
 I won't pretend this is some masterpiece, but it does the job and seems solid.
@@ -58,13 +68,6 @@ You can connect it to the [llama.cpp](https://github.com/ggml-org/llama.cpp)
 llama-server web UI's built in agentic loop, or connect it to your own agent
 of choice. You can also just use the tools it exposes from the command line
 interface to manually explore ZIM files.
-
-This project **does not convert HTML into Markdown**. Content is presented to
-the LLM in its original format. Nevertheless, given that Markdown is much more
-token efficient than HTML, and perhaps easier for the LLM to parse too, I
-recommend using Wikipedia ZIM files that have been converted to Markdown.
-Such files are also more space efficient on disk. I made a Python
-[script](https://github.com/sultanqasim/wikizim_parser) to do this conversion.
 
 ## Tools
 
