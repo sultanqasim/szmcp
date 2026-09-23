@@ -537,14 +537,16 @@ impl<'a> Rank<'a> {
 /// worker fetch-adds; the skip tally sits behind a mutex). `next` hands out
 /// the work (512-entry chunks in the classification pre-pass, one cluster
 /// task per fetch-add in the conversion walk; reset between the phases),
-/// `processed` counts classified entries and
-/// `articles_done`/`articles_total` is the walk's per-article progress.
+/// `processed` counts classified entries, `redirects` counts the redirect
+/// records stored by the pre-pass, and `articles_done`/`articles_total` is
+/// the walk's per-article progress.
 /// `ft_docs` IS the converted-article count: every successful conversion
 /// adds exactly one fulltext document.
 #[derive(Default)]
 struct Shared {
     next: AtomicU64,
     processed: AtomicU64,
+    redirects: AtomicU64,
     articles_done: AtomicU64,
     articles_total: u64,
     failed: AtomicU64,
@@ -780,14 +782,22 @@ pub fn convert(
         // mimes are tallied); every HTML article only contributes its
         // (cluster, blob, entry) coordinates to the collector below.
         let coords: Mutex<Vec<(u32, u32, u32)>> = Mutex::new(Vec::new());
+        let t_classify = Instant::now();
+        eprintln!("Classifying {end} entries (dirent headers only)...");
         run_chunk_workers(threads, &shared.next, end, |start, stop| {
             let mut found: Vec<(u32, u32, u32)> = Vec::new();
             for idx in start..stop {
-                shared.processed.fetch_add(1, Ordering::Relaxed);
+                let n = shared.processed.fetch_add(1, Ordering::Relaxed);
+                if n % STATUS_EVERY == STATUS_EVERY - 1 {
+                    // \r, not \n: the next status overwrites this one; the
+                    // epilogue after the join submits the final newline.
+                    eprint!("[{}/{end}] entries classified\r", n + 1);
+                }
                 let (mime, target) = z
                     .entry_head(idx)
                     .map_err(|e| format!("reading entry {idx}: {e}"))?;
                 if mime == MIME_REDIRECT {
+                    shared.redirects.fetch_add(1, Ordering::Relaxed);
                     // A redirect: resolve its terminal and the terminal's mime
                     // NOW (dirent headers only, no blobs) and store both in the
                     // record; liveness is decided after the join, when the
@@ -834,6 +844,20 @@ pub fn convert(
             coords.lock().unwrap().extend(found);
             Ok(())
         })?;
+
+        // Submit the final newline after the last \r status line (the walk
+        // does the same for its own \r stream after its join), then report
+        // the pre-pass tallies before the coordinates are sorted.
+        if end >= STATUS_EVERY as u32 {
+            eprintln!();
+        }
+        let dt = t_classify.elapsed().as_secs_f64();
+        let articles = coords.lock().unwrap().len();
+        let redirects = shared.redirects.load(Ordering::Relaxed);
+        let skipped_total = shared.skipped.lock().unwrap().values().sum::<usize>();
+        eprintln!(
+            "  classified {end} entries in {dt:.1}s: {articles} articles, {redirects} redirects, {skipped_total} skipped"
+        );
 
         // Between the phases: the collected coordinates sort by (cluster,
         // blob) — ascending cluster order is what makes the source reads
@@ -972,8 +996,8 @@ pub fn convert(
             })?;
         }
 
-        // Submit the final newline after the last \r status line (the walk's
-        // own counter — the pre-pass prints nothing).
+        // Submit the final newline after the last \r status line of the walk
+        // (the pre-pass's own \r stream got its newline after its join).
         if shared.articles_done.load(Ordering::Relaxed) >= STATUS_EVERY {
             eprintln!();
         }
