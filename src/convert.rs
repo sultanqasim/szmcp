@@ -18,7 +18,7 @@
 //! document order: the parallel adds race the same way its workers do, and
 //! the two are equivalent as sets keyed by document data.
 
-use crate::zim::{Target, Zim};
+use crate::zim::{ClusterData, Target, Zim};
 use crate::zimcommon::MIME_REDIRECT;
 use crate::zimwrite::{BlobRef, DirentOut, ZimCreator};
 use std::collections::HashMap;
@@ -577,14 +577,15 @@ fn run_chunk_workers(
 
 /// A small shared cache of decompressed clusters: consecutive source
 /// entries usually share a cluster, so the workers turning N articles into
-/// markdown turn ~N/cluster_size decompressions into one per cluster. FIFO
-/// eviction by a total-bytes and an entry-count cap.
+/// markdown turn ~N/cluster_size decompressions into one per cluster, with
+/// the per-blob spans parsed once per decompress too. FIFO eviction by a
+/// total-bytes and an entry-count cap.
 struct ClusterCache {
     inner: Mutex<CacheInner>,
 }
 
 struct CacheInner {
-    map: HashMap<u32, std::sync::Arc<Vec<u8>>>,
+    map: HashMap<u32, std::sync::Arc<ClusterData>>,
     order: std::collections::VecDeque<u32>,
     bytes: usize,
 }
@@ -603,50 +604,53 @@ impl ClusterCache {
         }
     }
 
-    /// The cluster's decompressed payload: a hit clones the shared Arc; a
-    /// miss decompresses OUTSIDE the lock and inserts under it (two workers
-    /// missing the same cluster decompress twice; the second insert
+    /// The cluster's decompressed payload with its per-blob spans: a hit
+    /// clones the shared Arc; a miss decompresses OUTSIDE the lock (parsing
+    /// the blob-offset table once per cluster) and inserts under it (two
+    /// workers missing the same cluster decompress twice; the second insert
     /// replaces and the byte count is corrected).
-    fn cluster(&self, z: &Zim, cluster: u32) -> io::Result<std::sync::Arc<Vec<u8>>> {
+    fn cluster(&self, z: &Zim, cluster: u32) -> io::Result<std::sync::Arc<ClusterData>> {
         if let Some(d) = self.inner.lock().unwrap().map.get(&cluster) {
             return Ok(d.clone());
         }
-        let data = std::sync::Arc::new(z.decompress_cluster(cluster)?);
+        let cd = std::sync::Arc::new(z.decompress_cluster_with_spans(cluster)?);
         let mut c = self.inner.lock().unwrap();
-        c.bytes += data.len();
-        if let Some(old) = c.map.insert(cluster, data.clone()) {
-            c.bytes -= old.len();
+        c.bytes += cd.data.len();
+        if let Some(old) = c.map.insert(cluster, cd.clone()) {
+            c.bytes -= old.data.len();
         }
         c.order.push_back(cluster);
         while c.order.len() > CACHE_ENTRIES || (c.bytes > CACHE_BYTES && c.order.len() > 1) {
             let evict = c.order.pop_front().unwrap();
             if let Some(d) = c.map.remove(&evict) {
-                c.bytes -= d.len();
+                c.bytes -= d.data.len();
             }
         }
-        Ok(data)
+        Ok(cd)
     }
 }
 
 /// An article's HTML bytes: compressed clusters come from the shared cache
-/// (the whole cluster decodes once per worker wave), uncompressed clusters
-/// are borrowed straight from the mmap (`read_blob` would copy).
+/// (the whole cluster decodes once per worker wave, its blob-offset table
+/// parsed once per cluster too), uncompressed clusters are borrowed
+/// straight from the mmap (`read_blob` would copy).
 enum HtmlSource<'a> {
-    Shared(std::sync::Arc<Vec<u8>>, u64, u64),
+    Shared(std::sync::Arc<ClusterData>, u64, u64),
     Raw(std::borrow::Cow<'a, [u8]>),
 }
 
 impl HtmlSource<'_> {
     fn bytes(&self) -> &[u8] {
         match self {
-            HtmlSource::Shared(d, s, e) => &d[*s as usize..*e as usize],
+            HtmlSource::Shared(d, s, e) => &d.data[*s as usize..*e as usize],
             HtmlSource::Raw(cow) => cow,
         }
     }
 }
 
-/// Fetch one article blob through the cache (compressed) or a direct mmap
-/// view (uncompressed).
+/// Fetch one article blob through the cache (compressed: the span resolves
+/// from the cached cluster, no second read of the cluster body) or a direct
+/// mmap view (uncompressed).
 fn article_html<'a>(
     z: &'a Zim,
     cache: &ClusterCache,
@@ -654,9 +658,9 @@ fn article_html<'a>(
     blob: u32,
 ) -> io::Result<HtmlSource<'a>> {
     if z.cluster_is_compressed(cluster)? {
-        let data = cache.cluster(z, cluster)?;
-        let (s, e) = z.blob_span(cluster, blob)?;
-        Ok(HtmlSource::Shared(data, s, e))
+        let c = cache.cluster(z, cluster)?;
+        let (s, e) = c.span(blob)?;
+        Ok(HtmlSource::Shared(c, s, e))
     } else {
         Ok(HtmlSource::Raw(z.raw_blob(cluster, blob)?))
     }

@@ -201,6 +201,26 @@ pub struct Entry {
     pub target: Target,
 }
 
+/// A decompressed cluster payload (blob-offset table + blob bytes)
+/// plus the per-blob byte spans `(start, end)` within that payload,
+/// parsed once from the payload's own leading offset table.
+pub struct ClusterData {
+    pub data: Vec<u8>,
+    pub spans: Vec<(u64, u64)>,
+}
+
+impl ClusterData {
+    /// The `(start, end)` span of blob `blob` within the payload: the same
+    /// indexing space - and the same "blob index out of bounds" error - as
+    /// [`Zim::blob_span`], with no further reads of the cluster body.
+    pub fn span(&self, blob: u32) -> io::Result<(u64, u64)> {
+        self.spans
+            .get(blob as usize)
+            .copied()
+            .ok_or_else(|| io::Error::new(ErrorKind::InvalidData, "blob index out of bounds"))
+    }
+}
+
 /// Where a blob's bytes live. `file_offset`/`length` are only set for blobs in
 /// uncompressed clusters.
 struct BlobLocation {
@@ -242,6 +262,32 @@ fn table_int(d: &[u8], off: usize, sz: usize) -> u64 {
     } else {
         u32le(&d[off..off + 4]) as u64
     }
+}
+
+/// Parse a decompressed cluster payload's leading blob-offset table into
+/// per-blob `(start, end)` spans. The offsets cover the whole payload (the
+/// table included: the first entry IS the table's byte size) - exactly the
+/// indexing space [`Zim::blob_span`] hands out. Pure payload parsing, no
+/// file IO.
+fn parse_blob_spans(data: &[u8], sz: usize) -> io::Result<Vec<(u64, u64)>> {
+    if data.len() < sz {
+        return Err(io::Error::new(ErrorKind::InvalidData, "malformed cluster blob table"));
+    }
+    let tbl_size = table_int(data, 0, sz);
+    if tbl_size < sz as u64 || tbl_size % sz as u64 != 0 || tbl_size as usize > data.len() {
+        return Err(io::Error::new(ErrorKind::InvalidData, "malformed cluster blob table"));
+    }
+    let n = (tbl_size / sz as u64) as usize; // offsets including the end sentinel
+    let mut spans = Vec::with_capacity(n.saturating_sub(1));
+    for i in 0..n.saturating_sub(1) {
+        let s = table_int(data, i * sz, sz);
+        let e = table_int(data, (i + 1) * sz, sz);
+        if s > e {
+            return Err(io::Error::new(ErrorKind::InvalidData, "malformed cluster blob table"));
+        }
+        spans.push((s, e));
+    }
+    Ok(spans)
 }
 
 /// Incremental decoder for a compressed cluster body: decompressed bytes are
@@ -623,30 +669,42 @@ impl Zim {
     /// byte). Uncompressed clusters return their raw body; compressed
     /// clusters are decoded in full (the caller decides whether to share or
     /// cache the result - see convert's `ClusterCache`).
+    #[allow(dead_code)] // kept as the payload-only face of decompress_cluster_with_spans
     pub fn decompress_cluster(&self, cluster: u32) -> io::Result<Vec<u8>> {
+        Ok(self.decompress_cluster_with_spans(cluster)?.data)
+    }
+
+    /// [`decompress_cluster`], plus the per-blob `(start, end)` spans parsed
+    /// once from the payload's own leading blob-offset table - so a caller
+    /// that keeps the payload (see convert's `ClusterCache`) can index any
+    /// blob without reading the cluster body again.
+    pub fn decompress_cluster_with_spans(&self, cluster: u32) -> io::Result<ClusterData> {
         let (start, end) = self.cluster_range(cluster)?;
         let info = self.store.read(start, 1)?[0];
         let compression = info & CLUSTER_COMPRESSION_MASK;
-        if compression == 0 || compression == CLUSTER_UNCOMPRESSED {
-            return Ok(self.store.read(start + 1, end - start - 1)?[..].to_vec());
-        }
-        let body = self.store.read(start + 1, end - start - 1)?;
-        let sz = if (info & CLUSTER_EXTENDED_BIT) != 0 { 8 } else { 4 };
-        let mut dec = ClusterDecoder::new(compression, &body)?;
-        // The decompressed data starts with the blob-offset table, whose
-        // first entry gives the table's own byte size; the LAST entry is the
-        // total payload size (each offset carries that size as delta), so
-        // the full decode length is known from the table alone.
-        let tbl_size = table_int(dec.decode_to(sz as u64)?, 0, sz);
-        if tbl_size < sz as u64 || tbl_size % sz as u64 != 0 {
-            return Err(io::Error::new(ErrorKind::InvalidData, "malformed cluster blob table"));
-        }
-        let tbl = dec.decode_to(tbl_size)?;
-        let total = table_int(tbl, tbl_size as usize - sz, sz);
-        if total < tbl_size {
-            return Err(io::Error::new(ErrorKind::InvalidData, "malformed cluster blob table"));
-        }
-        Ok(dec.decode_to(total)?.to_vec())
+        let sz = if (info & CLUSTER_EXTENDED_BIT) != 0 { 8usize } else { 4usize };
+        let data = if compression == 0 || compression == CLUSTER_UNCOMPRESSED {
+            self.store.read(start + 1, end - start - 1)?[..].to_vec()
+        } else {
+            let body = self.store.read(start + 1, end - start - 1)?;
+            let mut dec = ClusterDecoder::new(compression, &body)?;
+            // The decompressed data starts with the blob-offset table, whose
+            // first entry gives the table's own byte size; the LAST entry is the
+            // total payload size (each offset carries that size as delta), so
+            // the full decode length is known from the table alone.
+            let tbl_size = table_int(dec.decode_to(sz as u64)?, 0, sz);
+            if tbl_size < sz as u64 || tbl_size % sz as u64 != 0 {
+                return Err(io::Error::new(ErrorKind::InvalidData, "malformed cluster blob table"));
+            }
+            let tbl = dec.decode_to(tbl_size)?;
+            let total = table_int(tbl, tbl_size as usize - sz, sz);
+            if total < tbl_size {
+                return Err(io::Error::new(ErrorKind::InvalidData, "malformed cluster blob table"));
+            }
+            dec.decode_to(total)?.to_vec()
+        };
+        let spans = parse_blob_spans(&data, sz)?;
+        Ok(ClusterData { data, spans })
     }
 
     /// The byte span `(start, end)` of blob `blob` within a cluster's
@@ -654,6 +712,7 @@ impl Zim {
     /// Compressed clusters decode only their blob-offset table (a partial
     /// decompression from the frame start); uncompressed clusters read the
     /// table straight from the file.
+    #[allow(dead_code)] // public API; the convert hot path now reads spans from ClusterData
     pub fn blob_span(&self, cluster: u32, blob: u32) -> io::Result<(u64, u64)> {
         let (start, end) = self.cluster_range(cluster)?;
         let info = self.store.read(start, 1)?[0];
