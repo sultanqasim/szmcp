@@ -2,27 +2,32 @@
 //! turn a Kiwix HTML ZIM into a ZIM of Markdown articles with fresh search
 //! indexes.
 //!
-//! The conversion is two passes over the source directory (path order):
-//! ONE full parallel walk (a pool of worker threads over fixed 512-entry
-//! chunks) converts HTML articles to markdown items, builds both Xapian
-//! documents OUTSIDE the database mutexes and stores a 12-byte record per
-//! entry (a redirect's resolved terminal rides in its record); membership
-//! is then pure arithmetic over the record flags, and a single-threaded
-//! finalize walks the members' dirent headers exactly once to stream the
-//! dirents in source order and build the title-ordered listing. Every
-//! entry is either converted (text/html article → markdown item),
-//! recreated (redirect whose chain resolves to a converted source HTML
-//! article) or skipped and tallied by MIME. Fulltext and title Xapian
-//! indexes are built as libzim 9.8.2 would build them (see
-//! `mcp_stuff/convert_notes.md`), with libzim's own nondeterministic
-//! document order: the parallel adds race the same way its workers do, and
-//! the two are equivalent as sets keyed by document data.
+//! The conversion is a lean parallel classification pass over the source
+//! dirents (a pool of worker threads over fixed 512-entry chunks in path
+//! order, dirent headers only, no blob IO) followed by a parallel
+//! conversion walk in ascending cluster order: scraper-built ZIMs append
+//! their clusters in completion order while their dirents are path-sorted,
+//! so a path-order walk re-reads the same compressed cluster once per
+//! article it serves, while cluster order reads and decodes each
+//! compressed cluster exactly once. The walk converts HTML articles to
+//! markdown items, builds both Xapian documents OUTSIDE the database
+//! mutexes and stores a 12-byte record per entry (a redirect's resolved
+//! terminal rides in its record); membership is then pure arithmetic over
+//! the record flags, and a single-threaded finalize walks the members'
+//! dirent headers exactly once to stream the dirents in source order and
+//! build the title-ordered listing. Every entry is either converted
+//! (text/html article → markdown item), recreated (redirect whose chain
+//! resolves to a converted source HTML article) or skipped and tallied by
+//! MIME. Fulltext and title Xapian indexes are built as libzim 9.8.2 would
+//! build them (see `mcp_stuff/convert_notes.md`), with libzim's own
+//! nondeterministic document order: the parallel adds race the same way
+//! its workers do, and the two are equivalent as sets keyed by document
+//! data.
 
-use crate::zim::{ClusterData, Target, Zim};
+use crate::zim::{Target, Zim};
 use crate::zimcommon::MIME_REDIRECT;
 use crate::zimwrite::{BlobRef, DirentOut, ZimCreator};
 use std::collections::HashMap;
-use std::io;
 use std::path::Path;
 use std::sync::atomic::{AtomicU32, AtomicU64, AtomicU8, Ordering};
 use std::sync::Mutex;
@@ -455,9 +460,9 @@ fn copy_illustration(z: &Zim, creator: &mut ZimCreator) -> Result<(), String> {
 // Parallel-pass infrastructure
 // ---------------------------------------------------------------------------
 
-/// Worker-pulled chunk size: fixed ranges keep each worker's work
-/// contiguous while the shared atomic counter hands chunks out
-/// dynamically, so heterogeneous cores stay busy.
+/// Worker-pulled chunk size of the classification pre-pass: fixed ranges
+/// keep each worker's work contiguous while the shared atomic counter
+/// hands chunks out dynamically, so heterogeneous cores stay busy.
 const CHUNK_ENTRIES: u64 = 512;
 
 /// WDB commit pacing: glass buffers every uncommitted change in RAM and
@@ -529,13 +534,19 @@ impl<'a> Rank<'a> {
 }
 
 /// Counters and tallies shared by the worker threads (atomic because every
-/// worker fetch-adds; the skip tally sits behind a mutex). `ft_docs` IS the
-/// converted-article count: every successful conversion adds exactly one
-/// fulltext document.
+/// worker fetch-adds; the skip tally sits behind a mutex). `next` hands out
+/// the work (512-entry chunks in the classification pre-pass, one cluster
+/// task per fetch-add in the conversion walk; reset between the phases),
+/// `processed` counts classified entries and
+/// `articles_done`/`articles_total` is the walk's per-article progress.
+/// `ft_docs` IS the converted-article count: every successful conversion
+/// adds exactly one fulltext document.
 #[derive(Default)]
 struct Shared {
     next: AtomicU64,
     processed: AtomicU64,
+    articles_done: AtomicU64,
+    articles_total: u64,
     failed: AtomicU64,
     md_bytes: AtomicU64,
     ft_docs: AtomicU64,
@@ -545,7 +556,8 @@ struct Shared {
 
 /// Run `worker` on `threads` scoped threads; each pulls fixed
 /// [`CHUNK_ENTRIES`] chunks from `next` until the range `end` is
-/// exhausted. A worker's first error stops it and surfaces to the caller.
+/// exhausted (the classification pre-pass's shape). A worker's first error
+/// stops it and surfaces to the caller.
 fn run_chunk_workers(
     threads: usize,
     next: &AtomicU64,
@@ -578,117 +590,49 @@ fn run_chunk_workers(
     }
 }
 
-/// A small shared cache of decompressed clusters: consecutive source
-/// entries usually share a cluster, so the workers turning N articles into
-/// markdown turn ~N/cluster_size decompressions into one per cluster, with
-/// the per-blob spans parsed once per decompress too. FIFO eviction by a
-/// total-bytes and an entry-count cap.
-struct ClusterCache {
-    inner: Mutex<CacheInner>,
-}
-
-struct CacheInner {
-    map: HashMap<u32, std::sync::Arc<ClusterData>>,
-    order: std::collections::VecDeque<u32>,
-    bytes: usize,
-}
-
-const CACHE_BYTES: usize = 128 * 1024 * 1024;
-const CACHE_ENTRIES: usize = 32;
-
-impl ClusterCache {
-    fn new() -> Self {
-        ClusterCache {
-            inner: Mutex::new(CacheInner {
-                map: HashMap::new(),
-                order: std::collections::VecDeque::new(),
-                bytes: 0,
-            }),
+/// [`run_chunk_workers`]'s task-based sibling for the conversion walk:
+/// each worker pulls ONE task from `next` until `tasks` is exhausted. A
+/// worker's first error stops it and surfaces to the caller.
+fn run_task_workers<T: Sync>(
+    threads: usize,
+    next: &AtomicU64,
+    tasks: &[T],
+    worker: impl Fn(&T) -> Result<(), String> + Sync,
+) -> Result<(), String> {
+    let error: Mutex<Option<String>> = Mutex::new(None);
+    std::thread::scope(|s| {
+        for _ in 0..threads {
+            s.spawn(|| loop {
+                let c = next.fetch_add(1, Ordering::Relaxed);
+                if c as usize >= tasks.len() {
+                    return;
+                }
+                if let Err(e) = worker(&tasks[c as usize]) {
+                    let mut g = error.lock().unwrap();
+                    if g.is_none() {
+                        *g = Some(e);
+                    }
+                    return;
+                }
+            });
         }
-    }
-
-    /// The cluster's decompressed payload with its per-blob spans: a hit
-    /// clones the shared Arc; a miss decompresses OUTSIDE the lock (parsing
-    /// the blob-offset table once per cluster) and inserts under it (two
-    /// workers missing the same cluster decompress twice; the second insert
-    /// replaces and the byte count is corrected).
-    fn cluster(&self, z: &Zim, cluster: u32) -> io::Result<std::sync::Arc<ClusterData>> {
-        if let Some(d) = self.inner.lock().unwrap().map.get(&cluster) {
-            return Ok(d.clone());
-        }
-        let cd = std::sync::Arc::new(z.decompress_cluster_with_spans(cluster)?);
-        let mut c = self.inner.lock().unwrap();
-        c.bytes += cd.data.len();
-        if let Some(old) = c.map.insert(cluster, cd.clone()) {
-            c.bytes -= old.data.len();
-        }
-        c.order.push_back(cluster);
-        while c.order.len() > CACHE_ENTRIES || (c.bytes > CACHE_BYTES && c.order.len() > 1) {
-            let evict = c.order.pop_front().unwrap();
-            if let Some(d) = c.map.remove(&evict) {
-                c.bytes -= d.data.len();
-            }
-        }
-        Ok(cd)
+    });
+    match error.into_inner().unwrap() {
+        Some(e) => Err(e),
+        None => Ok(()),
     }
 }
 
-/// An article's HTML bytes: compressed clusters come from the shared cache
-/// (the whole cluster decodes once per worker wave, its blob-offset table
-/// parsed once per cluster too), uncompressed clusters are borrowed
-/// straight from the mmap (`read_blob` would copy).
-enum HtmlSource<'a> {
-    Shared(std::sync::Arc<ClusterData>, u64, u64),
-    Raw(std::borrow::Cow<'a, [u8]>),
-}
-
-impl HtmlSource<'_> {
-    fn bytes(&self) -> &[u8] {
-        match self {
-            HtmlSource::Shared(d, s, e) => &d.data[*s as usize..*e as usize],
-            HtmlSource::Raw(cow) => cow,
-        }
-    }
-}
-
-/// Fetch one article blob through the cache (compressed: the span resolves
-/// from the cached cluster, no second read of the cluster body) or a direct
-/// mmap view (uncompressed).
-fn article_html<'a>(
-    z: &'a Zim,
-    cache: &ClusterCache,
-    cluster: u32,
-    blob: u32,
-) -> io::Result<HtmlSource<'a>> {
-    if z.cluster_is_compressed(cluster)? {
-        let c = cache.cluster(z, cluster)?;
-        let (s, e) = c.span(blob)?;
-        Ok(HtmlSource::Shared(c, s, e))
-    } else {
-        Ok(HtmlSource::Raw(z.raw_blob(cluster, blob)?))
-    }
-}
-
-/// Convert one article: fetch the HTML blob and decode + convert it.
-/// `Ok(None)` is a failed read/decode - counted as a conversion failure
-/// with the reference's warning, never fatal.
+/// Convert one article's resolved HTML bytes to markdown. `Ok(None)` is a
+/// failed conversion - counted as a conversion failure with the reference's
+/// warning, never fatal.
 fn convert_article_html(
-    z: &Zim,
-    cache: &ClusterCache,
-    cluster: u32,
-    blob: u32,
+    html: &[u8],
     path: &str,
     title: &str,
     lang: &str,
 ) -> Result<Option<String>, String> {
-    let html = match article_html(z, cache, cluster, blob) {
-        Ok(html) => html,
-        Err(e) => {
-            eprintln!("warning: failed to convert {path:?}: {e}");
-            return Ok(None);
-        }
-    };
-    match std::str::from_utf8(html.bytes()) {
+    match std::str::from_utf8(html) {
         Ok(html) => Ok(Some(crate::html2md::html_to_md(html, Some(title), Some(lang)))),
         Err(_) => {
             eprintln!("warning: failed to convert {path:?}: content is not valid UTF-8");
@@ -772,8 +716,8 @@ pub fn convert(
 
     // The inner closure exists only so the temp dir is removed on every
     // error path; inside, the code reads top to bottom in execution order:
-    // setup, the single parallel walk, the post-join membership scan, the
-    // finalize walk.
+    // setup, pass 1 (the classification pre-pass, then the conversion walk
+    // in cluster order), the post-join membership scan, the finalize walk.
     let outcome = (|| -> Result<(), String> {
         // The walk range: the LIMIT (not the full entry count) — --limit
         // runs never allocate proportional to the archive.
@@ -811,12 +755,12 @@ pub fn convert(
             &lang.raw,
         )?);
 
-        // Thread pool: N workers over fixed 512-entry chunks pulled from a
-        // shared atomic counter - dynamic, so heterogeneous cores stay busy.
-        // No queues: a worker converts its chunk's articles one at a time
-        // and pushes each result through short mutex-locked adds; the mutex
-        // IS the backpressure (a worker holds at most one article's working
-        // set).
+        // Thread pool: N workers pulling work from a shared atomic counter
+        // - fixed 512-entry chunks in the classification pre-pass, one
+        // cluster task per fetch-add in the conversion walk - dynamic, so
+        // heterogeneous cores stay busy. No queues: a worker holds at most
+        // one article's working set and pushes each result through short
+        // mutex-locked adds; the mutex IS the backpressure.
         let threads = std::env::var("SZMCP_CONVERT_THREADS")
             .ok()
             .and_then(|v| v.parse::<usize>().ok())
@@ -824,30 +768,22 @@ pub fn convert(
             .unwrap_or_else(|| std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1));
         eprintln!("  {threads} conversion threads");
 
-        let cache = ClusterCache::new();
-        let shared = Shared::default();
+        let mut shared = Shared::default();
         // Per-entry records, preallocated exactly once for the LIMIT (not
         // the full entry count): 12 bytes per entry is the dominant
         // constant-RAM structure (600 MB at 50M entries).
         let recs: Vec<RecSlot> = (0..end).map(|_| RecSlot::default()).collect();
 
-        // ---- pass 1: the only full walk — convert every HTML article,
-        // build BOTH Xapian documents outside the mutexes, add them under
-        // short locks, add the blob, store the record.
+        // ---- pass 1, phase A: a lean parallel classification walk in path
+        // order — dirent headers only, NO blob IO. Every entry stores its
+        // 12-byte record (redirects resolve their terminal now, non-HTML
+        // mimes are tallied); every HTML article only contributes its
+        // (cluster, blob, entry) coordinates to the collector below.
+        let coords: Mutex<Vec<(u32, u32, u32)>> = Mutex::new(Vec::new());
         run_chunk_workers(threads, &shared.next, end, |start, stop| {
+            let mut found: Vec<(u32, u32, u32)> = Vec::new();
             for idx in start..stop {
-                let n = shared.processed.fetch_add(1, Ordering::Relaxed);
-                if n % STATUS_EVERY == STATUS_EVERY - 1 {
-                    // \r, not \n: the next status overwrites this one; the
-                    // epilogue after the join submits the final newline.
-                    eprint!(
-                        "[{}/{}] entries: {} articles converted ({:.1} MB written)\r",
-                        n + 1,
-                        end,
-                        shared.ft_docs.load(Ordering::Relaxed),
-                        shared.md_bytes.load(Ordering::Relaxed) as f64 / 1e6
-                    );
-                }
+                shared.processed.fetch_add(1, Ordering::Relaxed);
                 let (mime, target) = z
                     .entry_head(idx)
                     .map_err(|e| format!("reading entry {idx}: {e}"))?;
@@ -886,85 +822,159 @@ pub fn convert(
                     *shared.skipped.lock().unwrap().entry(key).or_insert(0) += 1;
                     continue;
                 }
-                // An HTML article: read, convert, index, add.
-                let entry = z.get_entry(idx)
-                    .map_err(|e| format!("reading entry {idx}: {e}"))?;
-                let item_path = entry.url;
-                let title = entry_title(&entry.title, &item_path);
+                // An HTML article: only its (cluster, blob, entry)
+                // coordinates matter here; the conversion walk below reads
+                // it in cluster order.
                 let Target::Cluster(cluster, blob) = target else {
                     continue;
                 };
-                let Some(md) = convert_article_html(
-                    &z,
-                    &cache,
-                    cluster,
-                    blob,
-                    &item_path,
-                    &title,
-                    &conv_lang,
-                )?
-                else {
-                    shared.failed.fetch_add(1, Ordering::Relaxed);
-                    continue;
-                };
-                // Both documents build OUTSIDE the database mutexes — the
-                // TermGenerator/Document FFI never touches the WDB pointer
-                // (exactly libzim's own worker design), so only add_document
-                // serializes. Commits every [`COMMIT_EVERY`] documents bound
-                // the uncommitted glass buffers (they hold every indexed term
-                // in RAM until committed — tens of KB per document).
-                let folded_title = crate::search::fold_accents(&title);
-                let folded_content = if index_intro_only {
-                    crate::search::fold_accents(&intro_for_index(&md))
-                } else {
-                    crate::search::fold_accents(&md)
-                };
-                let ft_doc = build_fulltext_document(&lang, &item_path, &folded_title, &folded_content)
-                    .map_err(|e| format!("indexing {item_path:?}: {e}"))?;
-                let ti_doc = build_title_document(&lang, &item_path, &title, None)
-                    .map_err(|e| format!("title indexing {item_path:?}: {e}"))?;
-                {
-                    let mut wdb = ft_wdb.lock().unwrap();
-                    wdb.add_document(&ft_doc)
-                        .map_err(|e| format!("indexing {item_path:?}: {e}"))?;
-                    let d = shared.ft_docs.fetch_add(1, Ordering::Relaxed) + 1;
-                    if d % COMMIT_EVERY == 0 {
-                        wdb.commit()
-                            .map_err(|e| format!("fulltext index commit: {e}"))?;
-                    }
-                }
-                {
-                    let mut wdb = ti_wdb.lock().unwrap();
-                    wdb.add_document(&ti_doc)
-                        .map_err(|e| format!("title indexing {item_path:?}: {e}"))?;
-                    let d = shared.ti_docs.fetch_add(1, Ordering::Relaxed) + 1;
-                    if d % COMMIT_EVERY == 0 {
-                        wdb.commit().map_err(|e| format!("title index commit: {e}"))?;
-                    }
-                }
-                // Writer add in its own lock scope (no nesting): the blob lands
-                // in an open cluster and the record carries its ref — the
-                // ARTICLE flag replaces the old written bitset.
-                {
-                    let mut zc = creator.lock().unwrap();
-                    let b = zc
-                        .add_blob(true, md.as_bytes())
-                        .map_err(|e| format!("item {item_path:?}: {e}"))?;
-                    let slot = &recs[idx as usize];
-                    slot.a.store(b.generation, Ordering::Relaxed);
-                    slot.b.store(b.blob, Ordering::Relaxed);
-                    slot.flags.store(
-                        REC_ARTICLE | if b.compress { REC_COMPRESS } else { 0 },
-                        Ordering::Relaxed,
-                    );
-                }
-                shared.md_bytes.fetch_add(md.len() as u64, Ordering::Relaxed);
+                found.push((cluster, blob, idx));
             }
+            // One lock acquisition per 512-entry chunk, not per entry.
+            coords.lock().unwrap().extend(found);
             Ok(())
         })?;
 
-        // Submit the final newline after the last \r status line.
-        if shared.processed.load(Ordering::Relaxed) >= STATUS_EVERY {
+        // Between the phases: the collected coordinates sort by (cluster,
+        // blob) — ascending cluster order is what makes the source reads
+        // sequential — and group into one task per cluster (the consecutive
+        // items sharing one). For a 6.7M-article ZIM this is ~80 MB of RAM.
+        let mut coords = coords.into_inner().unwrap();
+        coords.sort_unstable();
+        shared.articles_total = coords.len() as u64;
+        let mut tasks: Vec<(u32, Vec<(u32, u32)>)> = Vec::new();
+        for (cluster, blob, idx) in coords {
+            match tasks.last_mut() {
+                Some((c, items)) if *c == cluster => items.push((blob, idx)),
+                _ => tasks.push((cluster, vec![(blob, idx)])),
+            }
+        }
+        // The shared counter hands out 512-entry chunks in the pre-pass and
+        // cluster tasks in the walk: reset it between the two phases.
+        shared.next.store(0, Ordering::Relaxed);
+
+        // ---- pass 1, phase B: the conversion walk over the cluster tasks,
+        // in ascending cluster order: a scraper-built ZIM's dirents are
+        // path-sorted but its clusters were appended in completion order, so
+        // THIS is the order that reads each compressed cluster exactly once
+        // (path order re-read it once per article it served, from random
+        // offsets) and keeps the source reads sequential. Per article the
+        // handling is the old walk's: read, convert, index, add, store the
+        // record.
+        if !tasks.is_empty() {
+            run_task_workers(threads, &shared.next, &tasks, |(cluster, items)| {
+                let compressed = z
+                    .cluster_is_compressed(*cluster)
+                    .map_err(|e| format!("reading cluster {cluster}: {e}"))?;
+                // A compressed cluster (the overwhelmingly common case for
+                // text/html) decodes exactly once per task; an uncompressed
+                // cluster is NOT copied into RAM (it can hold media) — each
+                // wanted blob is read per item below.
+                let data = if compressed {
+                    Some(
+                        z.decompress_cluster_with_spans(*cluster)
+                            .map_err(|e| format!("decoding cluster {cluster}: {e}"))?,
+                    )
+                } else {
+                    None
+                };
+                for &(blob, idx) in items {
+                    let n = shared.articles_done.fetch_add(1, Ordering::Relaxed);
+                    if n % STATUS_EVERY == STATUS_EVERY - 1 {
+                        // \r, not \n: the next status overwrites this one; the
+                        // epilogue after the join submits the final newline.
+                        eprint!(
+                            "[{}/{}] articles: {} converted ({:.1} MB written)\r",
+                            n + 1,
+                            shared.articles_total,
+                            shared.ft_docs.load(Ordering::Relaxed),
+                            shared.md_bytes.load(Ordering::Relaxed) as f64 / 1e6
+                        );
+                    }
+                    let entry = z.get_entry(idx)
+                        .map_err(|e| format!("reading entry {idx}: {e}"))?;
+                    let item_path = entry.url;
+                    let title = entry_title(&entry.title, &item_path);
+                    let html = match &data {
+                        Some(d) => d.span(blob).map(|(s, e)| {
+                            std::borrow::Cow::Borrowed(&d.data[s as usize..e as usize])
+                        }),
+                        None => z.read_blob(*cluster, blob).map(std::borrow::Cow::Owned),
+                    };
+                    let html = match html {
+                        Ok(html) => html,
+                        Err(e) => {
+                            eprintln!("warning: failed to convert {item_path:?}: {e}");
+                            shared.failed.fetch_add(1, Ordering::Relaxed);
+                            continue;
+                        }
+                    };
+                    let Some(md) = convert_article_html(&html, &item_path, &title, &conv_lang)?
+                    else {
+                        shared.failed.fetch_add(1, Ordering::Relaxed);
+                        continue;
+                    };
+                    // Both documents build OUTSIDE the database mutexes — the
+                    // TermGenerator/Document FFI never touches the WDB pointer
+                    // (exactly libzim's own worker design), so only add_document
+                    // serializes. Commits every [`COMMIT_EVERY`] documents bound
+                    // the uncommitted glass buffers (they hold every indexed term
+                    // in RAM until committed — tens of KB per document).
+                    let folded_title = crate::search::fold_accents(&title);
+                    let folded_content = if index_intro_only {
+                        crate::search::fold_accents(&intro_for_index(&md))
+                    } else {
+                        crate::search::fold_accents(&md)
+                    };
+                    let ft_doc =
+                        build_fulltext_document(&lang, &item_path, &folded_title, &folded_content)
+                            .map_err(|e| format!("indexing {item_path:?}: {e}"))?;
+                    let ti_doc = build_title_document(&lang, &item_path, &title, None)
+                        .map_err(|e| format!("title indexing {item_path:?}: {e}"))?;
+                    {
+                        let mut wdb = ft_wdb.lock().unwrap();
+                        wdb.add_document(&ft_doc)
+                            .map_err(|e| format!("indexing {item_path:?}: {e}"))?;
+                        let d = shared.ft_docs.fetch_add(1, Ordering::Relaxed) + 1;
+                        if d % COMMIT_EVERY == 0 {
+                            wdb.commit()
+                                .map_err(|e| format!("fulltext index commit: {e}"))?;
+                        }
+                    }
+                    {
+                        let mut wdb = ti_wdb.lock().unwrap();
+                        wdb.add_document(&ti_doc)
+                            .map_err(|e| format!("title indexing {item_path:?}: {e}"))?;
+                        let d = shared.ti_docs.fetch_add(1, Ordering::Relaxed) + 1;
+                        if d % COMMIT_EVERY == 0 {
+                            wdb.commit().map_err(|e| format!("title index commit: {e}"))?;
+                        }
+                    }
+                    // Writer add in its own lock scope (no nesting): the blob lands
+                    // in an open cluster and the record carries its ref — the
+                    // ARTICLE flag replaces the old written bitset.
+                    {
+                        let mut zc = creator.lock().unwrap();
+                        let b = zc
+                            .add_blob(true, md.as_bytes())
+                            .map_err(|e| format!("item {item_path:?}: {e}"))?;
+                        let slot = &recs[idx as usize];
+                        slot.a.store(b.generation, Ordering::Relaxed);
+                        slot.b.store(b.blob, Ordering::Relaxed);
+                        slot.flags.store(
+                            REC_ARTICLE | if b.compress { REC_COMPRESS } else { 0 },
+                            Ordering::Relaxed,
+                        );
+                    }
+                    shared.md_bytes.fetch_add(md.len() as u64, Ordering::Relaxed);
+                }
+                Ok(())
+            })?;
+        }
+
+        // Submit the final newline after the last \r status line (the walk's
+        // own counter — the pre-pass prints nothing).
+        if shared.articles_done.load(Ordering::Relaxed) >= STATUS_EVERY {
             eprintln!();
         }
 
@@ -1363,9 +1373,12 @@ mod e2e {
 
     #[test]
     fn many_chunks_convert_deterministically_across_workers() {
-        // A source bigger than one 512-entry chunk, so the parallel pass
-        // really distribute chunks across workers and the streaming
-        // emission must still reproduce the source order deterministically.
+        // A source bigger than one 512-entry chunk: the classification
+        // pre-pass really distributes its 512-entry chunks across workers.
+        // The fixtures store every entry UNCOMPRESSED in a single cluster
+        // (see build_archive_indexes), so the conversion walk is one task
+        // turned by one worker — the streaming emission must still
+        // reproduce the source order deterministically.
         let n = 1200usize;
         let html = "<html><body><h1>T</h1><p>An article body.</p></body></html>";
         let mut content: Vec<TestEntry> = Vec::new();

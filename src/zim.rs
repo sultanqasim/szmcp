@@ -667,8 +667,7 @@ impl Zim {
     /// The whole decompressed payload of a cluster: the blob-offset table
     /// followed by the blob bytes (everything after the cluster's info
     /// byte). Uncompressed clusters return their raw body; compressed
-    /// clusters are decoded in full (the caller decides whether to share or
-    /// cache the result - see convert's `ClusterCache`).
+    /// clusters are decoded in full.
     #[allow(dead_code)] // kept as the payload-only face of decompress_cluster_with_spans
     pub fn decompress_cluster(&self, cluster: u32) -> io::Result<Vec<u8>> {
         Ok(self.decompress_cluster_with_spans(cluster)?.data)
@@ -676,8 +675,8 @@ impl Zim {
 
     /// [`decompress_cluster`], plus the per-blob `(start, end)` spans parsed
     /// once from the payload's own leading blob-offset table - so a caller
-    /// that keeps the payload (see convert's `ClusterCache`) can index any
-    /// blob without reading the cluster body again.
+    /// that keeps the payload (the convert walk: one decoded cluster per
+    /// task) can index any blob without reading the cluster body again.
     pub fn decompress_cluster_with_spans(&self, cluster: u32) -> io::Result<ClusterData> {
         let (start, end) = self.cluster_range(cluster)?;
         let info = self.store.read(start, 1)?[0];
@@ -759,6 +758,7 @@ impl Zim {
     /// The bytes of a blob in an UNCOMPRESSED cluster, borrowed from the
     /// mmap where possible (no decompression, no copy). Compressed clusters
     /// are rejected: their callers decode the whole cluster at once.
+    #[allow(dead_code)] // the convert walk reads its per-item blobs via read_blob
     pub fn raw_blob(&self, cluster: u32, blob: u32) -> io::Result<std::borrow::Cow<'_, [u8]>> {
         let loc = self.locate_blob(cluster, blob)?;
         let voff = loc.file_offset.ok_or_else(|| {
@@ -769,7 +769,8 @@ impl Zim {
 
     /// Whether the cluster's payload is compressed (zstd/lzma). Uncompressed
     /// cluster blobs are direct mmap views (see [`raw_blob`]); the parallel
-    /// convert pass caches decompressed compressed clusters only.
+    /// convert pass decodes compressed clusters as a whole, once per
+    /// cluster.
     pub fn cluster_is_compressed(&self, cluster: u32) -> io::Result<bool> {
         let (start, _) = self.cluster_range(cluster)?;
         let info = self.store.read(start, 1)?[0];
