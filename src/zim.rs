@@ -783,9 +783,12 @@ impl Zim {
     }
 
     /// Open the Xapian database stored as the content of directory entry
-    /// `idx`, preferring the zero-copy path (opening the in-file glass
-    /// database at the blob's offset), falling back to a temp-file copy.
-    /// `what` names the index in errors ("full-text", "title"). Never yields
+    /// `idx` in place: the in-file glass database is opened directly at the
+    /// blob's file offset, with no temp file and no copy into RAM. Any
+    /// failure is a clean error naming the index via `what` ("full-text",
+    /// "title"): the blob is not raw in-file bytes (compressed cluster), it
+    /// spans chunk files in a chunked archive, the archive is truncated
+    /// before the blob's end, or Xapian rejects the database. Never yields
     /// `Ok(None)` once the entry exists.
     fn open_index_entry(&self, idx: u32, what: &str) -> io::Result<Option<XapianDatabase>> {
         let entry = self.get_entry(idx)?;
@@ -796,29 +799,27 @@ impl Zim {
             ));
         };
         let loc = self.locate_blob(cluster, blob)?;
-        if let Some(voff) = loc.file_offset {
-            if let Some((path, off_in_file, file_len)) = self.store.file_location(voff) {
-                if off_in_file + loc.length <= file_len {
-                    match xapian2::Database::open_at(path, off_in_file, xapian2::DbFlags::NONE) {
-                        Ok(db) => return Ok(Some(db)),
-                        Err(e) => {
-                            eprintln!("warning: open_at for embedded Xapian index failed ({e}); copying to temp file");
-                        }
-                    }
-                }
-            }
+        let Some(voff) = loc.file_offset else {
+            return Err(io::Error::new(
+                ErrorKind::InvalidData,
+                format!("{what} index is not stored uncompressed; cannot open in place"),
+            ));
+        };
+        let Some((path, off_in_file, file_len)) = self.store.file_location(voff) else {
+            return Err(io::Error::new(
+                ErrorKind::InvalidData,
+                format!("{what} index spans chunk files; cannot open in place"),
+            ));
+        };
+        if off_in_file + loc.length > file_len {
+            return Err(io::Error::new(
+                ErrorKind::InvalidData,
+                format!("{what} index is truncated past the end of the archive"),
+            ));
         }
-        // Fallback: copy the (decompressed) index to a temp file.
-        let bytes = self.read_blob(cluster, blob)?;
-        static TMP_COUNTER: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
-        let n = TMP_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let tmp = std::env::temp_dir().join(format!("szmcp-xapian-{}-{n}.xdb", std::process::id()));
-        std::fs::write(&tmp, &bytes).map_err(|e| {
-            io::Error::new(ErrorKind::Other, format!("failed to write temp Xapian index: {e}"))
-        })?;
-        xapian2::Database::open(&tmp)
+        xapian2::Database::open_at(path, off_in_file, xapian2::DbFlags::NONE)
             .map(Some)
-            .map_err(|e| io::Error::new(ErrorKind::InvalidData, e.msg()))
+            .map_err(|e| io::Error::new(ErrorKind::InvalidData, format!("embedded {what} index: {e}")))
     }
 
     /// Open the archive's full-text Xapian index.
