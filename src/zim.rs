@@ -9,7 +9,6 @@
 //! `.zim` file or a chunked archive (`.zimaa`, `.zimab`, ...).
 
 use memmap2::Mmap;
-use std::collections::HashSet;
 use std::fs::File;
 use std::io::{self, ErrorKind};
 use std::path::{Path, PathBuf};
@@ -644,14 +643,13 @@ impl Zim {
     }
 
     /// Follow the redirect chain starting at entry `idx` to the first
-    /// non-redirect entry (transitively, cycle-safe, hence bounded).
-    /// `None` when the chain leaves the entry range or cycles - a dangling
-    /// redirect, like `zim2zim.redirect_target`.
+    /// non-redirect entry. `None` when the chain leaves the entry range or
+    /// does not terminate within [`MAX_REDIRECT_HOPS`] hops (cycles
+    /// included) - a dangling redirect, like `zim2zim.redirect_target`.
     pub fn redirect_terminal(&self, idx: u32) -> Option<u32> {
-        let mut seen: HashSet<u32> = HashSet::new();
         let mut cur = idx;
-        loop {
-            if cur >= self.header.entry_count || !seen.insert(cur) {
+        for _ in 0..MAX_REDIRECT_HOPS {
+            if cur >= self.header.entry_count {
                 return None;
             }
             let (_, target) = self.entry_head(cur).ok()?;
@@ -660,6 +658,7 @@ impl Zim {
                 _ => return Some(cur),
             }
         }
+        None
     }
 
     /// The whole decompressed payload of a cluster plus the per-blob
