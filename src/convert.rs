@@ -4,10 +4,11 @@
 //!
 //! The conversion is a lean parallel classification pass over the source
 //! dirents (a pool of worker threads over fixed 512-entry chunks in path
-//! order, dirent headers only, no blob IO) followed by a parallel
-//! conversion walk in ascending cluster order: scraper-built ZIMs append
-//! their clusters in completion order while their dirents are path-sorted,
-//! so a path-order walk re-reads the same compressed cluster once per
+//! order, dirents only, no blob IO: HTML articles also capture their path
+//! and title there, so the walk performs zero dirent reads) followed by a
+//! parallel conversion walk in ascending cluster order: scraper-built
+//! ZIMs append their clusters in completion order while their dirents are
+//! path-sorted, so a path-order walk re-reads the same compressed cluster once per
 //! article it serves, while cluster order reads and decodes each
 //! compressed cluster exactly once. The walk converts HTML articles to
 //! markdown items, builds both Xapian documents OUTSIDE the database
@@ -498,6 +499,34 @@ struct RecSlot {
     flags: AtomicU8,
 }
 
+/// One classified HTML article: blob coordinates plus the (offset, len)
+/// of its path and title inside the pre-pass string arena. Sorting by
+/// (cluster, blob, idx) groups one task per cluster in file order.
+#[derive(PartialEq, Eq, PartialOrd, Ord)]
+struct ArticleCoord {
+    cluster: u32,
+    blob: u32,
+    idx: u32,
+    path: (u32, u32),
+    title: (u32, u32),
+}
+
+/// The classification pre-pass's collector: the [`ArticleCoord`]s plus the
+/// string arena their path/title slices point into (raw bytes, no NUL
+/// terminators — the lengths are recorded). One mutex over both so the
+/// coordinates and their strings stay consistent. The arena holds the path
+/// and title of EVERY HTML article — ~0.5-1 GB at ~7M articles, in the same
+/// league as the 12-byte-per-entry records above — and buys the conversion
+/// walk zero dirent reads: it visits the dirents sequentially in path
+/// order, while the cluster-order walk would re-read each article's dirent
+/// from its scattered position across the dirent area (page-faulting
+/// 16-64 KB of physical dirent pages per article under memory pressure,
+/// eating the cluster-order read savings).
+struct PrePass {
+    arena: Vec<u8>,
+    coords: Vec<ArticleCoord>,
+}
+
 /// The NUL-terminated title at `off` in the finalize listing's bump arena
 /// (the terminator separates rows; titles derive from dirent titles and
 /// paths, which cannot contain NUL).
@@ -777,15 +806,23 @@ pub fn convert(
         let recs: Vec<RecSlot> = (0..end).map(|_| RecSlot::default()).collect();
 
         // ---- pass 1, phase A: a lean parallel classification walk in path
-        // order — dirent headers only, NO blob IO. Every entry stores its
-        // 12-byte record (redirects resolve their terminal now, non-HTML
-        // mimes are tallied); every HTML article only contributes its
-        // (cluster, blob, entry) coordinates to the collector below.
-        let coords: Mutex<Vec<(u32, u32, u32)>> = Mutex::new(Vec::new());
+        // order — dirents only, NO blob IO. Every entry stores its 12-byte
+        // record (redirects resolve their terminal now, non-HTML mimes are
+        // tallied); every HTML article also has its path and raw title
+        // copied into the collector's string arena below, so the conversion
+        // walk performs zero dirent reads.
+        let collector = Mutex::new(PrePass {
+            arena: Vec::new(),
+            coords: Vec::new(),
+        });
         let t_classify = Instant::now();
         eprintln!("Classifying {end} entries (dirent headers only)...");
         run_chunk_workers(threads, &shared.next, end, |start, stop| {
-            let mut found: Vec<(u32, u32, u32)> = Vec::new();
+            // Chunk-local arena and coordinates: the offsets in `found` are
+            // relative to this buffer, rebased onto the shared arena under
+            // the collector's lock below.
+            let mut arena: Vec<u8> = Vec::new();
+            let mut found: Vec<ArticleCoord> = Vec::new();
             for idx in start..stop {
                 let n = shared.processed.fetch_add(1, Ordering::Relaxed);
                 if n % STATUS_EVERY == STATUS_EVERY - 1 {
@@ -832,16 +869,42 @@ pub fn convert(
                     *shared.skipped.lock().unwrap().entry(key).or_insert(0) += 1;
                     continue;
                 }
-                // An HTML article: only its (cluster, blob, entry)
-                // coordinates matter here; the conversion walk below reads
-                // it in cluster order.
+                // An HTML article: its blob coordinates go to the walk
+                // below (which reads it in cluster order), together with
+                // the path and title captured NOW, while the pre-pass
+                // still touches the dirents sequentially — the same
+                // dirent read in the walk would land scattered across
+                // the dirent area in cluster order. Raw bytes only, no
+                // fallback: the walk applies entry_title().
                 let Target::Cluster(cluster, blob) = target else {
                     continue;
                 };
-                found.push((cluster, blob, idx));
+                let entry = z.get_entry(idx).map_err(|e| format!("reading entry {idx}: {e}"))?;
+                let path_off = arena.len() as u32;
+                arena.extend_from_slice(entry.url.as_bytes());
+                let title_off = arena.len() as u32;
+                arena.extend_from_slice(entry.title.as_bytes());
+                found.push(ArticleCoord {
+                    cluster,
+                    blob,
+                    idx,
+                    path: (path_off, entry.url.len() as u32),
+                    title: (title_off, entry.title.len() as u32),
+                });
             }
-            // One lock acquisition per 512-entry chunk, not per entry.
-            coords.lock().unwrap().extend(found);
+            // One lock acquisition per 512-entry chunk, not per entry:
+            // rebase the chunk-local offsets onto the shared arena, then
+            // extend both under the same lock so coordinates and strings
+            // stay consistent.
+            let mut pre = collector.lock().unwrap();
+            let base = pre.arena.len() as u32;
+            for c in found.iter_mut() {
+                c.path.0 += base;
+                c.title.0 += base;
+            }
+            pre.arena.extend_from_slice(&arena);
+            pre.coords.append(&mut found);
+            drop(pre);
             Ok(())
         })?;
 
@@ -852,7 +915,7 @@ pub fn convert(
             eprintln!();
         }
         let dt = t_classify.elapsed().as_secs_f64();
-        let articles = coords.lock().unwrap().len();
+        let articles = collector.lock().unwrap().coords.len();
         let redirects = shared.redirects.load(Ordering::Relaxed);
         let skipped_total = shared.skipped.lock().unwrap().values().sum::<usize>();
         eprintln!(
@@ -860,17 +923,19 @@ pub fn convert(
         );
 
         // Between the phases: the collected coordinates sort by (cluster,
-        // blob) — ascending cluster order is what makes the source reads
-        // sequential — and group into one task per cluster (the consecutive
-        // items sharing one). For a 6.7M-article ZIM this is ~80 MB of RAM.
-        let mut coords = coords.into_inner().unwrap();
+        // blob, idx) — ascending cluster order is what makes the source
+        // reads sequential — and group into one task per cluster (the
+        // consecutive items sharing one). For a 6.7M-article ZIM the
+        // coordinates are ~130 MB of RAM on top of the collector's string
+        // arena (see PrePass).
+        let PrePass { arena, mut coords } = collector.into_inner().unwrap();
         coords.sort_unstable();
         shared.articles_total = coords.len() as u64;
-        let mut tasks: Vec<(u32, Vec<(u32, u32)>)> = Vec::new();
-        for (cluster, blob, idx) in coords {
+        let mut tasks: Vec<(u32, Vec<ArticleCoord>)> = Vec::new();
+        for c in coords {
             match tasks.last_mut() {
-                Some((c, items)) if *c == cluster => items.push((blob, idx)),
-                _ => tasks.push((cluster, vec![(blob, idx)])),
+                Some((cl, items)) if *cl == c.cluster => items.push(c),
+                _ => tasks.push((c.cluster, vec![c])),
             }
         }
         // The shared counter hands out 512-entry chunks in the pre-pass and
@@ -882,9 +947,10 @@ pub fn convert(
         // path-sorted but its clusters were appended in completion order, so
         // THIS is the order that reads each compressed cluster exactly once
         // (path order re-read it once per article it served, from random
-        // offsets) and keeps the source reads sequential. Per article the
-        // handling is the old walk's: read, convert, index, add, store the
-        // record.
+        // offsets) and keeps the source reads sequential. The walk performs
+        // ZERO dirent reads: every path and title rides in the pre-pass's
+        // string arena (borrowed below). Per article the handling is the
+        // old walk's: read, convert, index, add, store the record.
         if !tasks.is_empty() {
             run_task_workers(threads, &shared.next, &tasks, |(cluster, items)| {
                 let compressed = z
@@ -902,7 +968,7 @@ pub fn convert(
                 } else {
                     None
                 };
-                for &(blob, idx) in items {
+                for c in items {
                     let n = shared.articles_done.fetch_add(1, Ordering::Relaxed);
                     if n % STATUS_EVERY == STATUS_EVERY - 1 {
                         // \r, not \n: the next status overwrites this one; the
@@ -915,15 +981,26 @@ pub fn convert(
                             shared.md_bytes.load(Ordering::Relaxed) as f64 / 1e6
                         );
                     }
-                    let entry = z.get_entry(idx)
-                        .map_err(|e| format!("reading entry {idx}: {e}"))?;
-                    let item_path = entry.url;
-                    let title = entry_title(&entry.title, &item_path);
+                    // Path and title from the pre-pass arena (offset, len);
+                    // the bytes came from get_entry's parsed Strings, so a
+                    // UTF-8 failure cannot happen in practice — map it to a
+                    // clear fatal error rather than panic.
+                    let item_path = std::str::from_utf8(
+                        &arena[c.path.0 as usize..c.path.0 as usize + c.path.1 as usize],
+                    )
+                    .map_err(|e| format!("path of entry {}: {e}", c.idx))?;
+                    let title = entry_title(
+                        std::str::from_utf8(
+                            &arena[c.title.0 as usize..c.title.0 as usize + c.title.1 as usize],
+                        )
+                        .map_err(|e| format!("title of entry {}: {e}", c.idx))?,
+                        item_path,
+                    );
                     let html = match &data {
-                        Some(d) => d.span(blob).map(|(s, e)| {
+                        Some(d) => d.span(c.blob).map(|(s, e)| {
                             std::borrow::Cow::Borrowed(&d.data[s as usize..e as usize])
                         }),
-                        None => z.read_blob(*cluster, blob).map(std::borrow::Cow::Owned),
+                        None => z.read_blob(*cluster, c.blob).map(std::borrow::Cow::Owned),
                     };
                     let html = match html {
                         Ok(html) => html,
@@ -982,7 +1059,7 @@ pub fn convert(
                         let b = zc
                             .add_blob(true, md.as_bytes())
                             .map_err(|e| format!("item {item_path:?}: {e}"))?;
-                        let slot = &recs[idx as usize];
+                        let slot = &recs[c.idx as usize];
                         slot.a.store(b.generation, Ordering::Relaxed);
                         slot.b.store(b.blob, Ordering::Relaxed);
                         slot.flags.store(
