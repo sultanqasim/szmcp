@@ -134,10 +134,10 @@ impl OpenCluster {
     }
 
     /// Write the cluster: the info byte, then the blob offset table (each
-    /// entry gets the table's byte size added — libzim's `delta`) and the blob
-    /// bytes. Compressed clusters hold ONE zstd frame (level 19, like libzim's
-    /// `ZSTD_INFO::init_stream_encoder`) over the table + blob bytes; the info
-    /// Write the cluster, returning its serialized size (bytes written).
+    /// entry gets the table's byte size added — libzim's `delta`) and the
+    /// blob bytes. Compressed clusters hold ONE zstd frame (level 19, like
+    /// libzim's `ZSTD_INFO::init_stream_encoder`) over the table + blob
+    /// bytes. Returns the serialized size (bytes written).
     fn write_to(&self, w: &mut impl Write) -> io::Result<u64> {
         let extended = self.is_extended();
         let width = if extended { 8 } else { 4 };
@@ -147,30 +147,51 @@ impl OpenCluster {
 
         // blob_ends doubles as libzim's `blobOffsets`: entry i is the start
         // offset of blob i within (table + data); the last entry is the total.
-        // Entries are u32 unless the cluster is extended.
-        let mut table = Vec::with_capacity(self.blob_ends.len() * width as usize);
-        for &off in &self.blob_ends {
-            if extended {
-                table.extend_from_slice(&(off + delta).to_le_bytes());
-            } else {
-                table.extend_from_slice(&(((off + delta) as u32).to_le_bytes()));
+        // Entries are u32 unless the cluster is extended. The table streams
+        // into whichever sink takes it (the encoder or the output), so no
+        // table-sized buffer is materialized.
+        let write_table = |sink: &mut dyn Write| -> io::Result<()> {
+            for &off in &self.blob_ends {
+                if extended {
+                    sink.write_all(&(off + delta).to_le_bytes())?;
+                } else {
+                    sink.write_all(&((off + delta) as u32).to_le_bytes())?;
+                }
             }
-        }
+            Ok(())
+        };
         w.write_all(&[info])?;
-        let mut written = 1u64;
         if self.compress {
-            let mut enc = zstd::stream::Encoder::new(Vec::new(), 19)?;
-            enc.write_all(&table)?;
+            let mut sink = CountingWriter { inner: w, n: 0 };
+            let mut enc = zstd::stream::Encoder::new(&mut sink, 19)?;
+            write_table(&mut enc)?;
             enc.write_all(&self.data)?;
-            let comp = enc.finish()?;
-            w.write_all(&comp)?;
-            written += comp.len() as u64;
+            enc.finish()?;
+            Ok(1 + sink.n)
         } else {
-            w.write_all(&table)?;
+            write_table(w)?;
             w.write_all(&self.data)?;
-            written += table.len() as u64 + self.data.len() as u64;
+            Ok(1 + delta + self.data.len() as u64)
         }
-        Ok(written)
+    }
+}
+
+/// Counts the bytes pushed through it, so `write_to` can report a
+/// compressed cluster's exact serialized size without materializing it.
+struct CountingWriter<'a, W: Write> {
+    inner: &'a mut W,
+    n: u64,
+}
+
+impl<W: Write> Write for CountingWriter<'_, W> {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        let n = self.inner.write(buf)?;
+        self.n += n as u64;
+        Ok(n)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.inner.flush()
     }
 }
 
