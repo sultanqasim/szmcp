@@ -61,6 +61,30 @@ const LISTING_MIME: &str = "application/octet-stream+zimlisting";
 /// buffer until finish (embedded Xapian databases are the only such blobs).
 const BIG_BLOB_THRESHOLD: u64 = 1024 * 1024;
 
+/// The info byte and blob-offset table of a streamed single-blob
+/// uncompressed cluster holding `len` bytes (the disk form of the big-blob
+/// branch of `ZimCreator::add_item_streaming`). The table holds the blob's 0
+/// start and its end, each widened by libzim's delta (the table's own byte
+/// size, 2 * width). Entries go u64 ("extended") whenever the end offset
+/// would not fit u32 — and the info byte then carries
+/// [`CLUSTER_EXTENDED_BIT`], because readers choose the entry width from the
+/// info byte alone: a u64 table under a plain info byte parses as garbage
+/// offsets and every reader rejects the cluster ("malformed cluster blob
+/// table" / libzim's "Offsets are not ordered") — the giant-archive bug.
+fn streamed_cluster_header(len: u64) -> (u8, Vec<u8>) {
+    let extended = len > u32::MAX as u64 - 8;
+    let width: u64 = if extended { 8 } else { 4 };
+    let table: Vec<u8> = [0u64, len]
+        .iter()
+        .flat_map(|&off| {
+            let v = off + 2 * width;
+            if extended { v.to_le_bytes().to_vec() } else { (v as u32).to_le_bytes().to_vec() }
+        })
+        .collect();
+    let info = CLUSTER_UNCOMPRESSED | if extended { CLUSTER_EXTENDED_BIT } else { 0 };
+    (info, table)
+}
+
 /// Which open cluster an item's blob landed in (compressed or not).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Slot {
@@ -478,20 +502,12 @@ impl ZimCreator {
         if len >= BIG_BLOB_THRESHOLD {
             self.close_cluster(Slot::Uncompressed)?;
             self.ensure_open()?;
-            let extended = len > u32::MAX as u64;
-            let width: u64 = if extended { 8 } else { 4 };
             // One blob: the offset table holds the 0 start and the end.
-            let table: Vec<u8> = [0u64, len]
-                .iter()
-                .flat_map(|&off| {
-                    let v = off + 2 * width;
-                    if extended { v.to_le_bytes().to_vec() } else { (v as u32).to_le_bytes().to_vec() }
-                })
-                .collect();
+            let (info, table) = streamed_cluster_header(len);
             let ws = self.w.as_mut().unwrap();
             let offset = ws.pos;
             let archive_idx = ws.cluster_offsets.len() as u32;
-            ws.out.write_all(&[CLUSTER_UNCOMPRESSED])?;
+            ws.out.write_all(&[info])?;
             ws.out.write_all(&table)?;
             let mut copied = 0u64;
             let mut buf = vec![0u8; 1024 * 1024];
@@ -1817,6 +1833,57 @@ assert_eq!(mime_end, 196, "mime list = 6 types + terminator");
         assert_eq!(z.mime_type(e.mime), Some("application/octet-stream+xapian"));
         let Target::Cluster(c, b) = e.target else { panic!("xapian index has content") };
         // uncompressed cluster: the reader stores file_offset for the blob
+        let blob = z.read_blob(c, b).unwrap();
+        assert_eq!(blob, db_bytes);
+    }
+
+    #[test]
+    fn streamed_cluster_header_sets_the_extended_bit_above_u32() {
+        // u32 range: plain info byte, 4-byte entries (table delta 8).
+        let (info, t) = streamed_cluster_header(BIG_BLOB_THRESHOLD);
+        assert_eq!(info, CLUSTER_UNCOMPRESSED);
+        assert_eq!(t.len(), 8);
+        assert_eq!(u32le(&t[0..4]), 8);
+        assert_eq!(u32le(&t[4..8]), (BIG_BLOB_THRESHOLD + 8) as u32);
+        // Exactly at the boundary the u32 end offset still fits.
+        let (info, t) = streamed_cluster_header(u32::MAX as u64 - 8);
+        assert_eq!(info, CLUSTER_UNCOMPRESSED);
+        assert_eq!(u32le(&t[4..8]), u32::MAX);
+        // One past it — and everywhere above — the table must go u64 AND the
+        // info byte must carry the extended bit: the giant-archive bug was a
+        // u64 table under a plain info byte, which every reader parses as
+        // 4-byte offsets ("malformed cluster blob table" on open).
+        for len in [u32::MAX as u64 - 7, u32::MAX as u64, u32::MAX as u64 + 16, 5_830_721_536] {
+            let (info, t) = streamed_cluster_header(len);
+            assert_eq!(info, CLUSTER_UNCOMPRESSED | CLUSTER_EXTENDED_BIT);
+            assert_eq!(t.len(), 16);
+            assert_eq!(u64le(&t[0..8]), 16);
+            assert_eq!(u64le(&t[8..16]), len + 16);
+        }
+    }
+
+    #[test]
+    fn streamed_big_blob_round_trips_through_the_reader() {
+        // Blobs >= BIG_BLOB_THRESHOLD take the streaming path (one
+        // uncompressed cluster of their own); 1 MiB + 64 KiB crosses the
+        // threshold without a multi-GiB fixture. The >4 GiB shape (u64 table
+        // + extended bit) is covered by
+        // `streamed_cluster_header_sets_the_extended_bit_above_u32`.
+        let dir = tempfile::tempdir().unwrap();
+        let out_path = dir.path().join("streamed.zim");
+        let db_bytes: Vec<u8> =
+            (0..(BIG_BLOB_THRESHOLD + 64 * 1024) as u32).map(|i| (i % 251) as u8).collect();
+        let db_path = dir.path().join("fulltext.idx");
+        std::fs::write(&db_path, &db_bytes).unwrap();
+        let mut zc = ZimCreator::new(&out_path).unwrap();
+        zc.add_item("a", "A", "text/plain", false, true, b"body".to_vec()).unwrap();
+        zc.add_xapian_index("fulltext/xapian", &db_path).unwrap();
+        zc.finish().unwrap();
+        let z = Zim::open(&out_path).unwrap();
+        let idx = z.find_entry(b'X', "fulltext/xapian").unwrap().unwrap();
+        let e = z.get_entry(idx).unwrap();
+        assert_eq!(z.mime_type(e.mime), Some("application/octet-stream+xapian"));
+        let Target::Cluster(c, b) = e.target else { panic!("xapian index has content") };
         let blob = z.read_blob(c, b).unwrap();
         assert_eq!(blob, db_bytes);
     }
