@@ -1060,12 +1060,17 @@ pub fn convert(
                 }
                 Ok(())
             })?;
-        }
-
-        // Submit the final newline after the last \r status line of the walk
-        // (the pre-pass's own \r stream got its newline after its join).
-        if shared.articles_done.load(Ordering::Relaxed) >= STATUS_EVERY {
-            eprintln!();
+            // Final status: the join is done, so the counters are final — the last
+            // periodic line can be up to STATUS_EVERY-1 items stale. Always emit
+            // the completed state. The cursor is at column 0 here (every earlier
+            // status ends in \r or \n), so a plain eprintln overwrites it.
+            eprintln!(
+                "[{}/{}] articles: {} converted ({:.1} MB written)",
+                shared.articles_done.load(Ordering::Relaxed),
+                shared.articles_total,
+                shared.ft_docs.load(Ordering::Relaxed),
+                shared.md_bytes.load(Ordering::Relaxed) as f64 / 1e6
+            );
         }
 
         // ---- post-join: final commits; the mutexes end here and the serial
