@@ -460,6 +460,12 @@ fn copy_illustration(z: &Zim, creator: &mut ZimCreator) -> Result<(), String> {
 /// dynamically, so heterogeneous cores stay busy.
 const CHUNK_ENTRIES: u64 = 512;
 
+/// WDB commit pacing (bounds the uncommitted glass buffers).
+const COMMIT_EVERY: u64 = 10_000;
+
+/// Progress-line interval (carriage-return overwrite, zim2zim style).
+const STATUS_EVERY: u64 = 1_000;
+
 /// Record flags: bit 0 = the article was converted and its blob entered an
 /// output cluster; bit 1 = that blob lives in a compressed cluster; bit 2 =
 /// a redirect whose resolved terminal is in `a`; bit 3 = that terminal's
@@ -824,9 +830,11 @@ pub fn convert(
         run_chunk_workers(threads, &shared.next, end, |start, stop| {
             for idx in start..stop {
                 let n = shared.processed.fetch_add(1, Ordering::Relaxed);
-                if n % 10000 == 9999 {
-                    eprintln!(
-                        "[{}/{}] entries: {} articles converted ({:.1} MB written)",
+                if n % STATUS_EVERY == STATUS_EVERY - 1 {
+                    // \r, not \n: the next status overwrites this one; the
+                    // epilogue after the join submits the final newline.
+                    eprint!(
+                        "[{}/{}] entries: {} articles converted ({:.1} MB written)\r",
                         n + 1,
                         end,
                         shared.ft_docs.load(Ordering::Relaxed),
@@ -895,9 +903,9 @@ pub fn convert(
                 // Both documents build OUTSIDE the database mutexes — the
                 // TermGenerator/Document FFI never touches the WDB pointer
                 // (exactly libzim's own worker design), so only add_document
-                // serializes. Commits every 10k documents bound the uncommitted
-                // glass buffers (they hold every indexed term in RAM until
-                // committed — tens of KB per document).
+                // serializes. Commits every [`COMMIT_EVERY`] documents bound
+                // the uncommitted glass buffers (they hold every indexed term
+                // in RAM until committed — tens of KB per document).
                 let folded_title = crate::search::fold_accents(&title);
                 let folded_content = if index_intro_only {
                     crate::search::fold_accents(&intro_for_index(&md))
@@ -913,7 +921,7 @@ pub fn convert(
                     wdb.add_document(&ft_doc)
                         .map_err(|e| format!("indexing {item_path:?}: {e}"))?;
                     let d = shared.ft_docs.fetch_add(1, Ordering::Relaxed) + 1;
-                    if d % 10_000 == 0 {
+                    if d % COMMIT_EVERY == 0 {
                         wdb.commit()
                             .map_err(|e| format!("fulltext index commit: {e}"))?;
                     }
@@ -923,7 +931,7 @@ pub fn convert(
                     wdb.add_document(&ti_doc)
                         .map_err(|e| format!("title indexing {item_path:?}: {e}"))?;
                     let d = shared.ti_docs.fetch_add(1, Ordering::Relaxed) + 1;
-                    if d % 10_000 == 0 {
+                    if d % COMMIT_EVERY == 0 {
                         wdb.commit().map_err(|e| format!("title index commit: {e}"))?;
                     }
                 }
@@ -947,6 +955,11 @@ pub fn convert(
             }
             Ok(())
         })?;
+
+        // Submit the final newline after the last \r status line.
+        if shared.processed.load(Ordering::Relaxed) >= STATUS_EVERY {
+            eprintln!();
+        }
 
         // ---- post-join: final commits; the mutexes end here and the serial
         // rest owns both databases outright.
@@ -983,7 +996,7 @@ pub fn convert(
 
         // Opt-in redirect title documents (the default build has none): value 1
         // = the terminal article's path, like the pass-1 article adds. Serial;
-        // commits paced every 10k documents. This sits BEFORE the title
+        // commits paced every [`COMMIT_EVERY`] documents. This sits BEFORE the title
         // database's compaction, and the finalize walk below needs no dirent
         // read from it in the default build.
         if index_redirect_titles {
@@ -1008,7 +1021,7 @@ pub fn convert(
                 ti.add_document(&doc)
                     .map_err(|e| format!("title indexing {:?}: {e}", entry.url))?;
                 added += 1;
-                if added % 10_000 == 0 {
+                if added % COMMIT_EVERY == 0 {
                     ti.commit().map_err(|e| format!("title index commit: {e}"))?;
                 }
             }
