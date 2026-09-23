@@ -460,8 +460,11 @@ fn copy_illustration(z: &Zim, creator: &mut ZimCreator) -> Result<(), String> {
 /// dynamically, so heterogeneous cores stay busy.
 const CHUNK_ENTRIES: u64 = 512;
 
-/// WDB commit pacing (bounds the uncommitted glass buffers).
-const COMMIT_EVERY: u64 = 10_000;
+/// WDB commit pacing: glass buffers every uncommitted change in RAM and
+/// only writes on commit, so this bounds the uncommitted glass buffers
+/// (tens of KB per document) while keeping the number of flush/merge
+/// passes — and their write amplification — low.
+const COMMIT_EVERY: u64 = 50_000;
 
 /// Progress-line interval (carriage-return overwrite, zim2zim style).
 const STATUS_EVERY: u64 = 1_000;
