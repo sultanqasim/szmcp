@@ -1,29 +1,21 @@
-//! `szmcp convert` — a faithful Rust port of `wikizim_parser/zim2zim.py`:
-//! turn a Kiwix HTML ZIM into a ZIM of Markdown articles with fresh search
-//! indexes.
+//! `szmcp convert` — a Rust port of `wikizim_parser/zim2zim.py`: turn a
+//! Kiwix HTML ZIM into a ZIM of Markdown articles with fresh fulltext and
+//! title Xapian indexes, built exactly as libzim 9.8.2 builds them (see
+//! `mcp_stuff/convert_notes.md`).
 //!
-//! The conversion is a lean parallel classification pass over the source
-//! dirents (a pool of worker threads over fixed 512-entry chunks in path
-//! order, dirents only, no blob IO: HTML articles also capture their path
-//! and title there, so the walk performs zero dirent reads) followed by a
-//! parallel conversion walk in ascending cluster order: scraper-built
-//! ZIMs append their clusters in completion order while their dirents are
-//! path-sorted, so a path-order walk re-reads the same compressed cluster once per
-//! article it serves, while cluster order reads and decodes each
-//! compressed cluster exactly once. The walk converts HTML articles to
-//! markdown items, builds both Xapian documents OUTSIDE the database
-//! mutexes and stores a 12-byte record per entry (a redirect's resolved
-//! terminal rides in its record); membership is then pure arithmetic over
-//! the record flags, and a single-threaded finalize walks the members'
-//! dirent headers exactly once to stream the dirents in source order and
-//! build the title-ordered listing. Every entry is either converted
-//! (text/html article → markdown item), recreated (redirect whose chain
-//! resolves to a converted source HTML article) or skipped and tallied by
-//! MIME. Fulltext and title Xapian indexes are built as libzim 9.8.2 would
-//! build them (see `mcp_stuff/convert_notes.md`), with libzim's own
-//! nondeterministic document order: the parallel adds race the same way
-//! its workers do, and the two are equivalent as sets keyed by document
-//! data.
+//! Shape: a parallel classification pre-pass over the dirents in path order
+//! (headers only; HTML articles also record their path/title and blob
+//! coordinates), then a parallel conversion walk in ascending cluster order
+//! — dirents are path-sorted but clusters were appended in completion
+//! order, so cluster order decodes each compressed cluster exactly once.
+//! Per-entry 12-byte records carry the walk's outcomes; membership is
+//! arithmetic over their flags, and a single-threaded finalize streams the
+//! member dirents in source order and builds the title-ordered listing.
+//! Every entry is converted (text/html → markdown), recreated (redirect
+//! resolving to a converted article) or skipped and tallied by MIME.
+//! Document order inside the Xapian databases is nondeterministic (the
+//! parallel adds race like libzim's workers); both sides are equivalent as
+//! sets keyed by document data.
 
 use crate::zim::{Target, Zim};
 use crate::zimcommon::MIME_REDIRECT;
@@ -510,17 +502,13 @@ struct ArticleCoord {
     title: (u32, u32),
 }
 
-/// The classification pre-pass's collector: the [`ArticleCoord`]s plus the
-/// string arena their path/title slices point into (raw bytes, no NUL
-/// terminators — the lengths are recorded). One mutex over both so the
-/// coordinates and their strings stay consistent. The arena holds the path
-/// and title of EVERY HTML article — ~0.5-1 GB at ~7M articles, in the same
-/// league as the 12-byte-per-entry records above — and buys the conversion
-/// walk zero dirent reads: it visits the dirents sequentially in path
-/// order, while the cluster-order walk would re-read each article's dirent
-/// from its scattered position across the dirent area (page-faulting
-/// 16-64 KB of physical dirent pages per article under memory pressure,
-/// eating the cluster-order read savings).
+/// The pre-pass's collector: the [`ArticleCoord`]s plus the string arena
+/// their path/title slices point into (raw bytes, lengths recorded), one
+/// mutex over both so coordinates and strings stay consistent. The arena
+/// (~0.5-1 GB at 7M articles) buys the walk zero dirent reads: the
+/// cluster-order walk would otherwise re-read each article's dirent from
+/// its scattered position across the dirent area, page-faulting 16-64 KB
+/// per article under memory pressure.
 struct PrePass {
     arena: Vec<u8>,
     coords: Vec<ArticleCoord>,
@@ -749,9 +737,7 @@ pub fn convert(
         .map_err(|e| format!("cannot create temp dir {}: {e}", tmp.display()))?;
 
     // The inner closure exists only so the temp dir is removed on every
-    // error path; inside, the code reads top to bottom in execution order:
-    // setup, pass 1 (the classification pre-pass, then the conversion walk
-    // in cluster order), the post-join membership scan, the finalize walk.
+    // error path.
     let outcome = (|| -> Result<(), String> {
         // The walk range: the LIMIT (not the full entry count) — --limit
         // runs never allocate proportional to the archive.
@@ -770,10 +756,8 @@ pub fn convert(
         // behind its mutex (short blob adds only).
         let creator = Mutex::new(creator);
 
-        // Both Xapian databases live in the temp dir NEXT TO THE OUTPUT
-        // (huge archives need the output filesystem's space for the
-        // throwaway databases) and are compacted to the single files libzim
-        // embeds (xapianIndexer.cpp indexingPrelude).
+        // Both databases are compacted to the single files libzim embeds
+        // (xapianIndexer.cpp indexingPrelude).
         let ft_path = tmp.join("fulltext.idx");
         let ti_path = tmp.join("title.idx");
         let ft_wdb = Mutex::new(create_index_wdb(
@@ -873,13 +857,10 @@ pub fn convert(
                     }
                     continue;
                 }
-                // An HTML article: its blob coordinates go to the walk
-                // below (which reads it in cluster order), together with
-                // the path and title captured NOW, while the pre-pass
-                // still touches the dirents sequentially — the same
-                // dirent read in the walk would land scattered across
-                // the dirent area in cluster order. Raw bytes only, no
-                // fallback: the walk applies entry_title().
+                // An HTML article: capture path and title NOW (the pre-pass
+                // still reads dirents sequentially) plus the blob
+                // coordinates for the cluster-order walk. Raw bytes only,
+                // no fallback: the walk applies entry_title().
                 let Target::Cluster(cluster, blob) = target else {
                     continue;
                 };
@@ -954,15 +935,11 @@ pub fn convert(
         // cluster tasks in the walk: reset it between the two phases.
         shared.next.store(0, Ordering::Relaxed);
 
-        // ---- pass 1, phase B: the conversion walk over the cluster tasks,
-        // in ascending cluster order: a scraper-built ZIM's dirents are
-        // path-sorted but its clusters were appended in completion order, so
-        // THIS is the order that reads each compressed cluster exactly once
-        // (path order re-read it once per article it served, from random
-        // offsets) and keeps the source reads sequential. The walk performs
-        // ZERO dirent reads: every path and title rides in the pre-pass's
-        // string arena (borrowed below). Per article the handling is the
-        // old walk's: read, convert, index, add, store the record.
+        // ---- pass 1, phase B: the conversion walk, one task per cluster in
+        // ascending cluster order — that order reads and decodes each
+        // compressed cluster exactly once and keeps the source reads
+        // sequential. ZERO dirent reads: every path and title rides in the
+        // pre-pass's string arena (borrowed below).
         if !tasks.is_empty() {
             run_task_workers(threads, &shared.next, &tasks, |(cluster, items)| {
                 let compressed = z
@@ -1063,9 +1040,8 @@ pub fn convert(
                             wdb.commit().map_err(|e| format!("title index commit: {e}"))?;
                         }
                     }
-                    // Writer add in its own lock scope (no nesting): the blob lands
-                    // in an open cluster and the record carries its ref — the
-                    // ARTICLE flag replaces the old written bitset.
+                    // Writer add in its own lock scope (no nesting): the
+                    // record carries the blob's ref.
                     {
                         let mut zc = creator.lock().unwrap();
                         let b = zc
@@ -1130,10 +1106,9 @@ pub fn convert(
         let rank = Rank::new(&member);
 
         // Opt-in redirect title documents (the default build has none): value 1
-        // = the terminal article's path, like the pass-1 article adds. Serial;
-        // commits paced every [`COMMIT_EVERY`] documents. This sits BEFORE the title
-        // database's compaction, and the finalize walk below needs no dirent
-        // read from it in the default build.
+        // = the terminal article's path, like the walk's article adds. Serial;
+        // commits paced every [`COMMIT_EVERY`] documents, before the title
+        // database's compaction.
         if index_redirect_titles {
             let mut added = 0u64;
             for idx in 0..end {
@@ -1182,12 +1157,11 @@ pub fn convert(
         }
 
         // ---- finalize (single-threaded): ONE dirent-header walk over the
-        // members — emit the dirents in SOURCE order and build the title-ordered
-        // listing rows, then the writer's tail. The listing's sort key is the
-        // derived title in a bump arena; the tie-break is the member's OUTPUT
-        // index, which IS member path order (the source dirents are path-sorted
-        // and all members are C-namespace), reproducing the old (title, path)
-        // comparator without re-parsing dirents per comparison.
+        // members — emit the dirents in SOURCE order and build the title-
+        // ordered listing rows. Listing sort key: the derived title in a
+        // bump arena, tie-broken by the member's OUTPUT index, which IS
+        // (title, path) order — the source dirents are path-sorted and all
+        // members are C-namespace.
         eprintln!("Finalizing (this may take a while)...");
         // The source index of the main-page PATH (its terminal article), for the
         // resolved W/mainPage target below.

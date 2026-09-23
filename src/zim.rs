@@ -110,12 +110,11 @@ impl Store {
         self.len
     }
 
-    /// Read `len` bytes at virtual offset `off`. Returns a borrowed view when
-    /// the range lies inside a single part. Reads of [`BIG_READ`] bytes or
-    /// more go through direct file I/O instead of the mapping: an 8+ GB
-    /// archive's cluster pages would otherwise accumulate in this process's
-    /// page-cache-resident RSS as the convert pass touches them (clean
-    /// mapped pages the kernel only reclaims under pressure).
+    /// Read `len` bytes at virtual offset `off`; borrowed when the range lies
+    /// inside one part. Reads of [`BIG_READ`] bytes or more bypass the
+    /// mapping (direct file I/O): the convert pass's cluster reads would
+    /// otherwise pin the archive's pages in this process's RSS (clean mapped
+    /// pages the kernel only reclaims under pressure).
     fn read<'a>(&'a self, off: u64, len: u64) -> io::Result<std::borrow::Cow<'a, [u8]>> {
         if off > self.len || len > self.len - off {
             return Err(io::Error::new(ErrorKind::InvalidData, "read out of bounds in ZIM archive"));
@@ -905,14 +904,11 @@ impl Archive {
     }
 
     /// Run `f` with handles on this archive's Xapian search indexes (full
-    /// text, plus the title index when the archive embeds one).
-    ///
-    /// Handle sets are pooled and moved in and out of the pool under the
-    /// lock, so no handle is ever reachable from two threads at once; `f`
+    /// text, plus the title index when the archive embeds one). Handle sets
+    /// are pooled and moved in and out under the lock — never shared, since
+    /// Xapian forbids concurrent calls on one database object — and `f`
     /// runs outside the lock. This amortizes the ~0.15 s open cost per
-    /// archive and index without ever sharing a Xapian object between
-    /// searches (Xapian's documented thread-safety contract forbids
-    /// concurrent calls on one database object).
+    /// archive and index.
     ///
     /// `Ok(None)` when the archive carries no full-text index. A title
     /// index that fails to open only downgrades to no title band - it never
@@ -1206,7 +1202,7 @@ fn scan_dir(dir: &Path, root: &Path, out: &mut Vec<String>) -> io::Result<()> {
 
 #[cfg(test)]
 pub(crate) mod testutil {
-    //! Synthetic ZIM archive builder for tests (adapted from zxr).
+    //! Synthetic ZIM archive builder for tests.
 
     use super::*;
     use std::io::Write;

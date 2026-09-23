@@ -1,14 +1,7 @@
 //! Pure-Rust ZIM 6.x container writer, byte-layout-compatible with what
-//! libzim 9.8.2's `zim::writer::Creator` produces.
-//!
-//! Mirrors libzim's writer internals (verified against libzim 9.8.2):
-//! - `creator.cpp` — entry lifecycle, finish order, file layout, header,
-//!   checksum (`writeLastParts` / `fillHeader`).
-//! - `dirent.cpp` + `tinyString.h` — binary dirent layout and the
-//!   path/title tiny-string packing (title omitted when equal to the path).
-//! - `cluster.cpp` — blob offset tables, extended (u64) offsets, zstd frames.
-//! - `counterHandler.cpp` — the `M/Counter` metadata.
-//! - the title listing provider (`TitleListingProvider`).
+//! libzim 9.8.2's `zim::writer::Creator` produces (verified against
+//! `creator.cpp`, `dirent.cpp` + `tinyString.h`, `cluster.cpp`,
+//! `counterHandler.cpp` and the title listing provider).
 //!
 //! Structural rules replicated here:
 //! - Dirents live in a `BTreeMap` keyed by `(namespace byte, path)`, so map
@@ -29,10 +22,6 @@
 //!   (offset table + blob bytes) plus the incoming blob would reach 2 MiB.
 //!   Compressed clusters hold one zstd frame (level 19) of the offset table +
 //!   blob bytes; uncompressed clusters store those bytes verbatim.
-//!
-//! The only API deviation from the plan sketch: [`ZimCreator::add_item`] takes
-//! an explicit `front_article` flag (libzim's FRONT_ARTICLE hint, which drives
-//! the `X/listing/titleOrdered/v1` contents; zim2zim sets it on every item).
 
 use std::collections::{BTreeMap, HashMap};
 use std::io::{self, Read, Seek, SeekFrom, Write};
