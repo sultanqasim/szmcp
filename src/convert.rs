@@ -824,12 +824,7 @@ pub fn convert(
             let mut arena: Vec<u8> = Vec::new();
             let mut found: Vec<ArticleCoord> = Vec::new();
             for idx in start..stop {
-                let n = shared.processed.fetch_add(1, Ordering::Relaxed);
-                if n % STATUS_EVERY == STATUS_EVERY - 1 {
-                    // \r, not \n: the next status overwrites this one; the
-                    // epilogue after the join submits the final newline.
-                    eprint!("[{}/{end}] entries classified\r", n + 1);
-                }
+                shared.processed.fetch_add(1, Ordering::Relaxed);
                 let (mime, target) = z
                     .entry_head(idx)
                     .map_err(|e| format!("reading entry {idx}: {e}"))?;
@@ -908,12 +903,6 @@ pub fn convert(
             Ok(())
         })?;
 
-        // Submit the final newline after the last \r status line (the walk
-        // does the same for its own \r stream after its join), then report
-        // the pre-pass tallies before the coordinates are sorted.
-        if end >= STATUS_EVERY as u32 {
-            eprintln!();
-        }
         let dt = t_classify.elapsed().as_secs_f64();
         let articles = collector.lock().unwrap().coords.len();
         let redirects = shared.redirects.load(Ordering::Relaxed);
