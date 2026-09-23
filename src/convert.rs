@@ -28,7 +28,6 @@
 use crate::zim::{Target, Zim};
 use crate::zimcommon::MIME_REDIRECT;
 use crate::zimwrite::{BlobRef, DirentOut, ZimCreator};
-use std::collections::HashMap;
 use std::path::Path;
 use std::sync::atomic::{AtomicU32, AtomicU64, AtomicU8, Ordering};
 use std::sync::Mutex;
@@ -205,9 +204,9 @@ fn main_entry_path(z: &Zim) -> Option<String> {
     None
 }
 
-/// The mime tally key for a skipped entry: the MIME string from the archive's
-/// mime list, or "unknown/<id>".
-fn skip_mime_key(z: &Zim, mime: u16) -> String {
+/// The display name for a skipped entry's MIME id: the MIME string from the
+/// archive's mime list, or "unknown/<id>".
+fn skip_mime_name(z: &Zim, mime: u16) -> String {
     match z.mime_type(mime) {
         Some(s) => s.to_string(),
         None => format!("unknown/{mime}"),
@@ -563,7 +562,8 @@ impl<'a> Rank<'a> {
 }
 
 /// Counters and tallies shared by the worker threads (atomic because every
-/// worker fetch-adds; the skip tally sits behind a mutex). `next` hands out
+/// worker fetch-adds; the skip tally is indexed by MIME id, so workers
+/// never contend on one lock). `next` hands out
 /// the work (512-entry chunks in the classification pre-pass, one cluster
 /// task per fetch-add in the conversion walk; reset between the phases),
 /// `processed` counts classified entries, `redirects` counts the redirect
@@ -582,7 +582,10 @@ struct Shared {
     md_bytes: AtomicU64,
     ft_docs: AtomicU64,
     ti_docs: AtomicU64,
-    skipped: Mutex<HashMap<String, usize>>,
+    /// Skipped-entry counts indexed by MIME id, sized to the archive's MIME
+    /// list; `skipped_unknown` counts entries whose id is past the list.
+    skipped: Vec<AtomicU64>,
+    skipped_unknown: AtomicU64,
 }
 
 /// Run `worker` on `threads` scoped threads; each pulls fixed
@@ -800,6 +803,9 @@ pub fn convert(
         eprintln!("  {threads} conversion threads");
 
         let mut shared = Shared::default();
+        // One skip-tally slot per id in the archive's MIME list: skips
+        // stay a single relaxed fetch-add.
+        shared.skipped = (0..mime_count as usize).map(|_| AtomicU64::new(0)).collect();
         // Per-entry records, preallocated exactly once for the LIMIT (not
         // the full entry count): 12 bytes per entry is the dominant
         // constant-RAM structure (600 MB at 50M entries).
@@ -860,8 +866,11 @@ pub fn convert(
                 }
                 if !z.mime_type(mime).is_some_and(|m| m.starts_with("text/html")) {
                     // Media/metadata/whatever: skipped, tallied by MIME.
-                    let key = skip_mime_key(&z, mime);
-                    *shared.skipped.lock().unwrap().entry(key).or_insert(0) += 1;
+                    if let Some(c) = shared.skipped.get(mime as usize) {
+                        c.fetch_add(1, Ordering::Relaxed);
+                    } else {
+                        shared.skipped_unknown.fetch_add(1, Ordering::Relaxed);
+                    }
                     continue;
                 }
                 // An HTML article: its blob coordinates go to the walk
@@ -906,7 +915,21 @@ pub fn convert(
         let dt = t_classify.elapsed().as_secs_f64();
         let articles = collector.lock().unwrap().coords.len();
         let redirects = shared.redirects.load(Ordering::Relaxed);
-        let skipped_total = shared.skipped.lock().unwrap().values().sum::<usize>();
+        // The skip tally as (label, count): one slot per archive MIME id,
+        // plus one combined line for ids past the list.
+        let mut skipped: Vec<(String, u64)> = shared
+            .skipped
+            .iter()
+            .enumerate()
+            .map(|(id, n)| (skip_mime_name(&z, id as u16), n.load(Ordering::Relaxed)))
+            .filter(|(_, n)| *n > 0)
+            .collect();
+        let unknown = shared.skipped_unknown.load(Ordering::Relaxed);
+        if unknown > 0 {
+            skipped.push(("unknown".to_string(), unknown));
+        }
+        skipped.sort_by_key(|&(_, n)| std::cmp::Reverse(n));
+        let skipped_total: u64 = skipped.iter().map(|&(_, n)| n).sum();
         eprintln!(
             "  classified {end} entries in {dt:.1}s: {articles} articles, {redirects} redirects, {skipped_total} skipped"
         );
@@ -1284,7 +1307,6 @@ pub fn convert(
         let elapsed = t0.elapsed().as_secs_f64();
         let processed = shared.processed.load(Ordering::Relaxed);
         let failed = shared.failed.load(Ordering::Relaxed);
-        let skipped_mimes = shared.skipped.into_inner().unwrap();
         eprintln!();
         eprintln!("{}", "=".repeat(60));
         eprintln!("SUMMARY");
@@ -1293,8 +1315,6 @@ pub fn convert(
         eprintln!("  language           : {} (metadata: {})", conv_lang, metadata_language);
         eprintln!("  conversion failures: {failed}");
         eprintln!("  skipped entries by MIME:");
-        let mut skipped: Vec<(&String, &usize)> = skipped_mimes.iter().collect();
-        skipped.sort_by_key(|(_, n)| std::cmp::Reverse(**n));
         for (mime, count) in skipped {
             eprintln!("    {mime:<30} {count}");
         }
