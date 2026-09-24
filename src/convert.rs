@@ -583,6 +583,9 @@ struct Shared {
     /// list; `skipped_unknown` counts entries whose id is past the list.
     skipped: Vec<AtomicU64>,
     skipped_unknown: AtomicU64,
+    /// HTML entries dropped by the pre-pass's `_categories_partials_` rule
+    /// (mwoffliner's category pagination fragments).
+    category_partials: AtomicU64,
 }
 
 /// Run `worker` on `threads` scoped threads; each pulls fixed
@@ -926,7 +929,9 @@ fn convert_article_html(
 /// them dangle and are dropped — though they still count as processed walk
 /// items. The default keeps them: they convert to markdown with their
 /// Subcategories/Pages-in-category sections and articles gain the
-/// localized Categories section.
+/// localized Categories section. Entries whose path starts with
+/// `_categories_partials_` (mwoffliner's category pagination fragments)
+/// are dropped in BOTH modes, before the walk ever sees them.
 pub fn convert(
     zimfile: &Path,
     outfile: &Path,
@@ -1114,6 +1119,18 @@ pub fn convert(
                     continue;
                 };
                 let entry = z.get_entry(idx).map_err(|e| format!("reading entry {idx}: {e}"))?;
+                // mwoffliner paginates large categories into
+                // `_categories_partials_*` text/html fragments (a 200-member
+                // `div#mw-pages` list slice, empty <title>; e.g.
+                // `_categories_partials_Category:1838_deaths_pages_2`).
+                // Converted as articles they would only duplicate the parent
+                // category's member list as junk `# categories partials …`
+                // pages, so they are dropped unconditionally — in both modes
+                // — before any capture: no walk item, no blob, no dirent.
+                if entry.url.starts_with("_categories_partials_") {
+                    shared.category_partials.fetch_add(1, Ordering::Relaxed);
+                    continue;
+                }
                 let path_off = arena.len() as u32;
                 arena.extend_from_slice(entry.url.as_bytes());
                 let title_off = arena.len() as u32;
@@ -1160,8 +1177,10 @@ pub fn convert(
         }
         skipped.sort_by_key(|&(_, n)| std::cmp::Reverse(n));
         let skipped_total: u64 = skipped.iter().map(|&(_, n)| n).sum();
+        let partials = shared.category_partials.load(Ordering::Relaxed);
+        let partials_note = if partials > 0 { format!(", {partials} category partials") } else { String::new() };
         eprintln!(
-            "  classified {end} entries in {dt:.1}s: {articles} articles, {redirects} redirects, {skipped_total} skipped"
+            "  classified {end} entries in {dt:.1}s: {articles} articles, {redirects} redirects, {skipped_total} skipped{partials_note}"
         );
 
         // Between the phases: the collected coordinates sort by (cluster,
@@ -1811,13 +1830,24 @@ mod e2e {
 <li><a href=\"Category%3AFruits_by_plant_part\" title=\"Category:Fruits by plant part\">Fruits by plant part</a></li>\
 </ul></div></div></body></html>";
 
+    /// mwoffliner's pagination fragment for the Fruits category's second
+    /// member-list page (empty <title>, a 200-member div#mw-pages slice —
+    /// truncated here), modeled on the real archive's shape.
+    const FRUITS_PARTIAL_HTML: &str = "<html><head><title></title></head><body>\
+<div id=\"mw-pages\"><div class=\"mw-content-ltr\"><div class=\"mw-category\">\
+<div class=\"mw-category-group\"><h3>B</h3><ul>\
+<li><a target=\"_parent\" href=\"Banana\" title=\"Banana\">Banana</a></li>\
+</ul></div></div></div></div></body></html>";
+
     /// The synthetic source for the category handling: the article, the
     /// category page it links to, a ZIM-native redirect pointing at the
-    /// category page, and English language metadata.
+    /// category page, one `_categories_partials_*` pagination fragment, and
+    /// English language metadata.
     fn category_fixture() -> Vec<u8> {
         let content = [
             TestEntry { namespace: b'C', url: "Apple", title: "Apple", mime: 0, body: APPLE_CAT_HTML.as_bytes() },
             TestEntry { namespace: b'C', url: "Category:Fruits", title: "Category:Fruits", mime: 0, body: CAT_FRUITS_HTML.as_bytes() },
+            TestEntry { namespace: b'C', url: "_categories_partials_Category:Fruits_pages_2", title: "", mime: 0, body: FRUITS_PARTIAL_HTML.as_bytes() },
             TestEntry { namespace: b'M', url: "Language", title: "", mime: 1, body: b"eng" },
         ];
         let redirects = [TestRedirect {
@@ -2301,6 +2331,41 @@ mod e2e {
         let ti = z.open_title_xapian().unwrap().unwrap();
         assert_eq!(ti.doc_count(), 1);
         assert_eq!(ti.get_document(1).unwrap().data_str().unwrap(), "C/Apple");
+    }
+
+    #[test]
+    fn category_partials_are_always_skipped() {
+        // mwoffliner's `_categories_partials_*` pagination fragments are
+        // dropped in BOTH modes, before the walk: no dirent, no blob, no
+        // index document — while the real pages around them are untouched.
+        for exclude in [false, true] {
+            let c = convert_category_fixture(exclude);
+            let z = &c.zim;
+            assert!(
+                z.resolve_path("C/_categories_partials_Category:Fruits_pages_2")
+                    .unwrap()
+                    .is_none(),
+                "exclude_categories={exclude}"
+            );
+            // The counter records exactly the markdown dirents written: the
+            // article plus (by default) the category page — never the
+            // fragment.
+            let counter = blob_of(z, b'M', "Counter").unwrap();
+            let expected = if exclude { "text/markdown=1" } else { "text/markdown=2" };
+            assert_eq!(
+                String::from_utf8_lossy(&counter),
+                expected,
+                "exclude_categories={exclude}"
+            );
+            let ft = z.open_fulltext_xapian().unwrap().unwrap();
+            let data: Vec<String> = (1..=ft.doc_count())
+                .map(|d| ft.get_document(d).unwrap().data_str().unwrap())
+                .collect();
+            assert!(
+                !data.iter().any(|d| d.contains("_categories_partials_")),
+                "exclude_categories={exclude}: {data:?}"
+            );
+        }
     }
 
     #[test]
