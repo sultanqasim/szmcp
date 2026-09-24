@@ -328,6 +328,34 @@ fn mask_code_dests(ln: &str) -> (String, Vec<String>) {
     (masked, items)
 }
 
+/// Shared scan driver for the find-then-replace repairs: find the next
+/// `token` from `from`, offer its position to `hit`, and on a hit replace
+/// `s[p..stop]` with the single char `emit` and resume the scan at
+/// `stop`; a miss resumes one char past the candidate, so overlapping
+/// candidates are still tried.
+fn sub_scan(
+    s: &str,
+    token: &str,
+    hit: impl Fn(&str, usize) -> Option<(usize, char)>,
+) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut last = 0usize;
+    let mut from = 0usize;
+    while let Some(k) = s[from..].find(token) {
+        let p = from + k;
+        if let Some((stop, emit)) = hit(s, p) {
+            out.push_str(&s[last..p]);
+            out.push(emit);
+            last = stop;
+            from = stop;
+        } else {
+            from = p + 1;
+        }
+    }
+    out.push_str(&s[last..]);
+    out
+}
+
 /// `\(\s+(?=\S)` -> `(`: "( (" becomes "((", but "(  " at end of line
 /// stays.  Candidates are the `(` positions; the greedy `\s+` takes the
 /// maximal whitespace run, and the lookahead only holds when a non-space
@@ -336,19 +364,39 @@ fn mask_code_dests(ln: &str) -> (String, Vec<String>) {
 /// maximal-run test is the whole rule.  Python `re.sub` scan semantics:
 /// replace and continue after the match.
 fn sub_paren_space(s: &str) -> String {
+    sub_scan(s, "(", |s, p| {
+        let run = run_end(s, p + 1, char::is_whitespace);
+        (run > p + 1 && s[run..].chars().next().is_some_and(|c| !c.is_whitespace()))
+            .then_some((run, '('))
+    })
+}
+
+/// Shared scan driver for the whitespace-run repairs: find each maximal
+/// run of `is_ws` chars from `i`, offer its `[start, end)` to `hit`, and
+/// on a hit replace `s[start..stop]` with the single char `emit` and
+/// resume at `stop`; a miss resumes at the run's end.
+fn sub_ws_runs(
+    s: &str,
+    is_ws: fn(char) -> bool,
+    emit: char,
+    hit: impl Fn(&str, usize, usize) -> Option<usize>,
+) -> String {
     let mut out = String::with_capacity(s.len());
     let mut last = 0usize;
-    let mut from = 0usize;
-    while let Some(k) = s[from..].find('(') {
-        let p = from + k;
-        let run = run_end(s, p + 1, char::is_whitespace);
-        if run > p + 1 && s[run..].chars().next().is_some_and(|c| !c.is_whitespace()) {
-            out.push_str(&s[last..p]);
-            out.push('(');
-            last = run;
-            from = run;
+    let mut i = 0usize;
+    while i < s.len() {
+        let start = match s[i..].find(is_ws) {
+            Some(k) => i + k,
+            None => break,
+        };
+        let end = run_end(s, start, is_ws);
+        if let Some(stop) = hit(s, start, end) {
+            out.push_str(&s[last..start]);
+            out.push(emit);
+            last = stop;
+            i = stop;
         } else {
-            from = p + 1;
+            i = end;
         }
     }
     out.push_str(&s[last..]);
@@ -361,29 +409,12 @@ fn sub_paren_space(s: &str) -> String {
 /// would end in whitespace); the lookbehind wants a non-space char
 /// before the run.
 fn sub_ws_close_paren(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    let mut last = 0usize;
-    let mut i = 0usize;
-    while i < s.len() {
-        let start = match s[i..].find(char::is_whitespace) {
-            Some(k) => i + k,
-            None => break,
-        };
-        let end = run_end(s, start, char::is_whitespace);
-        if end < s.len()
+    sub_ws_runs(s, char::is_whitespace, ')', |s, start, end| {
+        (end < s.len()
             && s.as_bytes()[end] == b')'
-            && prev_char(s, start).is_some_and(|c| !c.is_whitespace())
-        {
-            out.push_str(&s[last..start]);
-            out.push(')');
-            last = end + 1;
-            i = end + 1;
-        } else {
-            i = end;
-        }
-    }
-    out.push_str(&s[last..]);
-    out
+            && prev_char(s, start).is_some_and(|c| !c.is_whitespace()))
+        .then_some(end + 1)
+    })
 }
 
 /// `(?<=[A-Za-z0-9])\.\.(?![.\w/])` -> `.`: "3.." becomes "3.", while
@@ -392,94 +423,37 @@ fn sub_ws_close_paren(s: &str) -> String {
 /// are the ".." positions; a rejected pair is followed up one char later
 /// because overlapping pairs share their middle dot.
 fn sub_dot_pair(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    let mut last = 0usize;
-    let mut from = 0usize;
-    while let Some(k) = s[from..].find("..") {
-        let p = from + k;
+    sub_scan(s, "..", |s, p| {
         // [A-Za-z0-9] is pure ASCII, so the char before the pair can be
         // tested on its last byte (a non-ASCII char ends in >= 0x80).
         let lookbehind = p > 0 && s.as_bytes()[p - 1].is_ascii_alphanumeric();
-        let lookahead = !re("^[.\\w/]").is_match(&s[p + 2..]);
-        if lookbehind && lookahead {
-            out.push_str(&s[last..p]);
-            out.push('.');
-            last = p + 2;
-            from = p + 2;
-        } else {
-            from = p + 1;
-        }
-    }
-    out.push_str(&s[last..]);
-    out
+        (lookbehind && !re("^[.\\w/]").is_match(&s[p + 2..])).then_some((p + 2, '.'))
+    })
 }
 
 /// `(?<=\S) {2,}` -> ` `: "x   " becomes "x ", runs after whitespace or
 /// at start of line stay.  Candidates are the maximal runs of spaces
 /// (the core matches only `' '`), needing two or more.
 fn sub_double_space(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    let mut last = 0usize;
-    let mut i = 0usize;
-    while i < s.len() {
-        let start = match s[i..].find(' ') {
-            Some(k) => i + k,
-            None => break,
-        };
-        let end = run_end(s, start, |c| c == ' ');
-        if end - start >= 2 && prev_char(s, start).is_some_and(|c| !c.is_whitespace()) {
-            out.push_str(&s[last..start]);
-            out.push(' ');
-            last = end;
-        }
-        i = end;
-    }
-    out.push_str(&s[last..]);
-    out
+    sub_ws_runs(s, |c: char| c == ' ', ' ', |s, start, end| {
+        (end - start >= 2 && prev_char(s, start).is_some_and(|c| !c.is_whitespace()))
+            .then_some(end)
+    })
 }
 
-/// `,\s*\.(?![.\w])` -> `.`: ", ." becomes ".", ", .x" stays.  The
-/// greedy `\s*` can only reach a `.` at the run's end, so the candidate
-/// dot is uniquely placed; the lookahead holds past end of line too.
-fn sub_comma_dot(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    let mut last = 0usize;
-    let mut from = 0usize;
-    while let Some(k) = s[from..].find(',') {
-        let p = from + k;
+/// `,\s*\.(?![.\w])` -> `.` (", ." becomes ".", ", .x" stays) and
+/// `,\s*,(?!\w)` -> `,` (", ," becomes ",", ", ,a" stays): the two comma
+/// repairs share their shape and differ only in the matched char — which
+/// is also the replacement — and in the forbidden next-char class.  The
+/// greedy `\s*` can only reach the matched char at the run's end, so the
+/// candidate is uniquely placed; the lookahead holds past end of line
+/// too.
+fn sub_comma_before(s: &str, punct: char, forbidden: &'static str) -> String {
+    sub_scan(s, ",", |s, p| {
         let run = run_end(s, p + 1, char::is_whitespace);
-        if s[run..].starts_with('.') && !re("^[.\\w]").is_match(&s[run + 1..]) {
-            out.push_str(&s[last..p]);
-            out.push('.');
-            last = run + 1;
-            from = run + 1;
-        } else {
-            from = p + 1;
-        }
-    }
-    out.push_str(&s[last..]);
-    out
-}
-
-/// `,\s*,(?!\w)` -> `,`: ", ," becomes ",", ", ,a" stays.
-fn sub_comma_comma(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    let mut last = 0usize;
-    let mut from = 0usize;
-    while let Some(k) = s[from..].find(',') {
-        let p = from + k;
-        let run = run_end(s, p + 1, char::is_whitespace);
-        if s[run..].starts_with(',') && !re("^\\w").is_match(&s[run + 1..]) {
-            out.push_str(&s[last..p]);
-            out.push(',');
-            last = run + 1;
-            from = run + 1;
-        } else {
-            from = p + 1;
-        }
-    }
-    out.push_str(&s[last..]);
-    out
+        (s[run..].starts_with(punct) && !re(forbidden).is_match(&s[run + 1..]))
+            .then_some((run + 1, punct))
+    })
 }
 
 /// `(?<=[A-Za-z0-9\)\]"'*]) +\.(?![.\w])` -> `.`: "x ." becomes "x.",
@@ -488,31 +462,17 @@ fn sub_comma_comma(s: &str) -> String {
 /// a dot; the lookbehind class is pure ASCII, so it is tested on the
 /// last byte of the char before the run.
 fn sub_cls_space_dot(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    let mut last = 0usize;
-    let mut i = 0usize;
-    while i < s.len() {
-        let start = match s[i..].find(' ') {
-            Some(k) => i + k,
-            None => break,
-        };
-        let end = run_end(s, start, |c| c == ' ');
+    sub_ws_runs(s, |c: char| c == ' ', '.', |s, start, end| {
         let lookbehind = start > 0
             && matches!(
                 s.as_bytes()[start - 1],
                 b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9' | b')' | b']' | b'"' | b'\'' | b'*'
             );
-        if s[end..].starts_with('.') && lookbehind && !re("^[.\\w]").is_match(&s[end + 1..]) {
-            out.push_str(&s[last..start]);
-            out.push('.');
-            last = end + 1;
-            i = end + 1;
-        } else {
-            i = end;
-        }
-    }
-    out.push_str(&s[last..]);
-    out
+        (s[end..].starts_with('.')
+            && lookbehind
+            && !re("^[.\\w]").is_match(&s[end + 1..]))
+        .then_some(end + 1)
+    })
 }
 
 /// `(?<=[a-z0-9\)])\.([A-Z])` -> `. X`: "end.He" becomes "end. He" (the
@@ -570,10 +530,10 @@ fn repair_line(ln: &str) -> String {
             .replace_all(&s, "$1")
             .into_owned();
         if s.contains('.') {
-            s = sub_comma_dot(&s);
+            s = sub_comma_before(&s, '.', "^[.\\w]");
         }
         if s.matches(',').count() > 1 {
-            s = sub_comma_comma(&s);
+            s = sub_comma_before(&s, ',', "^\\w");
         }
     }
     if s.contains(" .") {
