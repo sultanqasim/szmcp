@@ -50,6 +50,9 @@ const METADATA_KEYS: [&str; 7] = [
     "Creator",
 ];
 
+/// libzim/python's default metadata mimetype.
+const METADATA_MIME: &str = "text/plain;charset=UTF-8";
+
 // ---------------------------------------------------------------------------
 // Ported helpers (zim2zim.py)
 // ---------------------------------------------------------------------------
@@ -161,21 +164,22 @@ fn indexing_language(raw: Option<&str>) -> String {
 // Source reading helpers
 // ---------------------------------------------------------------------------
 
-/// The raw `M/Language` metadata of the source (verbatim, e.g. "fra" or a
-/// comma list), or `None` when the archive carries none.
-fn raw_language_metadata(z: &Zim) -> Option<String> {
-    let idx = z.find_entry(b'M', "Language").ok()??;
+/// The value of one `M/<key>` metadata entry of the source, verbatim, or
+/// `None` when the key is absent, unreadable, not a cluster blob, or not
+/// UTF-8 (the find/get/read ladder both `M/` readers below share).
+fn metadata_value(z: &Zim, key: &str) -> Option<String> {
+    let idx = z.find_entry(b'M', key).ok()??;
     let entry = z.get_entry(idx).ok()?;
     let Target::Cluster(cluster, blob) = entry.target else {
         return None;
     };
-    let bytes = z.read_blob(cluster, blob).ok()?;
-    let value = String::from_utf8(bytes).ok()?;
-    if value.trim().is_empty() {
-        None
-    } else {
-        Some(value)
-    }
+    String::from_utf8(z.read_blob(cluster, blob).ok()?).ok()
+}
+
+/// The raw `M/Language` metadata of the source (verbatim, e.g. "fra" or a
+/// comma list), or `None` when the archive carries none.
+fn raw_language_metadata(z: &Zim) -> Option<String> {
+    metadata_value(z, "Language").filter(|v| !v.trim().is_empty())
 }
 
 /// The source's main entry path, replicating
@@ -387,37 +391,22 @@ fn copy_metadata(
     let mut language = default_language.to_string();
     let mut copied_language = false;
     for key in METADATA_KEYS {
-        let Some(idx) = (match z.find_entry(b'M', key) {
-            Ok(idx) => idx,
-            Err(_) => continue,
-        }) else {
-            continue;
-        };
-        let entry = match z.get_entry(idx) {
-            Ok(entry) => entry,
-            Err(_) => continue,
-        };
-        let Target::Cluster(cluster, blob) = entry.target else {
-            continue;
-        };
-        let Ok(bytes) = z.read_blob(cluster, blob) else { continue };
-        let Ok(value) = String::from_utf8(bytes) else { continue };
         // Skip missing/whitespace-only values; the value itself is copied
         // unmodified (python checks `val.strip()` and writes `val`).
-        if value.trim().is_empty() {
+        let Some(value) = metadata_value(z, key).filter(|v| !v.trim().is_empty()) else {
             continue;
-        }
+        };
         if key == "Language" {
             language = value.clone();
             copied_language = true;
         }
         creator
-            .add_metadata(key, value.as_bytes(), "text/plain;charset=UTF-8")
+            .add_metadata(key, value.as_bytes(), METADATA_MIME)
             .map_err(|e| format!("metadata {key:?}: {e}"))?;
     }
     if !copied_language {
         creator
-            .add_metadata("Language", default_language.as_bytes(), "text/plain;charset=UTF-8")
+            .add_metadata("Language", default_language.as_bytes(), METADATA_MIME)
             .map_err(|e| format!("metadata 'Language': {e}"))?;
     }
     Ok(language)
