@@ -562,10 +562,11 @@ impl<'a> Rank<'a> {
 /// `processed` counts classified entries, `redirects` counts the redirect
 /// records stored by the pre-pass, and `articles_done`/`articles_total` is
 /// the walk's per-article progress.
-/// `ft_docs` IS the converted-article count: every successful conversion
-/// adds exactly one fulltext document except no-content pages (they are
-/// indexed like redirects), and only the indexer thread
-/// increments `ft_docs`/`ti_docs`.
+/// `ft_docs` IS the fulltext-indexed-article count: every successful
+/// conversion adds exactly one fulltext document except no-content pages
+/// (they are indexed like redirects) and category pages (title index only),
+/// and only the indexer thread increments `ft_docs`/`ti_docs`. Category
+/// partials are never indexed at all.
 #[derive(Default)]
 struct Shared {
     next: AtomicU64,
@@ -583,8 +584,10 @@ struct Shared {
     /// list; `skipped_unknown` counts entries whose id is past the list.
     skipped: Vec<AtomicU64>,
     skipped_unknown: AtomicU64,
-    /// HTML entries dropped by the pre-pass's `_categories_partials_` rule
-    /// (mwoffliner's category pagination fragments).
+    /// HTML `_categories_partials_*` entries (mwoffliner's category
+    /// pagination fragments) dropped by the pre-pass under
+    /// --exclude-categories; with categories included they are converted
+    /// like articles (unindexed — see the walk).
     category_partials: AtomicU64,
 }
 
@@ -664,9 +667,11 @@ const DOC_QUEUE_CAP: usize = 2000;
 
 /// State under [`DocQueue`]'s mutex.
 struct QueueState {
-    /// Built (fulltext, title) document pairs with the article path (for
-    /// error messages), in worker-completion order.
-    docs: VecDeque<(Document, Document, String)>,
+    /// Built documents with the article path (for error messages), in
+    /// worker-completion order: the fulltext and title halves are each
+    /// `None` when that database must not index the article (category
+    /// pages are title-only; category partials reach no queue at all).
+    docs: VecDeque<(Option<Document>, Option<Document>, String)>,
     /// No more documents will arrive (the walk joined, or the indexer
     /// stopped on its first error).
     closed: bool,
@@ -702,9 +707,15 @@ impl DocQueue {
         self.state.lock().unwrap_or_else(|e| e.into_inner())
     }
 
-    /// Queue one article's documents. Blocks while the queue is full; fails
-    /// fast with the indexer's error once it has stopped.
-    fn push(&self, ft_doc: Document, ti_doc: Document, path: String) -> Result<(), String> {
+    /// Queue one article's documents; a `None` half is skipped by the
+    /// indexer (never indexed in that database). Blocks while the queue is
+    /// full; fails fast with the indexer's error once it has stopped.
+    fn push(
+        &self,
+        ft_doc: Option<Document>,
+        ti_doc: Option<Document>,
+        path: String,
+    ) -> Result<(), String> {
         let mut st = self.lock();
         loop {
             if let Some(e) = &st.error {
@@ -724,9 +735,9 @@ impl DocQueue {
         Ok(())
     }
 
-    /// Take the next document pair; `None` once the queue is closed and
+    /// Take the next document item; `None` once the queue is closed and
     /// drained (the indexer's exit condition).
-    fn pop(&self) -> Option<(Document, Document, String)> {
+    fn pop(&self) -> Option<(Option<Document>, Option<Document>, String)> {
         let mut st = self.lock();
         loop {
             if let Some(doc) = st.docs.pop_front() {
@@ -761,8 +772,9 @@ impl DocQueue {
 }
 
 /// The dedicated indexer thread's body: owns both WritableDatabases for the
-/// whole walk, drains the document queue (FIFO of worker completion),
-/// increments the document counters and paces commits every
+/// whole walk, drains the document queue (FIFO of worker completion; each
+/// item's `None` half is skipped — that database does not index the
+/// article), increments the document counters and paces commits every
 /// [`COMMIT_EVERY`] documents exactly like the old per-worker lock scopes,
 /// then performs the final commits of both databases and hands them back to
 /// the caller. The first add/commit error stops it (the queue closes with
@@ -776,26 +788,30 @@ fn run_indexer(
 ) -> (WritableDatabase, WritableDatabase, Result<(), String>) {
     let mut error: Option<String> = None;
     while let Some((ft_doc, ti_doc, path)) = queue.pop() {
-        if let Err(e) = ft.add_document(&ft_doc) {
-            error = Some(format!("indexing {path:?}: {e}"));
-            break;
-        }
-        let d = ft_docs.fetch_add(1, Ordering::Relaxed) + 1;
-        if d % COMMIT_EVERY == 0 {
-            if let Err(e) = ft.commit() {
-                error = Some(format!("fulltext index commit: {e}"));
+        if let Some(ft_doc) = ft_doc {
+            if let Err(e) = ft.add_document(&ft_doc) {
+                error = Some(format!("indexing {path:?}: {e}"));
                 break;
             }
+            let d = ft_docs.fetch_add(1, Ordering::Relaxed) + 1;
+            if d % COMMIT_EVERY == 0 {
+                if let Err(e) = ft.commit() {
+                    error = Some(format!("fulltext index commit: {e}"));
+                    break;
+                }
+            }
         }
-        if let Err(e) = ti.add_document(&ti_doc) {
-            error = Some(format!("title indexing {path:?}: {e}"));
-            break;
-        }
-        let d = ti_docs.fetch_add(1, Ordering::Relaxed) + 1;
-        if d % COMMIT_EVERY == 0 {
-            if let Err(e) = ti.commit() {
-                error = Some(format!("title index commit: {e}"));
+        if let Some(ti_doc) = ti_doc {
+            if let Err(e) = ti.add_document(&ti_doc) {
+                error = Some(format!("title indexing {path:?}: {e}"));
                 break;
+            }
+            let d = ti_docs.fetch_add(1, Ordering::Relaxed) + 1;
+            if d % COMMIT_EVERY == 0 {
+                if let Err(e) = ti.commit() {
+                    error = Some(format!("title index commit: {e}"));
+                    break;
+                }
             }
         }
     }
@@ -928,10 +944,14 @@ fn convert_article_html(
 /// from the output entirely — no blob, no dirent; redirects pointing at
 /// them dangle and are dropped — though they still count as processed walk
 /// items. The default keeps them: they convert to markdown with their
-/// Subcategories/Pages-in-category sections and articles gain the
-/// localized Categories section. Entries whose path starts with
-/// `_categories_partials_` (mwoffliner's category pagination fragments)
-/// are dropped in BOTH modes, before the walk ever sees them.
+/// Subcategories/Pages-in-category sections, articles gain the localized
+/// Categories section, and each page keeps a title-index document (target
+/// = its own path) but is NEVER fulltext-indexed. Entries whose path
+/// starts with `_categories_partials_` (mwoffliner's category pagination
+/// fragments) are converted like articles when categories are included
+/// (member-list markdown, no index document in either database) and are
+/// dropped before the walk under `exclude_categories` — no blob, no
+/// dirent.
 pub fn convert(
     zimfile: &Path,
     outfile: &Path,
@@ -1123,11 +1143,12 @@ pub fn convert(
                 // `_categories_partials_*` text/html fragments (a 200-member
                 // `div#mw-pages` list slice, empty <title>; e.g.
                 // `_categories_partials_Category:1838_deaths_pages_2`).
-                // Converted as articles they would only duplicate the parent
-                // category's member list as junk `# categories partials …`
-                // pages, so they are dropped unconditionally — in both modes
-                // — before any capture: no walk item, no blob, no dirent.
-                if entry.url.starts_with("_categories_partials_") {
+                // Under --exclude-categories they are dropped before any
+                // capture: no walk item, no blob, no dirent. When categories
+                // are included they are classified as normal articles and
+                // reach the walk, which converts them like articles but
+                // never indexes them.
+                if exclude_categories && entry.url.starts_with("_categories_partials_") {
                     shared.category_partials.fetch_add(1, Ordering::Relaxed);
                     continue;
                 }
@@ -1211,9 +1232,9 @@ pub fn convert(
         //
         // Indexing runs on ONE dedicated thread that owns both databases for
         // the whole walk: workers build each article's documents outside any
-        // lock and ship the pair over a bounded queue — blocking while full,
-        // so neither add_document nor the every-[`COMMIT_EVERY`] commits
-        // ever stall the workers.
+        // lock and ship (optional fulltext, optional title) pairs over a
+        // bounded queue — blocking while full, so neither add_document nor
+        // the every-[`COMMIT_EVERY`] commits ever stall the workers.
         let queue = Arc::new(DocQueue::new());
         let indexer = {
             let queue = Arc::clone(&queue);
@@ -1279,16 +1300,19 @@ pub fn convert(
                             continue;
                         }
                     };
-                    // A category page (the language-agnostic ns-14 body-class
-                    // marker) is omitted ENTIRELY under --exclude-categories:
-                    // no conversion, no blob add, no dirent — its record
-                    // stays zero, so it is not a member and redirects
-                    // pointing at it dangle and are dropped. The no-content
-                    // logic below can never see it, and the item already
-                    // counted as processed above. By default the page
-                    // converts like any other article (member lists and
-                    // all) and is indexed like one.
-                    if exclude_categories && is_category_page(&html) {
+                    // The category marker (the language-agnostic ns-14
+                    // body-class byte scan) runs on every item, right after
+                    // the HTML is available. Under --exclude-categories the
+                    // page is omitted ENTIRELY: no conversion, no blob add,
+                    // no dirent — its record stays zero, so it is not a
+                    // member and redirects pointing at it dangle and are
+                    // dropped. The no-content logic below can never see it,
+                    // and the item already counted as processed above. By
+                    // default the page converts like any other article
+                    // (member lists and all) but is indexed in the title
+                    // database only — see the doc build below.
+                    let is_cat_page = is_category_page(&html);
+                    if exclude_categories && is_cat_page {
                         continue;
                     }
                     let Some(md) = convert_article_html(
@@ -1302,6 +1326,30 @@ pub fn convert(
                         shared.failed.fetch_add(1, Ordering::Relaxed);
                         continue;
                     };
+                    // A category pagination fragment (converted like an
+                    // article when categories are included — the pre-pass
+                    // only drops them under --exclude-categories): its blob
+                    // and record are written like any article's, but it
+                    // never reaches the doc queue — no fulltext, no title
+                    // document, and never REC_NOCONTENT, so the
+                    // redirect-titles post-pass below never touches it.
+                    if item_path.starts_with("_categories_partials_") {
+                        {
+                            let mut zc = creator.lock().unwrap();
+                            let b = zc
+                                .add_blob(true, md.as_bytes())
+                                .map_err(|e| format!("item {item_path:?}: {e}"))?;
+                            let slot = &recs[c.idx as usize];
+                            slot.a.store(b.generation, Ordering::Relaxed);
+                            slot.b.store(b.blob, Ordering::Relaxed);
+                            slot.flags.store(
+                                REC_ARTICLE | if b.compress { REC_COMPRESS } else { 0 },
+                                Ordering::Relaxed,
+                            );
+                        }
+                        shared.md_bytes.fetch_add(md.len() as u64, Ordering::Relaxed);
+                        continue;
+                    }
                     // No-content page (title-only, or title plus exactly one
                     // bare wikilink line — mwoffliner's meta-refresh redirect
                     // stubs): indexed like a redirect — no fulltext doc, and
@@ -1311,29 +1359,38 @@ pub fn convert(
                     let no_content = body.is_empty()
                         || (body.starts_with("[[") && body.ends_with("]]") && !body.contains('\n'));
                     if !no_content {
-                        // Both documents build OUTSIDE any lock — the TermGenerator/Document
+                        // The documents build OUTSIDE any lock — the TermGenerator/Document
                         // FFI never touches the WDB pointer (exactly libzim's own
                         // worker design, which indexes into Document objects on
                         // worker threads) — then cross to the indexer thread
                         // through the bounded queue, which blocks while full (its
                         // backpressure) and aborts with the indexer's error once
-                        // indexing has stopped.
-                        let folded_title = crate::search::fold_accents(&title);
-                        let folded_content = if index_intro_only {
-                            crate::search::fold_accents(&intro_for_index(&md))
+                        // indexing has stopped. Category pages (ns-14, from the
+                        // unconditional check above) keep their title document
+                        // (target = their own path, like a regular article) but
+                        // are never fulltext-indexed: the Some/None split below.
+                        let ft_doc = if is_cat_page {
+                            None
                         } else {
-                            crate::search::fold_accents(&md)
+                            let folded_title = crate::search::fold_accents(&title);
+                            let folded_content = if index_intro_only {
+                                crate::search::fold_accents(&intro_for_index(&md))
+                            } else {
+                                crate::search::fold_accents(&md)
+                            };
+                            Some(
+                                build_fulltext_document(
+                                    &lang,
+                                    &item_path,
+                                    &folded_title,
+                                    &folded_content,
+                                )
+                                .map_err(|e| format!("indexing {item_path:?}: {e}"))?,
+                            )
                         };
-                        let ft_doc = build_fulltext_document(
-                            &lang,
-                            &item_path,
-                            &folded_title,
-                            &folded_content,
-                        )
-                        .map_err(|e| format!("indexing {item_path:?}: {e}"))?;
                         let ti_doc = build_title_document(&lang, &item_path, &title, None)
                             .map_err(|e| format!("title indexing {item_path:?}: {e}"))?;
-                        queue.push(ft_doc, ti_doc, item_path.to_string())?;
+                        queue.push(ft_doc, Some(ti_doc), item_path.to_string())?;
                     }
                     // Writer add in its own lock scope (no nesting): the
                     // record carries the blob's ref.
@@ -1867,7 +1924,8 @@ mod e2e {
 
     /// Converts the category fixture; `exclude_categories` selects the
     /// omission mode (--exclude-categories), the default converts the
-    /// category page like any article.
+    /// category page and the pagination fragment like articles (the page
+    /// title-indexed, the fragment unindexed).
     fn convert_category_fixture(exclude_categories: bool) -> Converted {
         let dir = tempfile::tempdir().unwrap();
         let src = dir.path().join("src.zim");
@@ -2334,38 +2392,60 @@ mod e2e {
     }
 
     #[test]
-    fn category_partials_are_always_skipped() {
+    fn category_partials_convert_unindexed_and_omit_with_exclude() {
         // mwoffliner's `_categories_partials_*` pagination fragments are
-        // dropped in BOTH modes, before the walk: no dirent, no blob, no
-        // index document — while the real pages around them are untouched.
-        for exclude in [false, true] {
-            let c = convert_category_fixture(exclude);
-            let z = &c.zim;
-            assert!(
-                z.resolve_path("C/_categories_partials_Category:Fruits_pages_2")
-                    .unwrap()
-                    .is_none(),
-                "exclude_categories={exclude}"
-            );
-            // The counter records exactly the markdown dirents written: the
-            // article plus (by default) the category page — never the
-            // fragment.
-            let counter = blob_of(z, b'M', "Counter").unwrap();
-            let expected = if exclude { "text/markdown=1" } else { "text/markdown=2" };
-            assert_eq!(
-                String::from_utf8_lossy(&counter),
-                expected,
-                "exclude_categories={exclude}"
-            );
-            let ft = z.open_fulltext_xapian().unwrap().unwrap();
-            let data: Vec<String> = (1..=ft.doc_count())
-                .map(|d| ft.get_document(d).unwrap().data_str().unwrap())
-                .collect();
-            assert!(
-                !data.iter().any(|d| d.contains("_categories_partials_")),
-                "exclude_categories={exclude}: {data:?}"
-            );
-        }
+        // converted like articles when categories are included — their
+        // member-list markdown is present, blob and dirent included — but
+        // they reach neither index database; under --exclude-categories
+        // they are omitted entirely, like the category pages.
+        let c = convert_category_fixture(false);
+        let z = &c.zim;
+        let idx = z
+            .resolve_path("C/_categories_partials_Category:Fruits_pages_2")
+            .unwrap()
+            .unwrap();
+        assert_eq!(z.mime_type(z.get_entry(idx).unwrap().mime), Some("text/markdown"));
+        let partial_md = md_of(z, "_categories_partials_Category:Fruits_pages_2");
+        assert!(partial_md.contains("[[Banana]]"), "{partial_md}");
+        // The counter records exactly the markdown dirents written: the
+        // article, the category page, and the fragment.
+        let counter = blob_of(z, b'M', "Counter").unwrap();
+        assert_eq!(String::from_utf8_lossy(&counter), "text/markdown=3");
+        // The fragment is in neither database: the fulltext index holds
+        // only the regular article (the category page is title-only), the
+        // title index the article plus the category page.
+        let ft = z.open_fulltext_xapian().unwrap().unwrap();
+        assert_eq!(ft.doc_count(), 1);
+        assert_eq!(ft.get_document(1).unwrap().data_str().unwrap(), "C/Apple");
+        let ti = z.open_title_xapian().unwrap().unwrap();
+        assert_eq!(ti.doc_count(), 2);
+        let ti_data: Vec<String> = (1..=ti.doc_count())
+            .map(|d| ti.get_document(d).unwrap().data_str().unwrap())
+            .collect();
+        assert!(
+            !ti_data.iter().any(|d| d.contains("_categories_partials_")),
+            "{ti_data:?}"
+        );
+
+        // --exclude-categories: the fragment AND the category page are both
+        // absent entirely (no dirent, no blob); only the regular article
+        // remains, indexed 1/1.
+        let c = convert_category_fixture(true);
+        let z = &c.zim;
+        assert!(
+            z.resolve_path("C/_categories_partials_Category:Fruits_pages_2")
+                .unwrap()
+                .is_none()
+        );
+        assert!(z.resolve_path("C/Category:Fruits").unwrap().is_none());
+        let counter = blob_of(z, b'M', "Counter").unwrap();
+        assert_eq!(String::from_utf8_lossy(&counter), "text/markdown=1");
+        let ft = z.open_fulltext_xapian().unwrap().unwrap();
+        assert_eq!(ft.doc_count(), 1);
+        assert_eq!(ft.get_document(1).unwrap().data_str().unwrap(), "C/Apple");
+        let ti = z.open_title_xapian().unwrap().unwrap();
+        assert_eq!(ti.doc_count(), 1);
+        assert_eq!(ti.get_document(1).unwrap().data_str().unwrap(), "C/Apple");
     }
 
     #[test]
@@ -2398,20 +2478,18 @@ mod e2e {
         let (_, target) = terminal(z, b'C', "All_fruits").unwrap();
         assert_eq!(target.url, "Category:Fruits");
 
-        // Both articles are indexed (the category page has content, so it
-        // joins the regular article in both databases).
+        // Only the regular article is fulltext-indexed; the category page
+        // keeps a title-index document (target = its own path) alongside it.
         let ft = z.open_fulltext_xapian().unwrap().unwrap();
-        assert_eq!(ft.doc_count(), 2);
-        let ft_data: Vec<String> = (1..=ft.doc_count())
-            .map(|d| ft.get_document(d).unwrap().data_str().unwrap())
-            .collect();
-        assert!(ft_data.contains(&"C/Apple".to_string()), "{ft_data:?}");
+        assert_eq!(ft.doc_count(), 1);
+        assert_eq!(ft.get_document(1).unwrap().data_str().unwrap(), "C/Apple");
         let ti = z.open_title_xapian().unwrap().unwrap();
         assert_eq!(ti.doc_count(), 2);
         let ti_data: Vec<String> = (1..=ti.doc_count())
             .map(|d| ti.get_document(d).unwrap().data_str().unwrap())
             .collect();
         assert!(ti_data.contains(&"C/Apple".to_string()), "{ti_data:?}");
+        assert!(ti_data.contains(&"C/Category:Fruits".to_string()), "{ti_data:?}");
     }
 
     #[test]
