@@ -22,10 +22,20 @@
 //!   (offset table + blob bytes) plus the incoming blob would reach 2 MiB.
 //!   Compressed clusters hold one zstd frame (level 19) of the offset table +
 //!   blob bytes; uncompressed clusters store those bytes verbatim.
+//! - Cluster compression runs on a small background pool: a compressed close
+//!   moves the closed cluster into a bounded job queue and returns at once;
+//!   pool workers compress each job exactly like the old inline close did.
+//!   Frames are written by the calling thread, in close (ordinal) order, at
+//!   the next uncompressed close, streamed blob or barrier drain — no bytes
+//!   are ever written between a compressed close and its gate write, so the
+//!   layout stays byte-identical to the inline path. Uncompressed closes and
+//!   streamed blobs write inline (memcpy/stream-bound, not zstd-bound).
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard};
+use std::thread::JoinHandle;
 
 use md5::Digest;
 
@@ -49,6 +59,25 @@ const LISTING_MIME: &str = "application/octet-stream+zimlisting";
 /// uncompressed cluster instead of accumulating in the open cluster's RAM
 /// buffer until finish (embedded Xapian databases are the only such blobs).
 const BIG_BLOB_THRESHOLD: u64 = 1024 * 1024;
+
+/// Cluster-compression pool: at most this many closed compressed clusters
+/// wait in the job queue before a close blocks, bounding the queue's RAM.
+const COMPRESSION_QUEUE_CAP: usize = 8;
+
+/// Pool size: the conversion walk saturates the cores on its own, so leave
+/// two for it and the calling thread, with sane floors and ceilings.
+fn compression_pool_size() -> usize {
+    std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1)
+        .saturating_sub(2)
+        .clamp(1, 6)
+}
+
+/// Cluster indexes are u32 in the archive format.
+fn too_many_clusters() -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidData, "too many clusters")
+}
 
 /// Info byte and offset table for a streamed single-blob uncompressed
 /// cluster of `len` bytes (0 start, `len` end, each widened by the table's
@@ -181,6 +210,208 @@ impl<W: Write> Write for CountingWriter<'_, W> {
 
     fn flush(&mut self) -> io::Result<()> {
         self.inner.flush()
+    }
+}
+
+/// Shared state of the cluster-compression pool. Only job handoff, frame
+/// readiness and error propagation are shared — all file writes happen on
+/// the calling thread. Invariants: ordinals are assigned and written in
+/// strictly increasing order by the single calling thread; an ordinal that
+/// is assigned but not yet written is always a queued compressed cluster.
+struct PoolState {
+    /// Closed compressed clusters awaiting compression, bounded by
+    /// [`COMPRESSION_QUEUE_CAP`] (a close blocks while the queue is full).
+    jobs: VecDeque<(u32, OpenCluster)>,
+    /// Finished zstd frames by ordinal, not yet written to the file.
+    frames: HashMap<u32, Vec<u8>>,
+    /// Serialized size per ordinal: `None` until known (worker-filled for
+    /// compressed clusters; immediate for uncompressed ones and streamed
+    /// blobs, recorded when their bytes hit the file).
+    sizes: Vec<Option<u64>>,
+    /// File offset per ordinal, recorded when its bytes hit the file —
+    /// writes run in ordinal order at the append cursor, so these are the
+    /// prefix sums the cluster pointer table is built from.
+    offsets: Vec<u64>,
+    /// Every ordinal below this frontier is fully written to the file.
+    written: u64,
+    /// No more jobs will be enqueued (the [`ZimCreator`] is dropping).
+    shutdown: bool,
+    /// First worker failure (zstd/IO); surfaced to every wait as io::Error.
+    error: Option<io::Error>,
+}
+
+/// The cluster-compression pool: a bounded job queue plus N workers, each
+/// compressing one closed cluster per job exactly like the old inline close
+/// (`OpenCluster::write_to`, one zstd-19 frame over table + data). File
+/// writes stay on the calling thread — see [`ClusterGate::write_pending`].
+struct ClusterGate {
+    state: Arc<(Mutex<PoolState>, Condvar)>,
+    workers: Vec<JoinHandle<()>>,
+}
+
+impl ClusterGate {
+    fn new() -> Self {
+        let state = Arc::new((
+            Mutex::new(PoolState {
+                jobs: VecDeque::new(),
+                frames: HashMap::new(),
+                sizes: Vec::new(),
+                offsets: Vec::new(),
+                written: 0,
+                shutdown: false,
+                error: None,
+            }),
+            Condvar::new(),
+        ));
+        let workers = (0..compression_pool_size())
+            .map(|_| {
+                let state = Arc::clone(&state);
+                std::thread::spawn(move || compression_worker(state))
+            })
+            .collect();
+        ClusterGate { state, workers }
+    }
+
+    /// Lock, recovering from a poisoned mutex: a worker panic must not turn
+    /// the io::Error paths into panics on the waiting thread.
+    fn lock(&self) -> MutexGuard<'_, PoolState> {
+        self.state.0.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Register the next ordinal's pending size and offset slots.
+    fn add_slot(&self) {
+        let mut st = self.lock();
+        st.sizes.push(None);
+        st.offsets.push(0);
+    }
+
+    /// Queue a closed compressed cluster. Blocks while the queue is full
+    /// (backpressure); fails fast once a worker has errored.
+    fn enqueue(&self, ordinal: u32, cluster: OpenCluster) -> io::Result<()> {
+        let mut st = self.lock();
+        loop {
+            if let Some(e) = &st.error {
+                return Err(io::Error::new(e.kind(), e.to_string()));
+            }
+            if st.jobs.len() < COMPRESSION_QUEUE_CAP {
+                break;
+            }
+            st = self.state.1.wait(st).unwrap_or_else(|e| e.into_inner());
+        }
+        st.jobs.push_back((ordinal, cluster));
+        drop(st);
+        self.state.1.notify_all();
+        Ok(())
+    }
+
+    /// The calling thread wrote ordinal `ordinal` inline (an uncompressed
+    /// close or streamed blob): record offset + size, advance the frontier.
+    fn mark_written(&self, ordinal: u32, offset: u64, size: u64) {
+        let mut st = self.lock();
+        st.offsets[ordinal as usize] = offset;
+        st.sizes[ordinal as usize] = Some(size);
+        st.written = ordinal as u64 + 1;
+        drop(st);
+        self.state.1.notify_all();
+    }
+
+    /// Gate rule: every ordinal below `upto` reaches the file before the
+    /// caller writes anything else. Unwritten ordinals are exactly the queued
+    /// compressed ones (uncompressed closes and streamed blobs write inline
+    /// before returning), so each step takes the finished frame from the
+    /// pool — waiting on the condvar while it compresses — and writes it at
+    /// the append cursor, in ordinal order.
+    fn write_pending(&self, ws: &mut WriteState, upto: u32) -> io::Result<()> {
+        loop {
+            let (ordinal, size, frame) = {
+                let mut st = self.lock();
+                loop {
+                    if let Some(e) = &st.error {
+                        return Err(io::Error::new(e.kind(), e.to_string()));
+                    }
+                    if st.written >= upto as u64 {
+                        return Ok(());
+                    }
+                    if st.sizes[st.written as usize].is_some() {
+                        break;
+                    }
+                    st = self.state.1.wait(st).unwrap_or_else(|e| e.into_inner());
+                }
+                let ordinal = st.written as u32;
+                let size = st.sizes[ordinal as usize].unwrap_or(0);
+                (ordinal, size, st.frames.remove(&ordinal))
+            };
+            let frame = frame
+                .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "cluster frame lost"))?;
+            let offset = ws.pos;
+            ws.out.write_all(&frame)?;
+            ws.pos += size;
+            let mut st = self.lock();
+            st.offsets[ordinal as usize] = offset;
+            st.written = ordinal as u64 + 1;
+            drop(st);
+            // No notify: only this thread waits on sizes/written.
+        }
+    }
+
+    /// The barrier's table rebuild: the recorded per-ordinal offsets.
+    fn take_offsets(&self) -> Vec<u64> {
+        self.lock().offsets.clone()
+    }
+
+    /// Close the job queue: workers drop queued jobs (their frames would
+    /// never be written) and exit; join the handles so a creator dropped
+    /// mid-conversion cannot hang.
+    fn shutdown(&mut self) {
+        self.lock().shutdown = true;
+        self.state.1.notify_all();
+        for worker in self.workers.drain(..) {
+            let _ = worker.join();
+        }
+    }
+}
+
+/// Pool worker: take one closed cluster per job, compress it exactly like
+/// the old inline close did (one zstd-19 frame over offset table + blob
+/// bytes) and store the frame under the job's ordinal. Errors land in the
+/// shared state; every wait surfaces them as io::Error.
+fn compression_worker(state: Arc<(Mutex<PoolState>, Condvar)>) {
+    loop {
+        let (ordinal, cluster) = {
+            let mut st = state.0.lock().unwrap_or_else(|e| e.into_inner());
+            loop {
+                if let Some(job) = st.jobs.pop_front() {
+                    break job;
+                }
+                if st.shutdown {
+                    return;
+                }
+                st = state.1.wait(st).unwrap_or_else(|e| e.into_inner());
+            }
+        };
+        state.1.notify_all(); // a queue slot freed (backpressure waiters)
+        // A creator dropped mid-conversion stops compressing: nobody will
+        // read its frames.
+        if state.0.lock().unwrap_or_else(|e| e.into_inner()).shutdown {
+            continue;
+        }
+        let mut frame = Vec::new();
+        let compressed = cluster.write_to(&mut frame);
+        let mut st = state.0.lock().unwrap_or_else(|e| e.into_inner());
+        match compressed {
+            Ok(size) => {
+                st.sizes[ordinal as usize] = Some(size);
+                st.frames.insert(ordinal, frame);
+            }
+            Err(e) => {
+                st.sizes[ordinal as usize] = Some(0);
+                if st.error.is_none() {
+                    st.error = Some(e);
+                }
+            }
+        }
+        drop(st);
+        state.1.notify_all();
     }
 }
 
@@ -332,11 +563,11 @@ pub struct ZimCreator {
     comp_cluster: OpenCluster,
     uncomp_cluster: OpenCluster,
     /// Number of clusters closed per compression kind (the "generation" of the
-    /// currently open clusters). Closed clusters stream straight to the
-    /// output file, so only their offsets survive.
+    /// currently open clusters). Closed clusters stream to the output file
+    /// (compressed ones via the pool), so only their offsets survive.
     comp_generation: u32,
     uncomp_generation: u32,
-    /// Generation -> archive cluster index, per slot.
+    /// Generation -> archive cluster index, per slot (the close's ordinal).
     comp_gen_idx: Vec<u32>,
     uncomp_gen_idx: Vec<u32>,
     /// Mime string -> count for `M/Counter` (sorted like libzim's std::map).
@@ -344,6 +575,21 @@ pub struct ZimCreator {
     /// Streaming file state, opened lazily on the first cluster close (or at
     /// `begin_write`) and gone once the file is complete.
     w: Option<WriteState>,
+    /// Monotonic cluster ordinal counter: every cluster close and streamed
+    /// big blob takes the next value, which IS its archive cluster index
+    /// (closes happen in output order).
+    next_ordinal: u64,
+    /// Cluster-compression pool: compressed closes offload their zstd-19
+    /// work here (see [`ClusterGate`]).
+    gate: ClusterGate,
+}
+
+impl Drop for ZimCreator {
+    fn drop(&mut self) {
+        // A creator dropped with jobs in flight (error paths) must not hang:
+        // close the queue so the workers drain-exit, then join them.
+        self.gate.shutdown();
+    }
 }
 
 /// 16 random bytes from `/dev/urandom` (falling back to a time/pid hash if
@@ -408,7 +654,33 @@ impl ZimCreator {
             uncomp_gen_idx: Vec::new(),
             mime_counter: BTreeMap::new(),
             w: None,
+            next_ordinal: 0,
+            gate: ClusterGate::new(),
         })
+    }
+
+    /// Take the next cluster ordinal: the monotonic close-order counter,
+    /// which is the cluster's archive index.
+    fn take_ordinal(&mut self) -> io::Result<u32> {
+        let ordinal = u32::try_from(self.next_ordinal).map_err(|_| too_many_clusters())?;
+        self.next_ordinal += 1;
+        self.gate.add_slot();
+        Ok(ordinal)
+    }
+
+    /// Barrier: wait until every ordinal enqueued so far is sized and on disk
+    /// (draining the pool's pending frames in order), then rebuild
+    /// `ws.cluster_offsets` from the gate's per-ordinal offsets. `ws.pos` is
+    /// already the append cursor — the gate's writes advance it as they go.
+    /// Runs at the begin_write barrier (before any dirent emission), between
+    /// `finish_write`'s blob adds and its tail dirents, after `finish_write`'s
+    /// final cluster closes, and at the head of `write_stream`.
+    fn gate_sync(&mut self) -> io::Result<()> {
+        let upto = u32::try_from(self.next_ordinal).map_err(|_| too_many_clusters())?;
+        self.gate.write_pending(self.w.as_mut().unwrap(), upto)?;
+        let offsets = self.gate.take_offsets();
+        self.w.as_mut().unwrap().cluster_offsets = offsets;
+        Ok(())
     }
 
     #[allow(dead_code)] // the record API lives on for tests and small archives
@@ -509,35 +781,43 @@ impl ZimCreator {
         if len >= BIG_BLOB_THRESHOLD {
             self.close_cluster(Slot::Uncompressed)?;
             self.ensure_open()?;
-            // One blob: the offset table holds the 0 start and the end.
-            let (info, table) = streamed_cluster_header(len);
-            let ws = self.w.as_mut().unwrap();
-            let offset = ws.pos;
-            let archive_idx = ws.cluster_offsets.len() as u32;
-            ws.out.write_all(&[info])?;
-            ws.out.write_all(&table)?;
-            let mut copied = 0u64;
-            let mut buf = vec![0u8; 1024 * 1024];
-            while copied < len {
-                let want = (len - copied).min(buf.len() as u64) as usize;
-                let n = reader.read(&mut buf[..want])?;
-                if n == 0 {
-                    break;
-                }
-                copied += n as u64;
-                ws.out.write_all(&buf[..n])?;
-            }
-            if copied != len {
-                return Err(io::Error::new(
-                    io::ErrorKind::UnexpectedEof,
-                    format!("xapian index shorter than expected ({copied} of {len} bytes)"),
-                ));
-            }
-            ws.pos += 1 + table.len() as u64 + len;
-            ws.cluster_offsets.push(offset);
+            let ordinal = self.take_ordinal()?;
             let generation = self.uncomp_generation;
-            self.uncomp_gen_idx.push(archive_idx);
+            self.uncomp_gen_idx.push(ordinal);
             self.uncomp_generation += 1;
+            // Inline write (stream-bound, not compression-bound): every lower
+            // ordinal first — the gate rule — then the header and blob bytes
+            // at the append cursor. Offset/size land in the gate here.
+            let (offset, size) = {
+                let ws = self.w.as_mut().unwrap();
+                self.gate.write_pending(ws, ordinal)?;
+                // One blob: the offset table holds the 0 start and the end.
+                let (info, table) = streamed_cluster_header(len);
+                let offset = ws.pos;
+                ws.out.write_all(&[info])?;
+                ws.out.write_all(&table)?;
+                let mut copied = 0u64;
+                let mut buf = vec![0u8; 1024 * 1024];
+                while copied < len {
+                    let want = (len - copied).min(buf.len() as u64) as usize;
+                    let n = reader.read(&mut buf[..want])?;
+                    if n == 0 {
+                        break;
+                    }
+                    copied += n as u64;
+                    ws.out.write_all(&buf[..n])?;
+                }
+                if copied != len {
+                    return Err(io::Error::new(
+                        io::ErrorKind::UnexpectedEof,
+                        format!("xapian index shorter than expected ({copied} of {len} bytes)"),
+                    ));
+                }
+                let size = 1 + table.len() as u64 + len;
+                ws.pos += size;
+                (offset, size)
+            };
+            self.gate.mark_written(ordinal, offset, size);
             return Ok((false, generation, 0));
         }
         if self.uncomp_cluster.count() > 0
@@ -569,21 +849,25 @@ impl ZimCreator {
     }
 
     /// The final archive cluster index of a blob. Closed generations map
-    /// through the generation tables; the two open clusters close at the end
-    /// of the file write (compressed first, a no-op when empty), so an open
-    /// generation's index is the next free position.
-    fn resolve_blob(&self, blob: BlobRef, closed: usize) -> io::Result<u32> {
+    /// through the generation tables (which hold the closes' ordinals); the
+    /// two open clusters close at the end of the file write (compressed
+    /// first, a no-op when empty), so an open generation's index is the next
+    /// ordinal to be assigned.
+    fn resolve_blob(&self, blob: BlobRef) -> io::Result<u32> {
         match blob.compress {
             true if (blob.generation as usize) < self.comp_gen_idx.len() => {
                 Ok(self.comp_gen_idx[blob.generation as usize])
             }
-            true if blob.generation == self.comp_generation => Ok(closed as u32),
+            true if blob.generation == self.comp_generation => {
+                u32::try_from(self.next_ordinal).map_err(|_| too_many_clusters())
+            }
             false if (blob.generation as usize) < self.uncomp_gen_idx.len() => {
                 Ok(self.uncomp_gen_idx[blob.generation as usize])
             }
-            false if blob.generation == self.uncomp_generation => {
-                Ok(closed as u32 + u32::from(self.comp_cluster.count() > 0))
-            }
+            false if blob.generation == self.uncomp_generation => u32::try_from(
+                self.next_ordinal + u64::from(self.comp_cluster.count() > 0),
+            )
+            .map_err(|_| too_many_clusters()),
             _ => Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "blob references an unknown cluster generation",
@@ -622,9 +906,15 @@ impl ZimCreator {
     }
 
     /// Close a cluster (it must hold at least one blob) and open a fresh
-    /// one: its bytes stream straight to the output file (clusters never
-    /// accumulate in RAM), which keeps the byte layout identical to writing
-    /// them all at finish — same close order, same offsets.
+    /// one. The close only files the cluster's ORDINAL (its archive index:
+    /// closes happen in output order). A compressed close moves the closed
+    /// cluster into the bounded pool queue and returns at once — its frame
+    /// is written by a later close or a barrier's drain, and since nothing
+    /// else writes between the close and that gate write, the frame lands
+    /// exactly where the old inline close put it. An uncompressed close
+    /// writes inline (memcpy-bound, not compression-bound): every lower
+    /// ordinal first — the gate rule — then its own bytes at the append
+    /// cursor. Same close order, same offsets, byte-identical layout.
     fn close_cluster(&mut self, slot: Slot) -> io::Result<()> {
         let count = match slot {
             Slot::Compressed => self.comp_cluster.count(),
@@ -633,30 +923,38 @@ impl ZimCreator {
         if count == 0 {
             return Ok(());
         }
-        let archive_idx = self
-            .w
-            .as_ref()
-            .map(|w| w.cluster_offsets.len())
-            .unwrap_or(0) as u32;
+        let ordinal = self.take_ordinal()?;
         let cluster = match slot {
             Slot::Compressed => {
-                self.comp_gen_idx.push(archive_idx);
+                self.comp_gen_idx.push(ordinal);
                 self.comp_generation += 1;
                 std::mem::replace(&mut self.comp_cluster, OpenCluster::new(true))
             }
             Slot::Uncompressed => {
-                self.uncomp_gen_idx.push(archive_idx);
+                self.uncomp_gen_idx.push(ordinal);
                 self.uncomp_generation += 1;
                 std::mem::replace(&mut self.uncomp_cluster, OpenCluster::new(false))
             }
         };
         self.ensure_open()?;
-        let ws = self.w.as_mut().unwrap();
-        let offset = ws.pos;
-        let size = cluster.write_to(&mut ws.out)?;
-        ws.cluster_offsets.push(offset);
-        ws.pos += size;
-        Ok(())
+        match slot {
+            Slot::Compressed => self.gate.enqueue(ordinal, cluster),
+            Slot::Uncompressed => {
+                {
+                    let ws = self.w.as_mut().unwrap();
+                    self.gate.write_pending(ws, ordinal)?;
+                }
+                let (offset, size) = {
+                    let ws = self.w.as_mut().unwrap();
+                    let offset = ws.pos;
+                    let size = cluster.write_to(&mut ws.out)?;
+                    ws.pos += size;
+                    (offset, size)
+                };
+                self.gate.mark_written(ordinal, offset, size);
+                Ok(())
+            }
+        }
     }
 
     /// Sort the MIME list (libzim's resolveMimeTypes). Dirents registered
@@ -805,6 +1103,10 @@ impl ZimCreator {
         self.get_mime_idx(LISTING_MIME)?;
         self.freeze_mimes();
         self.ensure_open()?;
+        // Barrier: the walk's queued compressed clusters must be sized and
+        // on disk before the first dirent byte (the old inline closes wrote
+        // them here).
+        self.gate_sync()?;
         let tails: Vec<((u8, String), Dirent)> =
             std::mem::take(&mut self.dirents).into_iter().collect();
         let ws = self.w.as_mut().unwrap();
@@ -838,10 +1140,9 @@ impl ZimCreator {
         self.ensure_open()?;
         match d {
             DirentOut::Item { ns, path, title, mime, blob } => {
-                let closed = self.w.as_ref().map(|w| w.cluster_offsets.len()).unwrap_or(0);
                 let kind = DirentBytes::Item {
                     mime_idx: self.mime_idx_of(&mime)?,
-                    cluster: self.resolve_blob(blob, closed)?,
+                    cluster: self.resolve_blob(blob)?,
                     blob: blob.blob,
                 };
                 let ws = self.w.as_mut().unwrap();
@@ -888,10 +1189,9 @@ impl ZimCreator {
                     .ok_or_else(|| {
                         io::Error::new(io::ErrorKind::InvalidData, "tail dirent mime out of range")
                     })?;
-                let closed = self.w.as_ref().map(|w| w.cluster_offsets.len()).unwrap_or(0);
                 DirentBytes::Item {
                     mime_idx: self.mime_idx_of(&mime)?,
-                    cluster: self.resolve_blob(*blob, closed)?,
+                    cluster: self.resolve_blob(*blob)?,
                     blob: blob.blob,
                 }
             }
@@ -963,6 +1263,10 @@ impl ZimCreator {
                 removed: false,
             }));
 
+        // Barrier: the counter blob's add may have closed the open compressed
+        // cluster (now a pool job) — its frame must reach the file before the
+        // tail dirents, where the old inline close wrote it.
+        self.gate_sync()?;
         {
             let ws = self.w.as_mut().unwrap();
             ws.tails.push(counter);
@@ -973,6 +1277,13 @@ impl ZimCreator {
             ws.tails.sort_by(|a, b| a.0.cmp(&b.0));
         }
         self.flush_all_tails()?;
+        // Close the two open clusters (compressed first, like libzim): the
+        // uncompressed close's gate wait flushes the pending compressed
+        // frame. The barrier below leaves every enqueued ordinal sized and
+        // on disk, with the offset table rebuilt, for the pointer tables.
+        self.close_cluster(Slot::Compressed)?;
+        self.close_cluster(Slot::Uncompressed)?;
+        self.gate_sync()?;
         self.finish_tail()
     }
 
@@ -997,9 +1308,10 @@ impl ZimCreator {
     }
 
     /// Complete the streamed file: patch the MIME list into the header gap,
-    /// close the two open clusters (compressed first, like libzim), then
-    /// write the path pointer table, cluster pointer table, header and MD5
-    /// checksum.
+    /// then write the path pointer table, cluster pointer table, header and
+    /// MD5 checksum. The two open clusters were closed by the caller (the
+    /// record path's `finish`, `finish_write`'s tail) — every enqueued
+    /// ordinal is sized and on disk by then, so no gate sync is needed.
     fn finish_tail(&mut self) -> io::Result<()> {
         // MIME list at offset 80 (the area was written as zeros).
         let mut mime_blob = Vec::new();
@@ -1021,8 +1333,6 @@ impl ZimCreator {
             ws.out.write_all(&vec![0u8; pad as usize])?;
             ws.out.seek(SeekFrom::Start(ws.pos))?;
         }
-        self.close_cluster(Slot::Compressed)?;
-        self.close_cluster(Slot::Uncompressed)?;
         let ws = self.w.as_mut().unwrap();
         let dirent_start = ws.dirent_start.unwrap_or(ws.pos);
         // The pointer tables go at the current append position (right after
@@ -1299,7 +1609,8 @@ impl ZimCreator {
         }
 
         // 8. Close the open clusters (compressed first, then the uncompressed
-        // one — libzim's order; they stream to the file), then stream every
+        // one — libzim's order; the compressed close queues a pool job, the
+        // uncompressed close's gate wait writes both), then stream every
         // dirent out in sorted order and complete the file.
         self.close_cluster(Slot::Compressed)?;
         self.close_cluster(Slot::Uncompressed)?;
@@ -1354,6 +1665,10 @@ impl ZimCreator {
     /// and — piecewise — the streaming path.
     fn write_stream(&mut self, dirents: impl Iterator<Item = DirentOut>) -> io::Result<()> {
         self.ensure_open()?;
+        // Barrier: `finish` closed the record path's clusters just above;
+        // drain their pool jobs and rebuild the offset table before the
+        // first dirent byte.
+        self.gate_sync()?;
         for d in dirents {
             self.emit_resolved(d)?;
         }
