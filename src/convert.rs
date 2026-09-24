@@ -819,7 +819,9 @@ fn convert_article_html(
     lang: &str,
 ) -> Result<Option<String>, String> {
     match std::str::from_utf8(html) {
-        Ok(html) => Ok(Some(crate::html2md::html_to_md(html, Some(title), Some(lang)))),
+        Ok(html) => {
+            Ok(Some(crate::html2md::html_to_md(html, Some(title), Some(lang), false)))
+        }
         Err(_) => {
             eprintln!("warning: failed to convert {path:?}: content is not valid UTF-8");
             Ok(None)
@@ -1763,7 +1765,8 @@ mod e2e {
             Target::Cluster(cluster, blob) => z.read_blob(cluster, blob).unwrap(),
             _ => panic!("article has no content"),
         };
-        let expected = crate::html2md::html_to_md(APPLE_HTML, Some("Apple"), Some("fra"));
+        let expected =
+            crate::html2md::html_to_md(APPLE_HTML, Some("Apple"), Some("fra"), false);
         assert_eq!(md, expected.into_bytes());
         assert!(String::from_utf8_lossy(&md).contains("rosaceae"));
 
@@ -1903,7 +1906,12 @@ mod e2e {
         // Value 0 is the FOLDED title, value 1 the wordcount of the folded
         // indexed content.
         assert_eq!(doc.value(0).unwrap(), b"revolution francaise");
-        let md = crate::html2md::html_to_md(REV_HTML, Some("Révolution française"), Some("fra"));
+        let md = crate::html2md::html_to_md(
+            REV_HTML,
+            Some("Révolution française"),
+            Some("fra"),
+            false,
+        );
         let wordcount = crate::search::fold_accents(&md).split_whitespace().count();
         assert_eq!(doc.value(1).unwrap(), wordcount.to_string().into_bytes());
 

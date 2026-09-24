@@ -84,7 +84,7 @@ fn markdown_title(article: &crate::zim::Article) -> String {
 /// every text/html entry converts.
 fn convert_html(arc: &Archive, article: &crate::zim::Article, html: &str) -> String {
     let lang = arc.language().unwrap_or_else(|| "eng".to_string());
-    html2md::html_to_md(html, Some(&markdown_title(article)), Some(&lang))
+    html2md::html_to_md(html, Some(&markdown_title(article)), Some(&lang), false)
 }
 
 #[derive(Serialize, JsonSchema)]

@@ -514,6 +514,18 @@ fn emph_wikilink(mark: &str, target: &str, core: &str) -> String {
     }
 }
 
+/// `[[target]]` when the label equals the target page title (query
+/// string included, since split_href keeps it), else `[[target|label]]`.
+fn labeled_wikilink(target: &str, path: &str, label: &str) -> String {
+    let bare = path.replace('_', " ");
+    let label_cmp = label.replace('_', " ");
+    if label_cmp == bare || label_cmp == target {
+        format!("[[{}]]", target)
+    } else {
+        format!("[[{}|{}]]", target, label)
+    }
+}
+
 /// (mark, core) when `label` is exactly one whole emphasis run.
 fn emph_is_whole(label: &str) -> Option<(&'static str, &str)> {
     for mark in ["**", "*"] {
@@ -781,14 +793,7 @@ fn anchor_md(
             return emph_wikilink(mark, &target, core);
         }
     }
-    // omit |label when the label equals the target page title (query
-    // string included, since split_href keeps it)
-    let bare = path.replace('_', " ");
-    let label_cmp = label_stripped.replace('_', " ");
-    if label_cmp == bare || label_cmp == target {
-        return format!("[[{}]]", target);
-    }
-    format!("[[{}|{}]]", target, label_stripped)
+    labeled_wikilink(&target, &path, label_stripped)
 }
 
 /// Render an <a> element: wikilink, external link, fragment-only label,
@@ -1260,13 +1265,77 @@ fn key_facts_of(dom: &Dom, lang: Option<&str>) -> String {
     crate::infobox_html::infoboxes_to_markdown(dom, &boxes, lang).trim().to_string()
 }
 
+/// First descendant element carrying the given id attribute.
+fn find_id<'a>(el: NodeRef<'a>, id: &str) -> Option<NodeRef<'a>> {
+    el.descendants()
+        .into_iter()
+        .find(|d| d.is_element() && d.attr("id") == Some(id))
+}
+
+/// True for a `[[Category:…]]` target (leading colons tolerated, like
+/// `in_dropped_ns`'s head match).
+fn is_category_target(target: &str) -> bool {
+    target
+        .trim_start_matches(':')
+        .split_once(':')
+        .is_some_and(|(head, _)| head.to_lowercase() == "category")
+}
+
+/// The page's normal categories as a '## Categories' section ('' when the
+/// page has none or carries no catlinks bar): one wikilink bullet per
+/// anchor of #mw-normal-catlinks (hidden categories stay excluded), in
+/// page order. The section is emitted only for at least one surviving
+/// category; anchors render_anchor drops (media hrefs, dropped-namespace
+/// targets) are skipped — except the category targets themselves, the
+/// section's subject. The heading comes from wikil10n::categories_title.
+fn categories_section(root: NodeRef, lang: Option<&str>) -> String {
+    let Some(bar) = find_id(root, "catlinks") else {
+        return String::new();
+    };
+    let Some(normal) = find_id(bar, "mw-normal-catlinks") else {
+        return String::new();
+    };
+    let mut bullets: Vec<String> = Vec::new();
+    for li in normal.find_all("li") {
+        for a in li.find_all("a") {
+            let href = a.attr("href").unwrap_or("");
+            if is_media_href(href) {
+                continue;
+            }
+            let (path, frag) = split_href(href);
+            let Some(target) = link_target_parts(&path, &frag).filter(|t| !t.is_empty()) else {
+                continue;
+            };
+            if in_dropped_ns(&target) && !is_category_target(&target) {
+                continue;
+            }
+            // Like render_anchor's label: verbatim text, flattened markup.
+            let label = render_children(
+                a,
+                InlineCtx { no_escape: true, in_link: true, ..Default::default() },
+            )
+            .trim()
+            .to_string();
+            if label.is_empty() {
+                continue; // no text to label the category with
+            }
+            bullets.push(format!("- {}", labeled_wikilink(&target, &path, &label)));
+        }
+    }
+    if bullets.is_empty() {
+        return String::new();
+    }
+    format!("## {}\n\n{}", crate::wikil10n::categories_title(lang), bullets.join("\n"))
+}
+
 /// Render the article body around the already-located container: Parsoid
 /// sections flattened, blocks rendered, sections assembled, title line
-/// prepended and the cleanup pass applied.
+/// prepended, the categories section appended and the cleanup pass applied.
 fn render_article(
     mut dom: Dom,
     body: crate::htmldom::NodeId,
     key_facts: String,
+    categories: String,
     title: Option<&str>,
     lang: Option<&str>,
 ) -> String {
@@ -1285,6 +1354,9 @@ fn render_article(
     if !content.trim().is_empty() {
         parts.push(content);
     }
+    if !categories.is_empty() {
+        parts.push(categories);
+    }
     cleanup::cleanup(&parts.join("\n\n"))
 }
 
@@ -1301,14 +1373,19 @@ fn render_article(
 /// rendering (the title line replaces it); a differing `<h1>` stays and
 /// renders as a `## ` heading. `lang` (a ZIM/BCP-47 code; 'fra'/'fre'/'fr'
 /// select French) localizes the '## Key facts' heading and the dropped
-/// boilerplate sections.
+/// boilerplate sections. `include_categories` opt-in appends a localized
+/// '## Categories' section listing the page's normal categories after the
+/// body content.
 pub fn html_to_md(
     html_str: &str,
     title: Option<&str>,
     lang: Option<&str>,
+    include_categories: bool,
 ) -> String {
     let mut dom = Dom::parse(html_str);
     let key_facts = key_facts_of(&dom, lang);
+    let categories =
+        if include_categories { categories_section(dom.root(), lang) } else { String::new() };
     // The wiki article container, else the page's <body>.
     let wiki_body = get_parser_output(dom.root()).map(|b| b.id());
     let body =
@@ -1331,7 +1408,7 @@ pub fn html_to_md(
             }
         }
     }
-    render_article(dom, body, key_facts, title.as_deref(), lang)
+    render_article(dom, body, key_facts, categories, title.as_deref(), lang)
 }
 
 #[cfg(test)]
@@ -1380,6 +1457,7 @@ mod tests {
             "<html><body><div id=\"mw-content-text\"><div class=\"mw-parser-output\"><p>in 1889.<!--note--> It was made from <a href=\"./Nitrocellulose\">nitrocellulose</a> known as nitrate.</p></div></div></body></html>",
             Some("Nitro"),
             None,
+            false,
         );
         assert!(md.contains("1889. It was made"), "{md}");
     }
@@ -1390,6 +1468,7 @@ mod tests {
             "<html><body><div id=\"mw-content-text\"><div class=\"mw-parser-output\"><p>Text <a href=\"Category%3AFoo\"Category:Foo\">label</a><a href=\"./File%3ABar\">img</a>.</p></div></div></body></html>",
             Some("T"),
             None,
+            false,
         );
         assert_eq!(md, "# T\n\nText.\n");
     }
@@ -1400,6 +1479,7 @@ mod tests {
             "<html><body><div id=\"mw-content-text\"><div class=\"mw-parser-output\"><p>a<br>b <i>c</i></p></div></div></body></html>",
             Some("T"),
             None,
+            false,
         );
         assert_eq!(md, "# T\n\na\n\nb *c*\n");
     }
@@ -1414,6 +1494,7 @@ mod tests {
              </body></html>",
             None,
             None,
+            false,
         );
         assert_eq!(md, "# Head\n\nPara **bold**.\n\nSee [link](https://x.example/a?b=1&c=2).\n");
     }
@@ -1424,6 +1505,7 @@ mod tests {
             "<html><body><h1>Intro</h1><p>Body text.</p></body></html>",
             Some("Doc"),
             None,
+            false,
         );
         assert_eq!(md, "# Doc\n\n## Intro\n\nBody text.\n");
     }
@@ -1437,6 +1519,7 @@ mod tests {
             ),
             Some("T"),
             None,
+            false,
         )
     }
 
@@ -1585,6 +1668,7 @@ mod tests {
             "<html><body><a href=\"./Equals_sign#Not_equal\">!=</a></body></html>",
             Some("!="),
             None,
+            false,
         );
         assert_eq!(md, "# !=\n\n[[Equals sign#Not equal|!=]]\n");
     }
@@ -1645,5 +1729,101 @@ mod tests {
         assert_eq!(md, "# T\n\n[[Page/Sub page]]\n");
         let md = wiki_doc("<a href=\"./Page/Sub_page\">Sub page</a>");
         assert_eq!(md, "# T\n\n[[Page/Sub page|Sub page]]\n");
+    }
+
+    // The opt-in '## Categories' section (html_to_md's include_categories).
+
+    /// The catlinks bar as real articles carry it: normal categories as
+    /// percent-encoded anchors inside #mw-normal-catlinks, hidden ones
+    /// beside it, the whole bar outside div.mw-parser-output.
+    const CAT_BAR: &str = concat!(
+        "<div id=\"catlinks\" class=\"catlinks\">",
+        "<div id=\"mw-normal-catlinks\" class=\"mw-normal-catlinks\">Categories: <ul>",
+        "<li><a href=\"Category%3A2003_albums\" title=\"Category:2003 albums\">2003 albums</a></li>",
+        "<li><a href=\"Category%3AEvan_Parker_albums\" title=\"Category:Evan Parker albums\">Evan Parker albums</a></li>",
+        "</ul></div>",
+        "<div id=\"mw-hidden-catlinks\" class=\"mw-hidden-catlinks\">Hidden categories: <ul>",
+        "<li>Use mdy dates from August 2026</li></ul></div></div>"
+    );
+
+    /// Wiki article shell whose content div is followed by `tail` (real
+    /// articles carry the catlinks bar there, outside the render root).
+    fn wiki_doc_with_tail(
+        inner: &str,
+        tail: &str,
+        lang: Option<&str>,
+        include_categories: bool,
+    ) -> String {
+        html_to_md(
+            &format!(
+                "<html><body><div id=\"mw-content-text\"><div class=\"mw-parser-output\">{}</div></div>{}</body></html>",
+                inner, tail
+            ),
+            Some("T"),
+            lang,
+            include_categories,
+        )
+    }
+
+    /// Flag on: the bar's normal categories become a '## Categories'
+    /// section of wikilink bullets after the body; the hidden categories
+    /// stay excluded.
+    #[test]
+    fn categories_section_appended_when_enabled() {
+        let md = wiki_doc_with_tail("<p>Body.</p>", CAT_BAR, None, true);
+        assert_eq!(
+            md,
+            "# T\n\nBody.\n\n## Categories\n\n\
+             - [[Category:2003 albums|2003 albums]]\n\
+             - [[Category:Evan Parker albums|Evan Parker albums]]\n"
+        );
+    }
+
+    /// Flag off: byte-identical to the pre-flag output — the bar stays
+    /// dropped entirely.
+    #[test]
+    fn categories_flag_off_is_byte_identical() {
+        let md = wiki_doc_with_tail("<p>Body.</p>", CAT_BAR, None, false);
+        assert_eq!(md, "# T\n\nBody.\n");
+    }
+
+    /// Hidden-only bar, or a present but empty normal list: no section —
+    /// the >=1-category gate and the #mw-normal-catlinks scope both hold.
+    #[test]
+    fn without_normal_categories_no_section() {
+        let hidden_only = concat!(
+            "<div id=\"catlinks\" class=\"catlinks\">",
+            "<div id=\"mw-hidden-catlinks\" class=\"mw-hidden-catlinks\">Hidden categories: <ul>",
+            "<li><a href=\"Category%3AUse_mdy_dates\" title=\"Category:Use mdy dates\">Use mdy dates</a></li>",
+            "</ul></div></div>"
+        );
+        let md = wiki_doc_with_tail("<p>Body.</p>", hidden_only, None, true);
+        assert_eq!(md, "# T\n\nBody.\n");
+        let empty_normal = concat!(
+            "<div id=\"catlinks\" class=\"catlinks\">",
+            "<div id=\"mw-normal-catlinks\" class=\"mw-normal-catlinks\">Categories: <ul></ul></div></div>"
+        );
+        let md = wiki_doc_with_tail("<p>Body.</p>", empty_normal, None, true);
+        assert_eq!(md, "# T\n\nBody.\n");
+    }
+
+    /// No catlinks bar at all (arbitrary non-wiki HTML): no section, flag
+    /// on or off.
+    #[test]
+    fn without_catlinks_bar_no_section() {
+        let md = wiki_doc_with_tail("<p>Body.</p>", "", None, true);
+        assert_eq!(md, "# T\n\nBody.\n");
+    }
+
+    /// The French archive language localizes the section heading.
+    #[test]
+    fn categories_heading_is_localized() {
+        let md = wiki_doc_with_tail("<p>Body.</p>", CAT_BAR, Some("fra"), true);
+        assert_eq!(
+            md,
+            "# T\n\nBody.\n\n## Catégories\n\n\
+             - [[Category:2003 albums|2003 albums]]\n\
+             - [[Category:Evan Parker albums|Evan Parker albums]]\n"
+        );
     }
 }
