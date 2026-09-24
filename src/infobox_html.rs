@@ -571,13 +571,10 @@ fn collect_rows(
         return String::new();
     }
     let mut above_text = String::new();
-    let mut skip_next: HashSet<usize> = HashSet::new();
+    let mut skip_next = false;
     for (i, tr) in rows.iter().enumerate() {
-        if skip_next.contains(&i) {
-            continue;
-        }
         let cells = row_cells(*tr);
-        if cells.is_empty() {
+        if std::mem::take(&mut skip_next) || cells.is_empty() {
             continue;
         }
         let c0 = cells[0];
@@ -626,7 +623,7 @@ fn collect_rows(
                     list_els: top_lists(value).iter().map(|l| l.id()).collect(),
                     ..Default::default()
                 }));
-                skip_next.insert(i + 1);
+                skip_next = true;
                 continue;
             }
             items.push(Item::Header(Header { level: header_level, text: header_text(c0) }));
