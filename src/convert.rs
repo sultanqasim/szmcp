@@ -581,45 +581,11 @@ struct Shared {
     category_partials: AtomicU64,
 }
 
-/// Run `worker` on `threads` scoped threads; each pulls fixed
-/// [`CHUNK_ENTRIES`] chunks from `next` until the range `end` is
-/// exhausted (the classification pre-pass's shape). A worker's first error
-/// stops it and surfaces to the caller.
-fn run_chunk_workers(
-    threads: usize,
-    next: &AtomicU64,
-    end: u32,
-    worker: impl Fn(u32, u32) -> Result<(), String> + Sync,
-) -> Result<(), String> {
-    let error: Mutex<Option<String>> = Mutex::new(None);
-    std::thread::scope(|s| {
-        for _ in 0..threads {
-            s.spawn(|| loop {
-                let c = next.fetch_add(1, Ordering::Relaxed);
-                if c * CHUNK_ENTRIES >= end as u64 {
-                    return;
-                }
-                let start = (c * CHUNK_ENTRIES) as u32;
-                let stop = ((c + 1) * CHUNK_ENTRIES).min(end as u64) as u32;
-                if let Err(e) = worker(start, stop) {
-                    let mut g = error.lock().unwrap();
-                    if g.is_none() {
-                        *g = Some(e);
-                    }
-                    return;
-                }
-            });
-        }
-    });
-    match error.into_inner().unwrap() {
-        Some(e) => Err(e),
-        None => Ok(()),
-    }
-}
-
-/// [`run_chunk_workers`]'s task-based sibling for the conversion walk:
-/// each worker pulls ONE task from `next` until `tasks` is exhausted. A
-/// worker's first error stops it and surfaces to the caller.
+/// Run `worker` on `threads` scoped threads; each pulls ONE task from
+/// `next` until `tasks` is exhausted — cluster tasks in the conversion
+/// walk, fixed [`CHUNK_ENTRIES`] ranges (built up front as data) in the
+/// classification pre-pass. A worker's first error stops it and surfaces
+/// to the caller.
 fn run_task_workers<T: Sync>(
     threads: usize,
     next: &AtomicU64,
@@ -963,7 +929,27 @@ pub fn convert(
         });
         let t_classify = Instant::now();
         eprintln!("Classifying {end} entries (dirent headers only)...");
-        run_chunk_workers(threads, &shared.next, end, |start, stop| {
+        // Fixed [`CHUNK_ENTRIES`] chunk ranges over `0..end` — the exact
+        // list this pre-pass used to hand out by counter index: chunk `c`
+        // is `start = c * CHUNK_ENTRIES`, `stop = min((c + 1) *
+        // CHUNK_ENTRIES, end)`, computed in u64 so nothing overflows u32
+        // even at `u32::MAX`. Built once as data (~8 bytes per 512
+        // entries, noise next to the record slots) so the unified
+        // [`run_task_workers`] can hand out plain tasks.
+        let chunks: Vec<(u32, u32)> = {
+            let end = u64::from(end);
+            let mut chunks = Vec::new();
+            let mut c: u64 = 0;
+            while c * CHUNK_ENTRIES < end {
+                chunks.push((
+                    (c * CHUNK_ENTRIES) as u32,
+                    ((c + 1) * CHUNK_ENTRIES).min(end) as u32,
+                ));
+                c += 1;
+            }
+            chunks
+        };
+        run_task_workers(threads, &shared.next, &chunks, |&(start, stop)| {
             // Chunk-local arena and coordinates: the offsets in `found` are
             // relative to this buffer, rebased onto the shared arena under
             // the collector's lock below.
