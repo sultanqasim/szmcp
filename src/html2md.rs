@@ -105,34 +105,19 @@ pub(crate) fn is_dropped(el: NodeRef) -> bool {
     if DROP_TAGS.contains(&tag) {
         return true;
     }
-    // One pass over the attributes for the lookups below (each used to
-    // cost its own linear `attr()` scan); first occurrence wins, like
-    // `attr()`.
-    let (mut role, mut type_of, mut style, mut aria_hidden, mut id, mut class) =
-        (None, None, None, None, None, None);
-    if let NodeKind::Element { attrs, .. } = el.kind() {
-        for (name, value) in attrs {
-            let slot = match name.as_str() {
-                "role" => &mut role,
-                "typeof" => &mut type_of,
-                "style" => &mut style,
-                "aria-hidden" => &mut aria_hidden,
-                "class" => &mut class,
-                "id" => &mut id,
-                _ => continue,
-            };
-            if slot.is_none() {
-                *slot = Some(value.as_str());
-            }
-        }
-    }
+    let role = el.attr("role");
+    let type_of = el.attr("typeof");
+    let style = el.attr("style");
+    let aria_hidden = el.attr("aria-hidden");
+    let id = el.attr("id");
+    let class = el.attr("class");
     if role == Some("navigation") {
         return true;
     }
     if tag == "a" && is_wikidata_badge(el) {
         return true;
     }
-    if class.unwrap_or("").split_whitespace().any(|c| DROP_CLASSES.contains(&c)) {
+    if el.has_any_class(DROP_CLASSES) {
         return true;
     }
     if type_of.unwrap_or("").split_whitespace().any(|t| t == "mw:File") {
@@ -142,7 +127,7 @@ pub(crate) fn is_dropped(el: NodeRef) -> bool {
         // Only styled elements with a `display` in the style reach the
         // de-spaced copy the check needs.
         if sty.contains("display")
-            && (sty.replace(' ', "").contains("display:none") || sty.contains("display: none"))
+            && sty.replace(' ', "").contains("display:none")
         {
             // MediaWiki renders formulas twice: a visible image fallback plus a
             // hidden MathML twin; a display:none element carrying <math>
