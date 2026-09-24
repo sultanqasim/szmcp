@@ -1204,32 +1204,22 @@ pub fn convert(
                     // never reaches the doc queue — no fulltext, no title
                     // document, and never REC_NOCONTENT, so the
                     // redirect-titles post-pass below never touches it.
-                    if item_path.starts_with("_categories_partials_") {
-                        {
-                            let mut zc = creator.lock().unwrap();
-                            let b = zc
-                                .add_blob(true, md.as_bytes())
-                                .map_err(|e| format!("item {item_path:?}: {e}"))?;
-                            let slot = &recs[c.idx as usize];
-                            slot.a.store(b.generation, Ordering::Relaxed);
-                            slot.b.store(b.blob, Ordering::Relaxed);
-                            slot.flags.store(
-                                REC_ARTICLE | if b.compress { REC_COMPRESS } else { 0 },
-                                Ordering::Relaxed,
-                            );
-                        }
-                        shared.md_bytes.fetch_add(md.len() as u64, Ordering::Relaxed);
-                        continue;
-                    }
+                    let partial = item_path.starts_with("_categories_partials_");
                     // No-content page (title-only, or title plus exactly one
                     // bare wikilink line — mwoffliner's meta-refresh redirect
                     // stubs): indexed like a redirect — no fulltext doc, and
                     // a title doc only via the redirect-titles post-pass
-                    // below. The blob is still written.
-                    let body = md.split_once('\n').map(|x| x.1.trim()).unwrap_or("");
-                    let no_content = body.is_empty()
-                        || (body.starts_with("[[") && body.ends_with("]]") && !body.contains('\n'));
-                    if !no_content {
+                    // below. The blob is still written. `!partial` gates the
+                    // test: a fragment (above) is never no-content, so it can
+                    // neither carry REC_NOCONTENT nor reach the doc build.
+                    let no_content = !partial && {
+                        let body = md.split_once('\n').map(|x| x.1.trim()).unwrap_or("");
+                        body.is_empty()
+                            || (body.starts_with("[[")
+                                && body.ends_with("]]")
+                                && !body.contains('\n'))
+                    };
+                    if !no_content && !partial {
                         // The documents build OUTSIDE any lock — the TermGenerator/Document
                         // FFI never touches the WDB pointer (exactly libzim's own
                         // worker design, which indexes into Document objects on
