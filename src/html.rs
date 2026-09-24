@@ -460,11 +460,9 @@ fn collect_headings(html: &str) -> Vec<Heading> {
             None => break,
         };
         // A heading tag: <hN followed by whitespace, '>', or '/'.
-        let level = (lt + 2 < bytes.len()
-            && (bytes[lt + 1] == b'h' || bytes[lt + 1] == b'H')
-            && bytes.get(lt + 2).copied().map(|c| c - b'0')
-            .is_some_and(|d| (1..=6).contains(&d))
-            && matches!(bytes.get(lt + 3), Some(b' ') | Some(b'>') | Some(b'/')))
+        let level = (matches!(bytes.get(lt + 1), Some(b'h' | b'H'))
+            && matches!(bytes.get(lt + 2), Some(b'1'..=b'6'))
+            && matches!(bytes.get(lt + 3), Some(b' ' | b'>' | b'/')))
         .then(|| bytes[lt + 2] - b'0');
         let Some(level) = level else {
             i = lt + 1;
@@ -776,6 +774,17 @@ mod tests {
         assert_eq!(attr_value(" /", "role"), None);
         assert!(!is_hatnote_attrs(" /"));
         assert_eq!(intro_from_html("<p>a<br />b</p>"), "a b");
+    }
+
+    #[test]
+    fn malformed_h_prefixes_are_not_headings() {
+        // A non-digit byte after `<h` (in `c - b'0'`) once underflowed and
+        // panicked the heading scan in debug builds.
+        let headings =
+            collect_headings("<p><h/ junk <h x><h- <H8></p><h2>Title</h2><p>Body.</p>");
+        assert_eq!(headings.len(), 1);
+        assert_eq!(headings[0].level, 2);
+        assert_eq!(headings[0].name, "Title");
     }
 
     #[test]
