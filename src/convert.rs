@@ -682,70 +682,38 @@ fn run_indexer(
 /// on the archive's real category pages). Deliberately byte-level: the walk
 /// calls it on the raw blob, which need not be valid UTF-8.
 fn is_category_page(html: &[u8]) -> bool {
-    const BODY_TAG: &[u8] = b"<body";
     // The `<body` start tag: the first occurrence whose next byte delimits
-    // the tag name (later occurrences are rescanned, so `<bodyx`-shaped text
-    // cannot stop the search).
-    let mut from = 0;
-    let start = loop {
-        if from + BODY_TAG.len() > html.len() {
-            return false;
-        }
-        match html[from..]
-            .windows(BODY_TAG.len())
-            .position(|w| w == BODY_TAG)
-            .map(|p| from + p)
-        {
-            Some(at) => {
-                let after = at + BODY_TAG.len();
-                if html[after..]
-                    .first()
-                    .is_some_and(|&b| b == b'>' || b == b'/' || b.is_ascii_whitespace())
-                {
-                    break after;
-                }
-                from = after;
-            }
-            None => return false,
-        }
-    };
-    // The tag's attributes run to the closing `>`.
+    // the tag name — a single forward pass, so `<bodyx` cannot stop the
+    // search — then the tag's attributes, which run to the closing `>` or,
+    // if the tag is unterminated, to the end of input (no tag ⇒ no attrs).
+    let delim = |b: u8| b == b'>' || b == b'/' || b.is_ascii_whitespace();
+    let start = html
+        .windows(6) // `<body` plus the byte that must delimit the name
+        .position(|w| w.starts_with(b"<body") && delim(w[5]))
+        .map_or(html.len(), |p| p + 5);
     let attrs_end = html[start..]
         .iter()
         .position(|&b| b == b'>')
         .map_or(html.len(), |p| start + p);
     let attrs = &html[start..attrs_end];
-    // The class attribute's value (either quote style), if any: its
-    // whitespace-separated tokens must contain `ns-14`.
-    let needle: &[u8] = b"class=";
-    for quote in [b'"', b'\''] {
-        let mut from = 0;
-        while let Some(at) = attrs[from..]
-            .windows(needle.len())
-            .position(|w| w == needle)
-            .map(|p| from + p)
-        {
-            from = at + needle.len();
-            // A delimited attribute name only (rules out data-class=…).
-            if at > 0 && !attrs[at - 1].is_ascii_whitespace() {
-                continue;
-            }
-            if attrs.get(at + needle.len()) != Some(&quote) {
-                continue;
-            }
-            let rest = &attrs[at + needle.len() + 1..];
-            let Some(stop) = rest.iter().position(|&b| b == quote) else {
-                continue; // unterminated value
-            };
-            if rest[..stop]
-                .split(|&b| b.is_ascii_whitespace())
-                .any(|t| t == b"ns-14")
-            {
-                return true;
-            }
-        }
-    }
-    false
+    // A `class=` attribute whose quoted value (either quote style, closed
+    // by the matching quote) has `ns-14` among its whitespace-separated
+    // tokens; the name must be delimited (rules out data-class=…), and an
+    // unterminated value never matches.
+    // Candidate windows (7 bytes): `class=` at `at` plus the opening quote.
+    attrs.windows(7).enumerate().any(|(at, w)| {
+        w.starts_with(b"class=")
+            && (at == 0 || attrs[at - 1].is_ascii_whitespace())
+            && matches!(w[6], b'"' | b'\'')
+            && attrs[at + 7..]
+                .iter()
+                .position(|&b| b == w[6])
+                .is_some_and(|stop| {
+                    attrs[at + 7..at + 7 + stop]
+                        .split(|&b| b.is_ascii_whitespace())
+                        .any(|t| t == b"ns-14")
+                })
+    })
 }
 
 /// Convert one article's resolved HTML bytes to markdown. `Ok(None)` is a
