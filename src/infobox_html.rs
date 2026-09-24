@@ -161,9 +161,7 @@ fn needs_plain_copy(el: NodeRef) -> bool {
 
 /// Unwrap all <b>/<strong>/<i>/<em> emphasis in the standalone copy.
 fn unwrap_emphasis(dom: &mut Dom) {
-    let emph = element_ids(dom, |e| {
-        EMPH_TAGS.contains(&e.tag().unwrap_or("")) && dom.parent_of(e.id()).is_some()
-    });
+    let emph = element_ids(dom, |e| EMPH_TAGS.contains(&e.tag().unwrap_or("")));
     for id in emph {
         dom.drop_tag(id); // no-op when detached (removed with a toggle)
     }
@@ -216,12 +214,9 @@ fn top_lists<'a>(cell: NodeRef<'a>) -> Vec<NodeRef<'a>> {
 
 /// A full-data row containing a nested table or a map/media structure.
 fn is_map_row(cell: NodeRef) -> bool {
-    if cell.find("table").is_some() {
-        return true;
-    }
     cell.descendants()
         .into_iter()
-        .any(|el| el.is_element() && el.has_any_class(MAP_CLASSES))
+        .any(|el| el.tag() == Some("table") || el.has_any_class(MAP_CLASSES))
 }
 
 /// A nested table built from ordinary infobox rows (>= 2 rows whose cells
@@ -399,7 +394,7 @@ fn subbox_title(tbl: NodeRef, above_text: &str, fallback: &str) -> String {
     }
     for tok in tbl.class_tokens() {
         if let Some(rest) = tok.strip_prefix("ib-") {
-            if tok.len() > 3 {
+            if !rest.is_empty() {
                 let rest = rest.replace('_', "-");
                 return rest
                     .split('-')
@@ -616,7 +611,7 @@ fn collect_rows(
             if is_single_value(&nxt) && embedded_md.is_empty() {
                 // A header immediately followed by ONE non-empty value cell
                 // labels that value rather than grouping sub-rows.
-                let value = nxt.unwrap().remove(0);
+                let value = nxt.unwrap()[0];
                 items.push(Item::Row(Row {
                     label_cell: Some(c0.id()),
                     value_cells: vec![value.id()],
@@ -877,11 +872,16 @@ fn append_row(dom: &Dom, lines: &mut Vec<String>, row: &Row, indent: usize) {
     lines.push(format!("{}- **{}**: {}", pad, label, rendered));
 }
 
-/// Append a sub-heading with a blank line before and after.
-fn emit_heading(lines: &mut Vec<String>, text: String) {
+/// Push a blank line unless `lines` is empty or already ends blank.
+fn sep_blank_line(lines: &mut Vec<String>) {
     if !lines.is_empty() && lines.last().map(String::as_str) != Some("") {
         lines.push(String::new());
     }
+}
+
+/// Append a sub-heading with a blank line before and after.
+fn emit_heading(lines: &mut Vec<String>, text: String) {
+    sep_blank_line(lines);
     lines.push(text);
     lines.push(String::new());
 }
@@ -943,9 +943,7 @@ fn emit_items(dom: &Dom, lines: &mut Vec<String>, items: &[&Item]) {
             Item::RawTable(md) => {
                 // an embedded real table renders verbatim between blank
                 // lines (never indented: an indented table would be code)
-                if !lines.is_empty() && lines.last().map(String::as_str) != Some("") {
-                    lines.push(String::new());
-                }
+                sep_blank_line(lines);
                 lines.extend(md.split('\n').map(String::from));
                 lines.push(String::new());
                 context_open = false;
@@ -955,9 +953,7 @@ fn emit_items(dom: &Dom, lines: &mut Vec<String>, items: &[&Item]) {
                     // A new context stint starts a fresh bullet at group
                     // level; with facts already emitted a blank line
                     // separates the stints.
-                    if !lines.is_empty() && lines.last().map(String::as_str) != Some("") {
-                        lines.push(String::new());
-                    }
+                    sep_blank_line(lines);
                     let before = lines.len();
                     append_row(dom, lines, row, 0);
                     if lines.len() > before {
