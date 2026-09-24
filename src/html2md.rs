@@ -903,7 +903,7 @@ pub(crate) fn list_item_lines_ctx(
     let br_mode = if raw { BrMode::Keep } else { BrMode::Space };
     let mut out: Vec<String> = Vec::new();
     for li in list_el.children() {
-        if li.tag() != Some("li") {
+        if li.tag() != Some("li") || is_dropped(li) {
             continue;
         }
         let mut parts: Vec<String> = Vec::new();
@@ -913,7 +913,9 @@ pub(crate) fn list_item_lines_ctx(
                 NodeKind::Text(t) => {
                     parts.push(if raw { t.to_string() } else { escape_plain_asterisks(t) });
                 }
-                NodeKind::Element { .. } if matches!(ch.tag(), Some("ul") | Some("ol")) => {
+                NodeKind::Element { .. }
+                    if matches!(ch.tag(), Some("ul") | Some("ol")) && !is_dropped(ch) =>
+                {
                     subs.push(ch);
                 }
                 NodeKind::Element { .. } => {
@@ -1715,6 +1717,24 @@ mod tests {
     fn second_dd_after_sublist_only_dd_gets_its_own_line() {
         let md = wiki_doc("<dl><dt>T</dt><dd><ul><li>x</li></ul></dd><dd>D</dd></dl>");
         assert_eq!(md, "# T\n\n- **T**\n  - x\n- D\n");
+    }
+
+    /// A hidden <li> (display:none) is dropped like everywhere else: it
+    /// contributes no item line to the list.
+    #[test]
+    fn hidden_li_is_dropped_from_the_list() {
+        let md = wiki_doc("<ul><li style=\"display:none\">x</li><li>a</li></ul>");
+        assert_eq!(md, "# T\n\n- a\n");
+    }
+
+    /// A dropped nested list (display:none) inside a list item renders no
+    /// sub-items — only the item's own text survives.
+    #[test]
+    fn dropped_nested_list_in_a_li_is_dropped() {
+        let md = wiki_doc(
+            "<ul><li>a<ul style=\"display:none\"><li>h</li></ul></li></ul>",
+        );
+        assert_eq!(md, "# T\n\n- a\n");
     }
 
     /// A complex table (spans force the HTML-table path) keeps its
