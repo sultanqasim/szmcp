@@ -1243,7 +1243,18 @@ pub fn convert(
             let queue = Arc::clone(&queue);
             let ft_docs = Arc::clone(&shared.ft_docs);
             let ti_docs = Arc::clone(&shared.ti_docs);
-            std::thread::spawn(move || run_indexer(ft_wdb, ti_wdb, &queue, &ft_docs, &ti_docs))
+            std::thread::spawn(move || {
+                // A panicking indexer must unblock the queue's pushers, not hang them.
+                match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    run_indexer(ft_wdb, ti_wdb, &queue, &ft_docs, &ti_docs)
+                })) {
+                    Ok(result) => result,
+                    Err(panic) => {
+                        queue.fail("indexer thread panicked".to_string());
+                        std::panic::resume_unwind(panic);
+                    }
+                }
+            })
         };
         let walked = if !tasks.is_empty() {
             run_task_workers(threads, &shared.next, &tasks, |(cluster, items)| {
