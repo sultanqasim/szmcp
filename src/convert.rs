@@ -1511,11 +1511,10 @@ pub fn convert(
 
         // Compaction postlude: single-file databases (DBCOMPACT_SINGLE_FILE |
         // FULL); an index with no documents is not embedded at all.
-        let converted = shared.ft_docs.load(Ordering::Relaxed);
         let ti_docs = shared.ti_docs.load(Ordering::Relaxed);
         let mut ft_file = None;
         let mut ti_file = None;
-        if converted > 0 {
+        if shared.ft_docs.load(Ordering::Relaxed) > 0 {
             ft.compact_to_path(&ft_path)
                 .map_err(|e| format!("fulltext index compact: {e}"))?;
             ft_file = Some(&ft_path);
@@ -1563,6 +1562,7 @@ pub fn convert(
         // parsed; the title bytes go into a NUL-terminated bump arena (titles
         // derive from dirent titles and paths, which cannot contain NUL).
         let mut first_member_article = None;
+        let mut converted = 0u64;
         let mut rows: Vec<u64> = Vec::new();
         let mut arena: Vec<u8> = Vec::new();
         for idx in 0..end {
@@ -1600,6 +1600,7 @@ pub fn convert(
                 if first_member_article.is_none() {
                     first_member_article = Some(out_idx);
                 }
+                converted += 1;
             } else {
                 creator.lock().unwrap().emit_dirent(DirentOut::Redirect {
                     ns: b'C',
