@@ -21,10 +21,9 @@
 use crate::zim::{Target, Zim};
 use crate::zimcommon::MIME_REDIRECT;
 use crate::zimwrite::{BlobRef, DirentOut, ZimCreator};
-use std::collections::VecDeque;
 use std::path::Path;
 use std::sync::atomic::{AtomicU32, AtomicU64, AtomicU8, Ordering};
-use std::sync::{Arc, Condvar, Mutex, MutexGuard};
+use std::sync::{Arc, Mutex, mpsc::Receiver};
 use std::time::Instant;
 use xapian2::{
     Document, Stem, StemStrategy, TermGenerator, WritableDatabase,
@@ -656,159 +655,51 @@ fn run_task_workers<T: Sync>(
 /// walk stays ahead of the index adds.
 const DOC_QUEUE_CAP: usize = 2000;
 
-/// State under [`DocQueue`]'s mutex.
-struct QueueState {
-    /// Built documents with the article path (for error messages), in
-    /// worker-completion order: the fulltext and title halves are each
-    /// `None` when that database must not index the article (category
-    /// pages are title-only; category partials reach no queue at all).
-    docs: VecDeque<(Option<Document>, Option<Document>, String)>,
-    /// No more documents will arrive (the walk joined, or the indexer
-    /// stopped on its first error).
-    closed: bool,
-    /// The indexer's first add/commit error (the queue closes with it).
-    error: Option<String>,
-}
-
-/// The bounded channel between the walk workers and the dedicated indexer
-/// thread (same Mutex+Condvar shape as zimwrite's compression pool): workers
-/// block while full (backpressure), the indexer blocks while empty, `close`
-/// releases a drained queue, and the indexer's first error closes it so
-/// every waiting worker aborts instead of hanging.
-struct DocQueue {
-    state: Mutex<QueueState>,
-    wake: Condvar,
-}
-
-impl DocQueue {
-    fn new() -> Self {
-        DocQueue {
-            state: Mutex::new(QueueState {
-                docs: VecDeque::new(),
-                closed: false,
-                error: None,
-            }),
-            wake: Condvar::new(),
-        }
-    }
-
-    /// Lock, recovering from a poisoned mutex: a panic must not turn the
-    /// error path into a hang.
-    fn lock(&self) -> MutexGuard<'_, QueueState> {
-        self.state.lock().unwrap_or_else(|e| e.into_inner())
-    }
-
-    /// Queue one article's documents; a `None` half is skipped by the
-    /// indexer (never indexed in that database). Blocks while the queue is
-    /// full; fails fast with the indexer's error once it has stopped.
-    fn push(
-        &self,
-        ft_doc: Option<Document>,
-        ti_doc: Option<Document>,
-        path: String,
-    ) -> Result<(), String> {
-        let mut st = self.lock();
-        loop {
-            if let Some(e) = &st.error {
-                return Err(e.clone());
-            }
-            if st.closed {
-                return Err("indexer stopped unexpectedly".to_string());
-            }
-            if st.docs.len() < DOC_QUEUE_CAP {
-                break;
-            }
-            st = self.wake.wait(st).unwrap_or_else(|e| e.into_inner());
-        }
-        st.docs.push_back((ft_doc, ti_doc, path));
-        drop(st);
-        self.wake.notify_all();
-        Ok(())
-    }
-
-    /// Take the next document item; `None` once the queue is closed and
-    /// drained (the indexer's exit condition).
-    fn pop(&self) -> Option<(Option<Document>, Option<Document>, String)> {
-        let mut st = self.lock();
-        loop {
-            if let Some(doc) = st.docs.pop_front() {
-                drop(st);
-                self.wake.notify_all(); // a queue slot freed (backpressure waiters)
-                return Some(doc);
-            }
-            if st.closed {
-                return None;
-            }
-            st = self.wake.wait(st).unwrap_or_else(|e| e.into_inner());
-        }
-    }
-
-    /// No more documents will arrive (the walk's join is done). Idempotent.
-    fn close(&self) {
-        self.lock().closed = true;
-        self.wake.notify_all();
-    }
-
-    /// Record the indexer's first error and stop the queue: every waiting
-    /// worker wakes and aborts with it.
-    fn fail(&self, error: String) {
-        let mut st = self.lock();
-        if st.error.is_none() {
-            st.error = Some(error);
-        }
-        st.closed = true;
-        drop(st);
-        self.wake.notify_all();
-    }
-}
+/// One article's channel item: optional fulltext and title documents (each
+/// `None` when that database must not index the article — category pages
+/// are title-only; category partials reach no channel at all) plus the
+/// article path (for error messages).
+type QueuedDoc = (Option<Document>, Option<Document>, String);
 
 /// The dedicated indexer thread's body: owns both WritableDatabases for the
-/// whole walk, drains the document queue (FIFO of worker completion; each
+/// whole walk, drains the document channel (FIFO of worker completion; each
 /// item's `None` half is skipped — that database does not index the
 /// article), increments the document counters and paces commits every
 /// [`COMMIT_EVERY`] documents exactly like the old per-worker lock scopes,
 /// then performs the final commits of both databases and hands them back to
-/// the caller. The first add/commit error stops it (the queue closes with
-/// the error, so workers abort); on error the final commits are skipped.
+/// the caller. The first add/commit error stops it: returning drops `rx`,
+/// disconnecting the channel, so every worker's `send` fails instead of
+/// hanging; on error the final commits are skipped.
 fn run_indexer(
     mut ft: WritableDatabase,
     mut ti: WritableDatabase,
-    queue: &DocQueue,
+    rx: Receiver<QueuedDoc>,
     ft_docs: &AtomicU64,
     ti_docs: &AtomicU64,
 ) -> (WritableDatabase, WritableDatabase, Result<(), String>) {
-    let mut error: Option<String> = None;
-    while let Some((ft_doc, ti_doc, path)) = queue.pop() {
+    while let Ok((ft_doc, ti_doc, path)) = rx.recv() {
         if let Some(ft_doc) = ft_doc {
             if let Err(e) = ft.add_document(&ft_doc) {
-                error = Some(format!("indexing {path:?}: {e}"));
-                break;
+                return (ft, ti, Err(format!("indexing {path:?}: {e}")));
             }
             let d = ft_docs.fetch_add(1, Ordering::Relaxed) + 1;
             if d % COMMIT_EVERY == 0 {
                 if let Err(e) = ft.commit() {
-                    error = Some(format!("fulltext index commit: {e}"));
-                    break;
+                    return (ft, ti, Err(format!("fulltext index commit: {e}")));
                 }
             }
         }
         if let Some(ti_doc) = ti_doc {
             if let Err(e) = ti.add_document(&ti_doc) {
-                error = Some(format!("title indexing {path:?}: {e}"));
-                break;
+                return (ft, ti, Err(format!("title indexing {path:?}: {e}")));
             }
             let d = ti_docs.fetch_add(1, Ordering::Relaxed) + 1;
             if d % COMMIT_EVERY == 0 {
                 if let Err(e) = ti.commit() {
-                    error = Some(format!("title index commit: {e}"));
-                    break;
+                    return (ft, ti, Err(format!("title index commit: {e}")));
                 }
             }
         }
-    }
-    if let Some(e) = error {
-        queue.fail(e.clone());
-        return (ft, ti, Err(e));
     }
     if let Err(e) = ft.commit() {
         return (ft, ti, Err(format!("fulltext index commit: {e}")));
@@ -1227,25 +1118,14 @@ pub fn convert(
         // Indexing runs on ONE dedicated thread that owns both databases for
         // the whole walk: workers build each article's documents outside any
         // lock and ship (optional fulltext, optional title) pairs over a
-        // bounded queue — blocking while full, so neither add_document nor
-        // the every-[`COMMIT_EVERY`] commits ever stall the workers.
-        let queue = Arc::new(DocQueue::new());
+        // bounded sync_channel — blocking while full, so neither
+        // add_document nor the every-[`COMMIT_EVERY`] commits ever stall
+        // the workers.
+        let (doc_tx, doc_rx) = std::sync::mpsc::sync_channel::<QueuedDoc>(DOC_QUEUE_CAP);
         let indexer = {
-            let queue = Arc::clone(&queue);
             let ft_docs = Arc::clone(&shared.ft_docs);
             let ti_docs = Arc::clone(&shared.ti_docs);
-            std::thread::spawn(move || {
-                // A panicking indexer must unblock the queue's pushers, not hang them.
-                match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    run_indexer(ft_wdb, ti_wdb, &queue, &ft_docs, &ti_docs)
-                })) {
-                    Ok(result) => result,
-                    Err(panic) => {
-                        queue.fail("indexer thread panicked".to_string());
-                        std::panic::resume_unwind(panic);
-                    }
-                }
-            })
+            std::thread::spawn(move || run_indexer(ft_wdb, ti_wdb, doc_rx, &ft_docs, &ti_docs))
         };
         let walked = if !tasks.is_empty() {
             run_task_workers(threads, &shared.next, &tasks, |(cluster, items)| {
@@ -1368,10 +1248,11 @@ pub fn convert(
                         // FFI never touches the WDB pointer (exactly libzim's own
                         // worker design, which indexes into Document objects on
                         // worker threads) — then cross to the indexer thread
-                        // through the bounded queue, which blocks while full (its
-                        // backpressure) and aborts with the indexer's error once
-                        // indexing has stopped. Category pages (ns-14, from the
-                        // unconditional check above) keep their title document
+                        // through the bounded channel, which blocks while
+                        // full (its backpressure) and whose send fails the
+                        // worker once indexing has stopped. Category pages
+                        // (ns-14, from the unconditional check above) keep
+                        // their title document
                         // (target = their own path, like a regular article) but
                         // are never fulltext-indexed: the Some/None split below.
                         let ft_doc = if is_cat_page {
@@ -1395,7 +1276,9 @@ pub fn convert(
                         };
                         let ti_doc = build_title_document(&lang, &item_path, &title, None)
                             .map_err(|e| format!("title indexing {item_path:?}: {e}"))?;
-                        queue.push(ft_doc, Some(ti_doc), item_path.to_string())?;
+                        doc_tx
+                            .send((ft_doc, Some(ti_doc), item_path.to_string()))
+                            .map_err(|_| "indexer stopped".to_string())?;
                     }
                     // Writer add in its own lock scope (no nesting): the
                     // record carries the blob's ref.
@@ -1421,15 +1304,18 @@ pub fn convert(
         } else {
             Ok(())
         };
-        // The walk's join is done: close the queue and wait for the indexer
-        // to drain the remaining documents, do the final commits of both
-        // databases and hand them back. ft_docs keeps rising until then, so
-        // the summary below must follow this join.
-        queue.close();
+        // The walk's join is done: drop the sender so the indexer sees the
+        // disconnected channel once it has drained the remaining documents,
+        // does the final commits of both databases and hands them back.
+        // ft_docs keeps rising until then, so the summary below must follow
+        // this join.
+        drop(doc_tx);
         let (ft, mut ti, index_result) =
             indexer.join().unwrap_or_else(|p| std::panic::resume_unwind(p));
-        walked?;
+        // The indexer's specific error surfaces before the walk's: worker
+        // sends only fail with the generic "indexer stopped" text.
         index_result?;
+        walked?;
         if !tasks.is_empty() {
             // Final status: workers and indexer are done, so the counters
             // are final — the last periodic line can be up to STATUS_EVERY-1
