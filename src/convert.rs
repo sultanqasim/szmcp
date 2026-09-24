@@ -61,10 +61,7 @@ const METADATA_MIME: &str = "text/plain;charset=UTF-8";
 /// bytes, dropping a trailing partial character (python's
 /// `encode()[:238].decode("utf-8", "ignore")`).
 fn trim_title(title: &str) -> String {
-    if title.len() <= TITLE_MAX_BYTES {
-        return title.to_string();
-    }
-    let mut end = TITLE_MAX_BYTES;
+    let mut end = title.len().min(TITLE_MAX_BYTES);
     while end > 0 && !title.is_char_boundary(end) {
         end -= 1;
     }
@@ -79,11 +76,7 @@ fn entry_title(dirent_title: &str, item_path: &str) -> String {
     } else {
         dirent_title.to_string()
     };
-    if title.len() > TITLE_MAX_BYTES {
-        trim_title(&title)
-    } else {
-        title
-    }
+    trim_title(&title)
 }
 
 /// `zim2zim._is_hatnote_para`: a standalone paragraph entirely wrapped in
