@@ -471,11 +471,14 @@ const STATUS_EVERY: u64 = 1_000;
 /// Record flags: bit 0 = the article was converted and its blob entered an
 /// output cluster; bit 1 = that blob lives in a compressed cluster; bit 2 =
 /// a redirect whose resolved terminal is in `a`; bit 3 = that terminal's
-/// MIME is text/html.
+/// MIME is text/html; bit 4 = a no-content article (title-only, or title
+/// plus one bare wikilink line), indexed like a redirect.
 const REC_ARTICLE: u8 = 1;
 const REC_COMPRESS: u8 = 2;
 const REC_REDIRECT: u8 = 4;
 const REC_TARGET_HTML: u8 = 8;
+/// A no-content article: indexed like a redirect (see the flags above).
+const REC_NOCONTENT: u8 = 16;
 
 /// One per-entry record (12 bytes), a union discriminated by the flags byte
 /// — an entry is either an article or a redirect, never both: an article
@@ -560,7 +563,8 @@ impl<'a> Rank<'a> {
 /// records stored by the pre-pass, and `articles_done`/`articles_total` is
 /// the walk's per-article progress.
 /// `ft_docs` IS the converted-article count: every successful conversion
-/// adds exactly one fulltext document, and only the indexer thread
+/// adds exactly one fulltext document except no-content pages (they are
+/// indexed like redirects), and only the indexer thread
 /// increments `ft_docs`/`ti_docs`.
 #[derive(Default)]
 struct Shared {
@@ -836,9 +840,9 @@ fn convert_article_html(
 /// Accent folding is always applied to the indexed text (the search side
 /// folds queries the same way); `index_intro_only` fulltext-indexes each
 /// article's intro instead of the whole markdown; `index_redirect_titles`
-/// gives recreated redirects the FRONT_ARTICLE hint so their titles enter
-/// the title index (the default excludes them, zim2zim's
-/// --no-redirect-titles behavior).
+/// gives recreated redirects and no-content pages (title-only or title plus
+/// one bare wikilink — never fulltext-indexed) their title-index documents
+/// (the default excludes them, zim2zim's --no-redirect-titles behavior).
 pub fn convert(
     zimfile: &Path,
     outfile: &Path,
@@ -1177,25 +1181,39 @@ pub fn convert(
                         shared.failed.fetch_add(1, Ordering::Relaxed);
                         continue;
                     };
-                    // Both documents build OUTSIDE any lock — the TermGenerator/Document
-                    // FFI never touches the WDB pointer (exactly libzim's own
-                    // worker design, which indexes into Document objects on
-                    // worker threads) — then cross to the indexer thread
-                    // through the bounded queue, which blocks while full (its
-                    // backpressure) and aborts with the indexer's error once
-                    // indexing has stopped.
-                    let folded_title = crate::search::fold_accents(&title);
-                    let folded_content = if index_intro_only {
-                        crate::search::fold_accents(&intro_for_index(&md))
-                    } else {
-                        crate::search::fold_accents(&md)
-                    };
-                    let ft_doc =
-                        build_fulltext_document(&lang, &item_path, &folded_title, &folded_content)
-                            .map_err(|e| format!("indexing {item_path:?}: {e}"))?;
-                    let ti_doc = build_title_document(&lang, &item_path, &title, None)
-                        .map_err(|e| format!("title indexing {item_path:?}: {e}"))?;
-                    queue.push(ft_doc, ti_doc, item_path.to_string())?;
+                    // No-content page (title-only, or title plus exactly one
+                    // bare wikilink line — mwoffliner's meta-refresh redirect
+                    // stubs): indexed like a redirect — no fulltext doc, and
+                    // a title doc only via the redirect-titles post-pass
+                    // below. The blob is still written.
+                    let body = md.split_once('\n').map(|x| x.1.trim()).unwrap_or("");
+                    let no_content = body.is_empty()
+                        || (body.starts_with("[[") && body.ends_with("]]") && !body.contains('\n'));
+                    if !no_content {
+                        // Both documents build OUTSIDE any lock — the TermGenerator/Document
+                        // FFI never touches the WDB pointer (exactly libzim's own
+                        // worker design, which indexes into Document objects on
+                        // worker threads) — then cross to the indexer thread
+                        // through the bounded queue, which blocks while full (its
+                        // backpressure) and aborts with the indexer's error once
+                        // indexing has stopped.
+                        let folded_title = crate::search::fold_accents(&title);
+                        let folded_content = if index_intro_only {
+                            crate::search::fold_accents(&intro_for_index(&md))
+                        } else {
+                            crate::search::fold_accents(&md)
+                        };
+                        let ft_doc = build_fulltext_document(
+                            &lang,
+                            &item_path,
+                            &folded_title,
+                            &folded_content,
+                        )
+                        .map_err(|e| format!("indexing {item_path:?}: {e}"))?;
+                        let ti_doc = build_title_document(&lang, &item_path, &title, None)
+                            .map_err(|e| format!("title indexing {item_path:?}: {e}"))?;
+                        queue.push(ft_doc, ti_doc, item_path.to_string())?;
+                    }
                     // Writer add in its own lock scope (no nesting): the
                     // record carries the blob's ref.
                     {
@@ -1207,7 +1225,9 @@ pub fn convert(
                         slot.a.store(b.generation, Ordering::Relaxed);
                         slot.b.store(b.blob, Ordering::Relaxed);
                         slot.flags.store(
-                            REC_ARTICLE | if b.compress { REC_COMPRESS } else { 0 },
+                            REC_ARTICLE
+                                | if no_content { REC_NOCONTENT } else { 0 }
+                                | if b.compress { REC_COMPRESS } else { 0 },
                             Ordering::Relaxed,
                         );
                     }
@@ -1272,14 +1292,17 @@ pub fn convert(
         let rank = Rank::new(&member);
 
         // Opt-in redirect title documents (the default build has none): value 1
-        // = the terminal article's path, like the walk's article adds. Serial;
-        // commits paced every [`COMMIT_EVERY`] documents, before the title
-        // database's compaction.
+        // = the terminal article's path, like the walk's article adds —
+        // except no-content articles, which get no target: their `a` holds
+        // a blob generation, not an index, so the doc targets their own
+        // path like a regular article add. Serial; commits paced every
+        // [`COMMIT_EVERY`] documents, before the title database's compaction.
         if index_redirect_titles {
             let mut added = 0u64;
             for idx in 0..end {
+                let flags = recs[idx as usize].flags.load(Ordering::Relaxed);
                 if member[idx as usize / 64] & (1 << (idx % 64)) == 0
-                    || recs[idx as usize].flags.load(Ordering::Relaxed) & REC_REDIRECT == 0
+                    || flags & (REC_REDIRECT | REC_NOCONTENT) == 0
                 {
                     continue;
                 }
@@ -1289,11 +1312,15 @@ pub fn convert(
                 if title.is_empty() {
                     continue;
                 }
-                let t = recs[idx as usize].a.load(Ordering::Relaxed);
-                let t_entry = z.get_entry(t)
-                    .map_err(|e| format!("reading entry {t}: {e}"))?;
-                let doc = build_title_document(&lang, &entry.url, &title, Some(&t_entry.url))
-                    .map_err(|e| format!("title indexing {:?}: {e}", entry.url))?;
+                let doc = if flags & REC_NOCONTENT != 0 {
+                    build_title_document(&lang, &entry.url, &title, None)
+                } else {
+                    let t = recs[idx as usize].a.load(Ordering::Relaxed);
+                    let t_entry = z.get_entry(t)
+                        .map_err(|e| format!("reading entry {t}: {e}"))?;
+                    build_title_document(&lang, &entry.url, &title, Some(&t_entry.url))
+                }
+                .map_err(|e| format!("title indexing {:?}: {e}", entry.url))?;
                 ti.add_document(&doc)
                     .map_err(|e| format!("title indexing {:?}: {e}", entry.url))?;
                 added += 1;
@@ -1970,6 +1997,82 @@ mod e2e {
             wc_intro.parse::<usize>().unwrap() < wc_full.parse::<usize>().unwrap(),
             "intro wordcount {wc_intro} vs full {wc_full}"
         );
+    }
+
+    const STUB_HTML: &str = "<html><body><a href=\"./Apple#f\">label</a></body></html>";
+
+    /// One normal article (a `<p>` body) plus one stub-shaped article (a
+    /// bare internal `<a>` as the only body child — mwoffliner's
+    /// meta-refresh redirect stub).
+    fn stub_fixture() -> Vec<u8> {
+        let content = [
+            TestEntry { namespace: b'C', url: "Apple", title: "Apple", mime: 0, body: APPLE_HTML.as_bytes() },
+            TestEntry { namespace: b'C', url: "Stub", title: "Stub", mime: 0, body: STUB_HTML.as_bytes() },
+            TestEntry { namespace: b'M', url: "Language", title: "", mime: 2, body: b"eng" },
+        ];
+        build_archive(
+            &["text/html", "text/css", "text/plain;charset=UTF-8", "image/png"],
+            &content,
+            &[],
+            0,
+            None,
+        )
+    }
+
+    fn convert_stub_fixture(redirect_titles: bool) -> Converted {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("src.zim");
+        std::fs::write(&src, stub_fixture()).unwrap();
+        let out = dir.path().join("out.zim");
+        convert(&src, &out, -1, false, redirect_titles).unwrap();
+        let zim = Zim::open(&out).unwrap();
+        Converted { _dir: dir, zim }
+    }
+
+    #[test]
+    fn no_content_stub_is_not_indexed_by_default() {
+        let c = convert_stub_fixture(false);
+        let z = &c.zim;
+
+        // The stub produces no fulltext and no title document: only the
+        // normal article is indexed in both databases.
+        let ft = z.open_fulltext_xapian().unwrap().unwrap();
+        assert_eq!(ft.doc_count(), 1);
+        assert_eq!(ft.get_document(1).unwrap().data_str().unwrap(), "C/Apple");
+        let ti = z.open_title_xapian().unwrap().unwrap();
+        assert_eq!(ti.doc_count(), 1);
+        assert_eq!(ti.get_document(1).unwrap().data_str().unwrap(), "C/Apple");
+
+        // The stub page still exists as text/markdown carrying its wikilink
+        // line, and still resolves to that content.
+        let idx = z.resolve_path("C/Stub").unwrap().unwrap();
+        let entry = z.get_entry(idx).unwrap();
+        assert_eq!(z.mime_type(entry.mime), Some("text/markdown"));
+        let md = String::from_utf8(blob_of(z, b'C', "Stub").unwrap()).unwrap();
+        assert_eq!(md, "# Stub\n\n[[Apple#f|label]]\n");
+    }
+
+    #[test]
+    fn no_content_stub_title_doc_only_opt_in() {
+        // Under --index-redirect-titles the stub gets a title document with
+        // NO target path (its record's `a` holds a blob generation, not an
+        // index): value 1 is its own path, like a regular article.
+        let c = convert_stub_fixture(true);
+        let z = &c.zim;
+        assert_eq!(z.open_fulltext_xapian().unwrap().unwrap().doc_count(), 1);
+        let ti = z.open_title_xapian().unwrap().unwrap();
+        assert_eq!(ti.doc_count(), 2);
+        let doc_by_data = |data: &str| -> (Vec<u8>, Vec<u8>) {
+            for d in 1..=ti.doc_count() {
+                let mut doc = ti.get_document(d).unwrap();
+                if doc.data_str().unwrap() == data {
+                    return (doc.value(0).unwrap(), doc.value(1).unwrap());
+                }
+            }
+            panic!("title doc {data} missing");
+        };
+        assert_eq!(doc_by_data("C/Stub"), (b"Stub".to_vec(), b"Stub".to_vec()));
+        assert_eq!(doc_by_data("C/Apple"), (b"Apple".to_vec(), b"Apple".to_vec()));
     }
 
     #[test]
