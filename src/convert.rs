@@ -809,6 +809,78 @@ fn run_indexer(
     (ft, ti, Ok(()))
 }
 
+/// True for a MediaWiki category page: the `<body …>` tag's class attribute
+/// contains the namespace token `ns-14` — how MediaWiki marks the category
+/// namespace in every language, so the check is language-agnostic (verified
+/// on the archive's real category pages). Deliberately byte-level: the walk
+/// calls it on the raw blob, which need not be valid UTF-8.
+fn is_category_page(html: &[u8]) -> bool {
+    const BODY_TAG: &[u8] = b"<body";
+    // The `<body` start tag: the first occurrence whose next byte delimits
+    // the tag name (later occurrences are rescanned, so `<bodyx`-shaped text
+    // cannot stop the search).
+    let mut from = 0;
+    let start = loop {
+        if from + BODY_TAG.len() > html.len() {
+            return false;
+        }
+        match html[from..]
+            .windows(BODY_TAG.len())
+            .position(|w| w == BODY_TAG)
+            .map(|p| from + p)
+        {
+            Some(at) => {
+                let after = at + BODY_TAG.len();
+                if html[after..]
+                    .first()
+                    .is_some_and(|&b| b == b'>' || b == b'/' || b.is_ascii_whitespace())
+                {
+                    break after;
+                }
+                from = after;
+            }
+            None => return false,
+        }
+    };
+    // The tag's attributes run to the closing `>`.
+    let attrs_end = html[start..]
+        .iter()
+        .position(|&b| b == b'>')
+        .map_or(html.len(), |p| start + p);
+    let attrs = &html[start..attrs_end];
+    // The class attribute's value (either quote style), if any: its
+    // whitespace-separated tokens must contain `ns-14`.
+    let needle: &[u8] = b"class=";
+    for quote in [b'"', b'\''] {
+        let mut from = 0;
+        while let Some(at) = attrs[from..]
+            .windows(needle.len())
+            .position(|w| w == needle)
+            .map(|p| from + p)
+        {
+            from = at + needle.len();
+            // A delimited attribute name only (rules out data-class=…).
+            if at > 0 && !attrs[at - 1].is_ascii_whitespace() {
+                continue;
+            }
+            if attrs.get(at + needle.len()) != Some(&quote) {
+                continue;
+            }
+            let rest = &attrs[at + needle.len() + 1..];
+            let Some(stop) = rest.iter().position(|&b| b == quote) else {
+                continue; // unterminated value
+            };
+            if rest[..stop]
+                .split(|&b| b.is_ascii_whitespace())
+                .any(|t| t == b"ns-14")
+            {
+                return true;
+            }
+        }
+    }
+    false
+}
+
 /// Convert one article's resolved HTML bytes to markdown. `Ok(None)` is a
 /// failed conversion - counted as a conversion failure with the reference's
 /// warning, never fatal.
@@ -817,11 +889,15 @@ fn convert_article_html(
     path: &str,
     title: &str,
     lang: &str,
+    include_categories: bool,
 ) -> Result<Option<String>, String> {
     match std::str::from_utf8(html) {
-        Ok(html) => {
-            Ok(Some(crate::html2md::html_to_md(html, Some(title), Some(lang), false)))
-        }
+        Ok(html) => Ok(Some(crate::html2md::html_to_md(
+            html,
+            Some(title),
+            Some(lang),
+            include_categories,
+        ))),
         Err(_) => {
             eprintln!("warning: failed to convert {path:?}: content is not valid UTF-8");
             Ok(None)
@@ -844,13 +920,20 @@ fn convert_article_html(
 /// article's intro instead of the whole markdown; `index_redirect_titles`
 /// gives recreated redirects and no-content pages (title-only or title plus
 /// one bare wikilink — never fulltext-indexed) their title-index documents
-/// (the default excludes them, zim2zim's --no-redirect-titles behavior).
+/// (the default excludes them, zim2zim's --no-redirect-titles behavior);
+/// `include_categories` keeps MediaWiki category pages (ns-14 body class) in
+/// the output — they convert to markdown with their Subcategories/
+/// Pages-in-category sections and articles gain the localized Categories
+/// section. The default omits category pages entirely (no blob, no dirent;
+/// redirects pointing at them dangle and are dropped) though they still
+/// count as processed walk items.
 pub fn convert(
     zimfile: &Path,
     outfile: &Path,
     limit: i64,
     index_intro_only: bool,
     index_redirect_titles: bool,
+    include_categories: bool,
 ) -> Result<(), String> {
     let t0 = Instant::now();
     eprintln!("Opening source ZIM: {}", zimfile.display());
@@ -1177,7 +1260,23 @@ pub fn convert(
                             continue;
                         }
                     };
-                    let Some(md) = convert_article_html(&html, &item_path, &title, &conv_lang)?
+                    // A category page (the language-agnostic ns-14 body-class
+                    // marker) is omitted ENTIRELY unless --include-categories
+                    // was given: no conversion, no blob add, no dirent — its
+                    // record stays zero, so it is not a member and redirects
+                    // pointing at it dangle and are dropped. The no-content
+                    // logic below can never see it, and the item already
+                    // counted as processed above.
+                    if !include_categories && is_category_page(&html) {
+                        continue;
+                    }
+                    let Some(md) = convert_article_html(
+                        &html,
+                        &item_path,
+                        &title,
+                        &conv_lang,
+                        include_categories,
+                    )?
                     else {
                         shared.failed.fetch_add(1, Ordering::Relaxed);
                         continue;
@@ -1563,6 +1662,28 @@ mod tests {
         assert_eq!(indexing_language(None), "eng");
         assert_eq!(indexing_language(Some("   ")), "eng");
     }
+
+    #[test]
+    fn is_category_page_detects_the_ns14_body_class() {
+        // The real shape: ns-14 among the body's class tokens.
+        assert!(is_category_page(
+            b"<html><body class=\"ns-14 ns-subject page-Category-Fruits\"><p>x</p></body></html>"
+        ));
+        // Single-quoted attribute value.
+        assert!(is_category_page(b"<body class='ns-14 talk ns-subject'>"));
+        // Token equality only: ns-140 is not ns-14.
+        assert!(!is_category_page(b"<body class=\"ns-140 ns-subject\">"));
+        // No body tag at all, or no category-namespace token on it.
+        assert!(!is_category_page(b"<html><head><title>t</title></head></html>"));
+        assert!(!is_category_page(b"<html><body><p>x</p></body></html>"));
+        assert!(!is_category_page(b"<body class=\"ns-0 ns-subject\">"));
+        // A delimited attribute name only (data-class=… is not class=).
+        assert!(!is_category_page(b"<body data-class=\"ns-14\">"));
+        // Raw non-UTF-8 bytes elsewhere in the document cannot break it.
+        let mut raw = b"<body class=\"ns-14 ns-subject\"><p>".to_vec();
+        raw.extend_from_slice(&[0xFF, 0xFE, b'x']);
+        assert!(is_category_page(&raw));
+    }
 }
 
 /// A second test module: end-to-end conversions over a synthetic source ZIM
@@ -1620,12 +1741,12 @@ mod e2e {
         zim: Zim,
     }
 
-    fn convert_fixture(limit: i64, intro_only: bool, redirect_titles: bool) -> Converted {
+    fn convert_fixture(limit: i64, intro_only: bool, redirect_titles: bool, include_categories: bool) -> Converted {
         let dir = tempfile::tempdir().unwrap();
         let src = dir.path().join("src.zim");
         std::fs::write(&src, fixture()).unwrap();
         let out = dir.path().join("out.zim");
-        convert(&src, &out, limit, intro_only, redirect_titles).unwrap();
+        convert(&src, &out, limit, intro_only, redirect_titles, include_categories).unwrap();
         let zim = Zim::open(&out).unwrap();
         Converted { _dir: dir, zim }
     }
@@ -1651,6 +1772,80 @@ mod e2e {
             }
         }
         None
+    }
+
+    /// One regular article with a one-category catlinks bar (wiki body, the
+    /// bar outside the render root, as the archive's pages carry it).
+    const APPLE_CAT_HTML: &str = "<html><head><title>Apple</title></head><body>\
+<div id=\"mw-content-text\"><div class=\"mw-parser-output\">\
+<p>An <b>apple</b> is the fruit of trees.</p></div>\
+<div id=\"catlinks\" class=\"catlinks\"><div id=\"mw-normal-catlinks\" class=\"mw-normal-catlinks\">Categories: <ul>\
+<li><a href=\"Category%3AFruits\" title=\"Category:Fruits\">Fruits</a></li>\
+</ul></div></div></body></html>";
+
+    /// The category page the article links to: ns-14 body class (MediaWiki's
+    /// language-agnostic category-namespace marker) and a
+    /// div.mw-category-generated member section — one subcategory and one
+    /// member list, modeled on the real archive's shapes (html2md's
+    /// cat_generated/cat_bar_local fixtures).
+    const CAT_FRUITS_HTML: &str = "<html><head><title>Category:Fruits</title></head>\
+<body class=\"ns-14 ns-subject\">\
+<div id=\"mw-content-text\"><div class=\"mw-parser-output\"><p>Articles about <b>fruits</b>.</p></div>\
+<div class=\"mw-category-generated\">\
+<div id=\"mw-subcategories\"><h2>Subcategories</h2>\
+<p>This category has the following 1 subcategory, out of 1 total.</p>\
+<div class=\"mw-content-ltr\"><div class=\"mw-category\">\
+<div class=\"mw-category-group\"><h3>R</h3><ul>\
+<li><a target=\"_parent\" href=\"Category%3ARosaceae_genera\" title=\"Category:Rosaceae genera\">Rosaceae genera</a></li>\
+</ul></div></div></div></div>\
+<div id=\"mw-pages\"><h2>Pages in category \"Fruits\"</h2>\
+<p>The following 1 page is in this category, out of 1 total.</p>\
+<div class=\"mw-content-ltr\"><div class=\"mw-category\">\
+<div class=\"mw-category-group\"><h3>A</h3><ul>\
+<li><a target=\"_parent\" href=\"Apple\" title=\"Apple\">Apple</a></li>\
+</ul></div></div></div></div>\
+<p><em>This category content has been reduced to only pages contained in the ZIM file.</em></p></div>\
+<div id=\"catlinks\" class=\"catlinks\"><div id=\"mw-normal-catlinks\" class=\"mw-normal-catlinks\">Categories: <ul>\
+<li><a href=\"Category%3AFruits_by_plant_part\" title=\"Category:Fruits by plant part\">Fruits by plant part</a></li>\
+</ul></div></div></body></html>";
+
+    /// The synthetic source for the category handling: the article, the
+    /// category page it links to, a ZIM-native redirect pointing at the
+    /// category page, and English language metadata.
+    fn category_fixture() -> Vec<u8> {
+        let content = [
+            TestEntry { namespace: b'C', url: "Apple", title: "Apple", mime: 0, body: APPLE_CAT_HTML.as_bytes() },
+            TestEntry { namespace: b'C', url: "Category:Fruits", title: "Category:Fruits", mime: 0, body: CAT_FRUITS_HTML.as_bytes() },
+            TestEntry { namespace: b'M', url: "Language", title: "", mime: 1, body: b"eng" },
+        ];
+        let redirects = [TestRedirect {
+            namespace: b'C',
+            url: "All_fruits",
+            title: "All fruits",
+            target_content: 1,
+        }];
+        build_archive(
+            &["text/html", "text/plain;charset=UTF-8"],
+            &content,
+            &redirects,
+            0,
+            None,
+        )
+    }
+
+    fn convert_category_fixture(include_categories: bool) -> Converted {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("src.zim");
+        std::fs::write(&src, category_fixture()).unwrap();
+        let out = dir.path().join("out.zim");
+        convert(&src, &out, -1, false, false, include_categories).unwrap();
+        let zim = Zim::open(&out).unwrap();
+        Converted { _dir: dir, zim }
+    }
+
+    /// The markdown of one output article.
+    fn md_of(z: &Zim, url: &str) -> String {
+        String::from_utf8(blob_of(z, b'C', url).unwrap()).unwrap()
     }
 
     #[test]
@@ -1699,7 +1894,7 @@ mod e2e {
         )
         .unwrap();
         let out = dir.path().join("out.zim");
-        convert(&src, &out, -1, false, false).unwrap();
+        convert(&src, &out, -1, false, false, false).unwrap();
         let z = Zim::open(&out).unwrap();
 
         // Every article is present as text/markdown, in SOURCE member
@@ -1754,7 +1949,7 @@ mod e2e {
 
     #[test]
     fn converts_articles_recreates_redirects_and_copies_assets() {
-        let c = convert_fixture(-1, false, false);
+        let c = convert_fixture(-1, false, false, false);
         let z = &c.zim;
 
         // The article is markdown at the SAME path, with the dirent title.
@@ -1806,7 +2001,7 @@ mod e2e {
         // C/Apple_fruit (redirect), C/Banana, ... A limit of 3 stops after
         // Apple_fruit: Alt_Banana's target (Banana) was never converted, so
         // that redirect dangles and is dropped by finish().
-        let c = convert_fixture(3, false, false);
+        let c = convert_fixture(3, false, false, false);
         let z = &c.zim;
         assert!(z.resolve_path("C/Apple").unwrap().is_some());
         assert!(z.resolve_path("C/Apple_fruit").unwrap().is_some());
@@ -1822,7 +2017,7 @@ mod e2e {
 
     #[test]
     fn title_index_excludes_redirect_titles_by_default() {
-        let c = convert_fixture(-1, false, false);
+        let c = convert_fixture(-1, false, false, false);
         let z = &c.zim;
         let title = z.open_title_xapian().unwrap().unwrap();
         // One doc per article, sorted by path: Apple, Banana, Révolution.
@@ -1856,7 +2051,7 @@ mod e2e {
 
     #[test]
     fn title_index_includes_redirect_titles_opt_in() {
-        let c = convert_fixture(-1, false, true);
+        let c = convert_fixture(-1, false, true, false);
         let z = &c.zim;
         let title = z.open_title_xapian().unwrap().unwrap();
         // Articles + both recreated redirects (both targets were converted),
@@ -1888,7 +2083,7 @@ mod e2e {
 
     #[test]
     fn fulltext_index_is_folded_and_french_stemmed() {
-        let c = convert_fixture(-1, false, false);
+        let c = convert_fixture(-1, false, false, false);
         let z = &c.zim;
         let ft = z.open_fulltext_xapian().unwrap().unwrap();
         // One doc per converted article, in conversion order.
@@ -1948,7 +2143,7 @@ mod e2e {
         );
         std::fs::write(&src, bytes).unwrap();
         let out = dir.path().join("out.zim");
-        convert(&src, &out, -1, false, false).unwrap();
+        convert(&src, &out, -1, false, false, false).unwrap();
         let z = Zim::open(&out).unwrap();
         assert_eq!(blob_of(&z, b'M', "Language"), Some(b"fra,eng".to_vec()));
         let ft = z.open_fulltext_xapian().unwrap().unwrap();
@@ -1966,7 +2161,7 @@ mod e2e {
         );
         std::fs::write(&src, bytes).unwrap();
         let out = dir.path().join("out2.zim");
-        convert(&src, &out, -1, false, false).unwrap();
+        convert(&src, &out, -1, false, false, false).unwrap();
         let z = Zim::open(&out).unwrap();
         assert_eq!(blob_of(&z, b'M', "Language"), Some(b"eng".to_vec()));
         let ft = z.open_fulltext_xapian().unwrap().unwrap();
@@ -1981,14 +2176,14 @@ mod e2e {
         // archive, so surface forms don't survive STEM_ALL).
         let mut fr = xapian2::Stem::new("fr").unwrap();
         let kaz = fr.apply("kazakhstan").unwrap();
-        let full = convert_fixture(-1, false, false);
+        let full = convert_fixture(-1, false, false, false);
         let ft = full.zim.open_fulltext_xapian().unwrap().unwrap();
         assert_eq!(ft.termfreq(&kaz), 1);
         assert!(ft.termfreq(&fr.apply("apple").unwrap()) >= 1);
 
         // Intro-only: the lead section only - title line kept, everything
         // after the first "## " heading gone.
-        let intro = convert_fixture(-1, true, false);
+        let intro = convert_fixture(-1, true, false, false);
         let ft = intro.zim.open_fulltext_xapian().unwrap().unwrap();
         assert_eq!(ft.termfreq(&kaz), 0);
         // The title line keeps the article searchable in the lead.
@@ -2030,7 +2225,7 @@ mod e2e {
         let src = dir.path().join("src.zim");
         std::fs::write(&src, stub_fixture()).unwrap();
         let out = dir.path().join("out.zim");
-        convert(&src, &out, -1, false, redirect_titles).unwrap();
+        convert(&src, &out, -1, false, redirect_titles, false).unwrap();
         let zim = Zim::open(&out).unwrap();
         Converted { _dir: dir, zim }
     }
@@ -2079,6 +2274,74 @@ mod e2e {
         };
         assert_eq!(doc_by_data("C/Stub"), (b"Stub".to_vec(), b"Stub".to_vec()));
         assert_eq!(doc_by_data("C/Apple"), (b"Apple".to_vec(), b"Apple".to_vec()));
+    }
+
+    #[test]
+    fn category_pages_are_omitted_by_default() {
+        // No --include-categories: the category page (ns-14 body class) is
+        // absent from the output entirely — no dirent, so the redirect
+        // pointing at it dangles and is dropped too — and the article keeps
+        // no Categories section.
+        let c = convert_category_fixture(false);
+        let z = &c.zim;
+        assert!(z.resolve_path("C/Category:Fruits").unwrap().is_none());
+        assert!(z.resolve_path("C/All_fruits").unwrap().is_none());
+        assert_eq!(md_of(z, "Apple"), "# Apple\n\nAn **apple** is the fruit of trees.\n");
+
+        // The category page still counted as a processed walk item, but only
+        // the regular article is indexed (fulltext and title).
+        let ft = z.open_fulltext_xapian().unwrap().unwrap();
+        assert_eq!(ft.doc_count(), 1);
+        assert_eq!(ft.get_document(1).unwrap().data_str().unwrap(), "C/Apple");
+        let ti = z.open_title_xapian().unwrap().unwrap();
+        assert_eq!(ti.doc_count(), 1);
+        assert_eq!(ti.get_document(1).unwrap().data_str().unwrap(), "C/Apple");
+    }
+
+    #[test]
+    fn include_categories_keeps_and_converts_category_pages() {
+        let c = convert_category_fixture(true);
+        let z = &c.zim;
+
+        // The category page converts to text/markdown; its generated member
+        // section renders with the real pages' Subcategories / Pages in
+        // category headings and the member wikilink bullets.
+        let cat_idx = z.resolve_path("C/Category:Fruits").unwrap().unwrap();
+        let cat_entry = z.get_entry(cat_idx).unwrap();
+        assert_eq!(z.mime_type(cat_entry.mime), Some("text/markdown"));
+        let cat_md = md_of(z, "Category:Fruits");
+        assert!(cat_md.contains("## Subcategories"), "{cat_md}");
+        assert!(cat_md.contains("- [[Category:Rosaceae genera|Rosaceae genera]]"), "{cat_md}");
+        assert!(cat_md.contains("## Pages in category \"Fruits\""), "{cat_md}");
+        assert!(cat_md.contains("- [[Apple]]"), "{cat_md}");
+
+        // The article gains the localized Categories section, whose category
+        // wikilink's target is exactly the category page's dirent.
+        assert_eq!(
+            md_of(z, "Apple"),
+            "# Apple\n\nAn **apple** is the fruit of trees.\n\n\
+             ## Categories\n\n- [[Category:Fruits|Fruits]]\n"
+        );
+        assert_eq!(cat_entry.url, "Category:Fruits");
+
+        // The redirect pointing at the category page resolves again.
+        let (_, target) = terminal(z, b'C', "All_fruits").unwrap();
+        assert_eq!(target.url, "Category:Fruits");
+
+        // Both articles are indexed (the category page has content, so it
+        // joins the regular article in both databases).
+        let ft = z.open_fulltext_xapian().unwrap().unwrap();
+        assert_eq!(ft.doc_count(), 2);
+        let ft_data: Vec<String> = (1..=ft.doc_count())
+            .map(|d| ft.get_document(d).unwrap().data_str().unwrap())
+            .collect();
+        assert!(ft_data.contains(&"C/Apple".to_string()), "{ft_data:?}");
+        let ti = z.open_title_xapian().unwrap().unwrap();
+        assert_eq!(ti.doc_count(), 2);
+        let ti_data: Vec<String> = (1..=ti.doc_count())
+            .map(|d| ti.get_document(d).unwrap().data_str().unwrap())
+            .collect();
+        assert!(ti_data.contains(&"C/Apple".to_string()), "{ti_data:?}");
     }
 
     #[test]

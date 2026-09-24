@@ -104,6 +104,13 @@ enum Command {
         /// resolve)
         #[arg(long = "index-redirect-titles")]
         index_redirect_titles: bool,
+        /// Keep MediaWiki category pages in the output (default: omit them
+        /// entirely — no content entry, no listing entry; redirects pointing
+        /// at them dangle and are dropped). With the flag, category pages
+        /// convert to markdown with their Subcategories/Pages-in-category
+        /// sections, and articles gain the localized Categories section
+        #[arg(long)]
+        include_categories: bool,
     },
     /// Get one section of an article from a ZIM file, by its heading text
     GetSection {
@@ -196,10 +203,17 @@ async fn run(command: Command) -> Result<(), String> {
                 print_result(&result)
             }
         }
-        Command::Convert { input_zim, output_zim, limit, index_intro_only, index_redirect_titles } => {
+        Command::Convert { input_zim, output_zim, limit, index_intro_only, index_redirect_titles, include_categories } => {
             // Synchronous, blocking: no await point is involved (the tokio
             // runtime simply hosts this call).
-            convert::convert(&input_zim, &output_zim, limit, index_intro_only, index_redirect_titles)
+            convert::convert(
+                &input_zim,
+                &output_zim,
+                limit,
+                index_intro_only,
+                index_redirect_titles,
+                include_categories,
+            )
         }
         Command::GetSection { zim_path, path, section, content, raw } => {
             let library = open_single_zim(&zim_path)?;
