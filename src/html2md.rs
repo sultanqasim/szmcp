@@ -73,6 +73,10 @@ const DROP_CLASSES: &[&str] = &[
     "thumb", "mw-editsection-bracket", "mw-ref", "referencetooltip",
     "mw-cite-backlink", "hatnote-dummy", "ext-phonos",
     "ext-phonos-PhonosButton", "ext-phonos-attribution",
+    // mwoffliner's JS-pagination placeholders around a category page's
+    // member lists ("Next items are not visible in browsers without
+    // Javascript"): browser noise, never content.
+    "mwo-cat-pagination",
 ];
 
 const DROP_TAGS: &[&str] = &[
@@ -589,6 +593,11 @@ struct InlineCtx {
     in_link: bool,
     br_mode: BrMode,
     in_hatnote: bool,
+    /// Rendering a category page's member section: `[[Category:…]]` links are
+    /// the section's subject and survive the dropped-namespace rule (the same
+    /// exception `categories_section` makes for the catlinks bar). False
+    /// everywhere else.
+    keep_category_links: bool,
 }
 
 /// Render one element (or text node) in inline context.
@@ -751,6 +760,7 @@ fn anchor_md(
     label: &str,
     emph_mark: Option<&str>,
     in_link: bool,
+    keep_category_links: bool,
 ) -> String {
     let label_stripped = label.trim();
     let scheme = href_scheme(href);
@@ -782,7 +792,7 @@ fn anchor_md(
         Some(t) if !t.is_empty() => t,
         _ => return label.to_string(),
     };
-    if in_dropped_ns(&target) {
+    if in_dropped_ns(&target) && !(keep_category_links && is_category_target(&target)) {
         return String::new(); // [[File:…]]/[[Category:…]]-style link: dropped whole
     }
     if let Some(mark) = emph_mark {
@@ -835,7 +845,7 @@ fn render_anchor(el: NodeRef, ctx: InlineCtx) -> String {
         }
     }
 
-    anchor_md(el, href, &label, emph_mark, ctx.in_link)
+    anchor_md(el, href, &label, emph_mark, ctx.in_link, ctx.keep_category_links)
 }
 
 /// Render an element in inline context to markdown text (links,
@@ -870,6 +880,17 @@ pub(crate) fn render_inline_default(el: NodeRef) -> String {
 /// two-space indent per nesting level. raw=True selects the HTML-table-
 /// cell variant (`* item` markers, `<br>` kept, text verbatim).
 pub(crate) fn list_item_lines(list_el: NodeRef, depth: usize, raw: bool) -> Vec<String> {
+    list_item_lines_ctx(list_el, depth, raw, false)
+}
+
+/// [`list_item_lines`] with the category page's member-section flag: `keep`
+/// lets `[[Category:…]]` item links through the dropped-namespace rule.
+pub(crate) fn list_item_lines_ctx(
+    list_el: NodeRef,
+    depth: usize,
+    raw: bool,
+    keep_category_links: bool,
+) -> Vec<String> {
     let marker = if list_el.tag() == Some("ol") {
         "1. "
     } else if raw {
@@ -895,7 +916,15 @@ pub(crate) fn list_item_lines(list_el: NodeRef, depth: usize, raw: bool) -> Vec<
                     subs.push(ch);
                 }
                 NodeKind::Element { .. } => {
-                    parts.push(render_inline(ch, InlineCtx { no_escape: raw, br_mode, ..Default::default() }));
+                    parts.push(render_inline(
+                        ch,
+                        InlineCtx {
+                            no_escape: raw,
+                            br_mode,
+                            keep_category_links,
+                            ..Default::default()
+                        },
+                    ));
                 }
                 _ => {}
             }
@@ -905,7 +934,7 @@ pub(crate) fn list_item_lines(list_el: NodeRef, depth: usize, raw: bool) -> Vec<
             out.push(format!("{}{}{}", indent, marker, text));
         }
         for sub in subs {
-            out.extend(list_item_lines(sub, depth + 1, raw));
+            out.extend(list_item_lines_ctx(sub, depth + 1, raw, keep_category_links));
         }
     }
     out
@@ -913,7 +942,13 @@ pub(crate) fn list_item_lines(list_el: NodeRef, depth: usize, raw: bool) -> Vec<
 
 /// Render <ul>/<ol> with 2-space indent per nesting level.
 pub(crate) fn render_list(el: NodeRef, depth: usize) -> String {
-    list_item_lines(el, depth, false).join("\n")
+    render_list_ctx(el, depth, false)
+}
+
+/// [`render_list`] with the category page's member-section flag (see
+/// [`list_item_lines_ctx`]).
+pub(crate) fn render_list_ctx(el: NodeRef, depth: usize, keep_category_links: bool) -> String {
+    list_item_lines_ctx(el, depth, false, keep_category_links).join("\n")
 }
 
 /// Definition list: <dt> -> `- **term**`, <dt>+<dd> -> `- **term**: def`,
@@ -1059,7 +1094,7 @@ fn render_pre(pre: NodeRef) -> String {
 
 /// `> ` line-per-line blockquote; empty lines inside become `>`.
 fn render_blockquote(bq: NodeRef) -> String {
-    let inner = block_children_md(bq, None, true);
+    let inner = block_children_md(bq, None, true, false);
     let inner = inner.trim_matches('\n');
     if inner.is_empty() {
         return String::new();
@@ -1079,11 +1114,15 @@ fn render_blockquote(bq: NodeRef) -> String {
 
 /// A generic block container: recurse into its children; hatnote
 /// containers render as standalone fully-italic paragraphs.
-fn render_block_container(el: NodeRef, in_blockquote: bool) -> String {
+fn render_block_container(
+    el: NodeRef,
+    in_blockquote: bool,
+    keep_category_links: bool,
+) -> String {
     if el.attr("role") == Some("note") || el.has_class("hatnote") {
         return render_hatnote(el);
     }
-    block_children_md(el, None, in_blockquote)
+    block_children_md(el, None, in_blockquote, keep_category_links)
 }
 
 /// Render a hatnote container as a standalone fully-italic paragraph; only
@@ -1133,9 +1172,23 @@ fn heading_of(el: NodeRef) -> Option<(u32, String)> {
 /// Markdown of ONE block-level child element ('' when it renders to
 /// nothing) — the per-child dispatch of block_children_md.
 pub(crate) fn block_md(ch: NodeRef, in_blockquote: bool) -> String {
-    // a bare hN, or a div.mw-heading wrapper, renders as a Markdown heading
+    block_md_in(ch, in_blockquote, false)
+}
+
+/// [`block_md`] with the category page's member-section flag: `keep` lets
+/// `[[Category:…]]` links inside the section's lists through the
+/// dropped-namespace rule.
+pub(crate) fn block_md_in(ch: NodeRef, in_blockquote: bool, keep_category_links: bool) -> String {
+    // a bare hN, or a div.mw-heading wrapper, renders as a Markdown heading;
+    // a heading with no text (category pages' TOC groups carry
+    // `<h3>&nbsp;</h3>` for the non-letter keys) renders nothing instead of
+    // a bare `##` line.
     if let Some((level, text)) = heading_of(ch) {
-        return format!("{} {}", "#".repeat(level as usize), text);
+        return if text.is_empty() {
+            String::new()
+        } else {
+            format!("{} {}", "#".repeat(level as usize), text)
+        };
     }
     match ch.tag().unwrap_or("") {
         "p" => {
@@ -1146,7 +1199,7 @@ pub(crate) fn block_md(ch: NodeRef, in_blockquote: bool) -> String {
                 p_lines.join("\n\n")
             }
         }
-        "ul" | "ol" => render_list(ch, 0),
+        "ul" | "ol" => render_list_ctx(ch, 0, keep_category_links),
         "dl" => render_dl(ch, 0),
         "blockquote" => render_blockquote(ch),
         "pre" => render_pre(ch),
@@ -1169,9 +1222,9 @@ pub(crate) fn block_md(ch: NodeRef, in_blockquote: bool) -> String {
             ))
             .trim()
             .to_string();
-            anchor_md(ch, href, &label, None, false)
+            anchor_md(ch, href, &label, None, false, keep_category_links)
         }
-        _ => render_block_container(ch, in_blockquote),
+        _ => render_block_container(ch, in_blockquote, keep_category_links),
     }
 }
 
@@ -1179,11 +1232,13 @@ pub(crate) fn block_md(ch: NodeRef, in_blockquote: bool) -> String {
 /// blank lines). A non-empty `key_facts` block is emitted structurally
 /// immediately before the first heading (or at the end for lead-only
 /// pages). `in_blockquote` keeps <br>-separated paragraph lines within one
-/// quote paragraph.
+/// quote paragraph. `keep_category_links` is the category page's
+/// member-section flag (see [`list_item_lines_ctx`]).
 pub(crate) fn block_children_md(
     el: NodeRef,
     key_facts: Option<&str>,
     in_blockquote: bool,
+    keep_category_links: bool,
 ) -> String {
     let mut out: Vec<String> = Vec::new();
     let mut key_facts_pending = key_facts.filter(|k| !k.is_empty());
@@ -1199,7 +1254,7 @@ pub(crate) fn block_children_md(
             out.push(kf.to_string());
             key_facts_pending = None;
         }
-        let md = block_md(ch, in_blockquote);
+        let md = block_md_in(ch, in_blockquote, keep_category_links);
         if !md.is_empty() {
             out.push(md);
         }
@@ -1281,6 +1336,20 @@ fn is_category_target(target: &str) -> bool {
         .is_some_and(|(head, _)| head.to_lowercase() == "category")
 }
 
+/// The category page's member/subcategory section: div.mw-category-generated,
+/// a sibling of div.mw-parser-output (both under #mw-content-text) and so
+/// OUTSIDE the render root. Real category pages carry it whenever they list
+/// subcategories or members (empty ones, which mwoffliner does not ship, have
+/// no lists and no section); located by the class token, present on every
+/// member-listing category page in the archive.
+fn category_generated_id(dom: &Dom) -> Option<crate::htmldom::NodeId> {
+    dom.root()
+        .descendants()
+        .into_iter()
+        .find(|el| el.is_element() && el.has_class("mw-category-generated"))
+        .map(|el| el.id())
+}
+
 /// The page's normal categories as a '## Categories' section ('' when the
 /// page has none or carries no catlinks bar): one wikilink bullet per
 /// anchor of #mw-normal-catlinks (hidden categories stay excluded), in
@@ -1330,11 +1399,13 @@ fn categories_section(root: NodeRef, lang: Option<&str>) -> String {
 
 /// Render the article body around the already-located container: Parsoid
 /// sections flattened, blocks rendered, sections assembled, title line
-/// prepended, the categories section appended and the cleanup pass applied.
+/// prepended, the category page's member section (when rendering) and the
+/// categories section appended, and the cleanup pass applied.
 fn render_article(
     mut dom: Dom,
     body: crate::htmldom::NodeId,
     key_facts: String,
+    category_generated: Option<crate::htmldom::NodeId>,
     categories: String,
     title: Option<&str>,
     lang: Option<&str>,
@@ -1344,8 +1415,20 @@ fn render_article(
         dom.ref_(body),
         if key_facts.is_empty() { None } else { Some(&key_facts) },
         false,
+        false,
     );
     let content = cleanup::assemble(&body_md, lang);
+    // The category page's member/subcategory section renders through the
+    // same block walker as the body: its own <h2>Subcategories</h2> /
+    // <h2>Pages in category "…"</h2> become '## ' headings and its
+    // mw-category-group <ul><li><a> lists become the normal wikilink
+    // bullets (member hrefs are bare paths, subcategory ones
+    // ./Category:… — split_href handles both). DOM order also puts it
+    // before the catlinks bar, so the generated section is appended before
+    // the '## Categories' section below.
+    let generated = category_generated
+        .map(|id| block_children_md(dom.ref_(id), None, false, true))
+        .unwrap_or_default();
     let title = title.map(|t| t.to_string()).or_else(|| first_h1_title(&dom));
     let mut parts: Vec<String> = Vec::new();
     if let Some(t) = &title {
@@ -1353,6 +1436,9 @@ fn render_article(
     }
     if !content.trim().is_empty() {
         parts.push(content);
+    }
+    if !generated.trim().is_empty() {
+        parts.push(generated);
     }
     if !categories.is_empty() {
         parts.push(categories);
@@ -1375,7 +1461,13 @@ fn render_article(
 /// select French) localizes the '## Key facts' heading and the dropped
 /// boilerplate sections. `include_categories` opt-in appends a localized
 /// '## Categories' section listing the page's normal categories after the
-/// body content.
+/// body content. It also renders category pages usefully: their member and
+/// subcategory lists live in a sibling div.mw-category-generated outside
+/// the render root and are dropped with the flag off (the page renders
+/// title/description-only, like zim2zim.py); with the flag on that section
+/// renders through the normal block walker — its own '## Subcategories' and
+/// '## Pages in category "…"' headings and wikilink lists — placed before
+/// the '## Categories' section, in DOM order.
 pub fn html_to_md(
     html_str: &str,
     title: Option<&str>,
@@ -1386,6 +1478,10 @@ pub fn html_to_md(
     let key_facts = key_facts_of(&dom, lang);
     let categories =
         if include_categories { categories_section(dom.root(), lang) } else { String::new() };
+    // The category page's member section: its node id must be located
+    // before `dom` moves into render_article (only rendered when the flag
+    // is on — the page's lists live outside the render root).
+    let category_generated = if include_categories { category_generated_id(&dom) } else { None };
     // The wiki article container, else the page's <body>.
     let wiki_body = get_parser_output(dom.root()).map(|b| b.id());
     let body =
@@ -1408,7 +1504,15 @@ pub fn html_to_md(
             }
         }
     }
-    render_article(dom, body, key_facts, categories, title.as_deref(), lang)
+    render_article(
+        dom,
+        body,
+        key_facts,
+        category_generated,
+        categories,
+        title.as_deref(),
+        lang,
+    )
 }
 
 #[cfg(test)]
@@ -1813,6 +1917,311 @@ mod tests {
     fn without_catlinks_bar_no_section() {
         let md = wiki_doc_with_tail("<p>Body.</p>", "", None, true);
         assert_eq!(md, "# T\n\nBody.\n");
+    }
+
+    // The category page's member section (div.mw-category-generated, a sibling
+    // of div.mw-parser-output outside the render root). Real structures
+    // probed in the archive (e.g. Category:2018 in men's international
+    // association football, cluster 2; Category:1957 Hindi-language films,
+    // cluster 40).
+
+    /// mwoffliner's JS-pagination placeholder pair around a category list
+    /// (one div before it, one after).
+    fn cat_pagination() -> &'static str {
+        "<div class=\"mwo-cat-pagination\"><span class=\"mwo-no-js\">Next items are not visible in browsers without Javascript</span><span class=\"mwo-js\"></span></div>"
+    }
+
+    /// The mw-category-generated section as the archive's category pages
+    /// carry it: #mw-subcategories and #mw-pages blocks, each with its own
+    /// <h2>, count paragraph, pagination noise and a
+    /// mw-content-ltr > mw-category > mw-category-group(h3 + ul) list tree,
+    /// plus the closing reduced-ZIM note. Subcategory hrefs are
+    /// percent-encoded Category%3A… links, member hrefs bare underscored
+    /// paths — both carry target="_parent".
+    fn cat_generated() -> String {
+        let pag = cat_pagination();
+        [
+            "<div class=\"mw-category-generated\">",
+            "<div id=\"mw-subcategories\">",
+            "<h2>Subcategories</h2>",
+            "<p>This category has the following 2 subcategories, out of 2 total.</p>",
+            pag,
+            "<div class=\"mw-content-ltr\"><div class=\"mw-category\">",
+            // a non-letter group key carries an &nbsp;-only <h3> header
+            "<div class=\"mw-category-group\"><h3>&nbsp;</h3><ul>",
+            "<li><a target=\"_parent\" href=\"Category%3A1957_films_by_country\" title=\"Category:1957 films by country\">1957 films by country</a></li>",
+            "</ul></div>",
+            "<div class=\"mw-category-group\"><h3>C</h3><ul>",
+            "<li><a target=\"_parent\" href=\"./Category:Comedy_films_of_1957\" title=\"Category:Comedy films of 1957\">Comedy films of 1957</a></li>",
+            "<li><a target=\"_parent\" href=\"Category%3ACrime_films_of_1957\" title=\"Category:Crime films of 1957\">Crime films of 1957</a></li>",
+            "</ul></div></div></div>",
+            pag,
+            "</div>",
+            "<div id=\"mw-pages\">",
+            "<h2>Pages in category \"1957 Hindi-language films\"</h2>",
+            "<p>The following 2 pages are in this category, out of 2 total.</p>",
+            pag,
+            "<div class=\"mw-content-ltr\"><div class=\"mw-category\">",
+            "<div class=\"mw-category-group\"><h3>A</h3><ul>",
+            "<li><a target=\"_parent\" href=\"Aag_(1957_film)\" title=\"Aag (1957 film)\">Aag (1957 film)</a></li>",
+            "</ul></div>",
+            "<div class=\"mw-category-group\"><h3>M</h3><ul>",
+            "<li><a target=\"_parent\" href=\"Mother_India\" title=\"Mother India\">Mother India</a></li>",
+            "</ul></div></div></div>",
+            pag,
+            "</div>",
+            "<p><em>This category content has been reduced to only pages contained in the ZIM file.</em></p>",
+            "</div>",
+        ]
+        .concat()
+    }
+
+    /// A two-entry normal-catlinks bar for the fixture's tail.
+    fn cat_bar_local() -> String {
+        [
+            "<div id=\"catlinks\" class=\"catlinks\">",
+            "<div id=\"mw-normal-catlinks\" class=\"mw-normal-catlinks\">Categories: <ul>",
+            "<li><a href=\"Category%3A1957_films\" title=\"Category:1957 films\">1957 films</a></li>",
+            "<li><a href=\"Category%3A1957_films_by_language\" title=\"Category:1957 films by language\">1957 films by language</a></li>",
+            "</ul></div></div>",
+        ]
+        .concat()
+    }
+
+    /// Category-page shell: `inner` inside div.mw-parser-output followed by
+    /// `tail` (the mw-category-generated section and the catlinks bar sit
+    /// there, outside the render root), rendered under the page's real title.
+    fn category_doc(
+        title: &str,
+        inner: &str,
+        tail: &str,
+        lang: Option<&str>,
+        include_categories: bool,
+    ) -> String {
+        html_to_md(
+            &format!(
+                "<html><body class=\"ns-14 ns-subject\"><div id=\"mw-content-text\"><div class=\"mw-parser-output\">{}</div>{}</div></body></html>",
+                inner, tail
+            ),
+            Some(title),
+            lang,
+            include_categories,
+        )
+    }
+
+    /// (a) Subcategories + members + description, flag on: the section's own
+    /// Subcategories / Pages-in-category headings render as '## ' headings
+    /// with the count paragraphs and the wikilink bullet lists (the
+    /// &nbsp;-keyed TOC group header renders nothing), the reduced-ZIM note
+    /// renders as an italic paragraph, and the section precedes the
+    /// '## Categories' bar in DOM order.
+    #[test]
+    fn category_page_with_subcategories_members_and_description() {
+        let md = category_doc(
+            "Category:1957 Hindi-language films",
+            "<p>This category is for <b><a rel=\"mw:WikiLink\" href=\"Hindi_language\" title=\"Hindi language\" class=\"mw-redirect\">Hindi-language</a></b> <b><a rel=\"mw:WikiLink\" href=\"Film\" title=\"Film\">films</a></b>.</p>",
+            &format!("{}{}", cat_generated(), cat_bar_local()),
+            None,
+            true,
+        );
+        assert_eq!(
+            md,
+            concat!(
+                "# Category:1957 Hindi-language films\n\n",
+                "This category is for **[[Hindi language|Hindi-language]]** **[[Film|films]]**.\n\n",
+                "## Subcategories\n\n",
+                "This category has the following 2 subcategories, out of 2 total.\n\n",
+                "- [[Category:1957 films by country|1957 films by country]]\n\n",
+                "### C\n\n",
+                "- [[Category:Comedy films of 1957|Comedy films of 1957]]\n",
+                "- [[Category:Crime films of 1957|Crime films of 1957]]\n\n",
+                "## Pages in category \"1957 Hindi-language films\"\n\n",
+                "The following 2 pages are in this category, out of 2 total.\n\n",
+                "### A\n\n",
+                "- [[Aag (1957 film)]]\n\n",
+                "### M\n\n",
+                "- [[Mother India]]\n\n",
+                "*This category content has been reduced to only pages contained in the ZIM file.*\n\n",
+                "## Categories\n\n",
+                "- [[Category:1957 films|1957 films]]\n",
+                "- [[Category:1957 films by language|1957 films by language]]\n"
+            )
+        );
+        // the JS-pagination placeholders never leak into the output
+        assert!(!md.contains("Next items"), "{md}");
+        assert!(!md.contains("mwo-"), "{md}");
+    }
+
+    /// (b) Members only, no description: the parse-output root is empty, so
+    /// the pages block renders right under the title.
+    #[test]
+    fn members_only_category_page() {
+        let generated = concat!(
+            "<div class=\"mw-category-generated\">",
+            "<div id=\"mw-pages\">",
+            "<h2>Pages in category \"Cinematographers from Georgia (country)\"</h2>",
+            "<p>This category contains only the following page.</p>",
+            "<div class=\"mw-content-ltr\"><div class=\"mw-category\">",
+            "<div class=\"mw-category-group\"><h3>A</h3><ul>",
+            "<li><a target=\"_parent\" href=\"Vasil_Amashukeli\" title=\"Vasil Amashukeli\">Vasil Amashukeli</a></li>",
+            "</ul></div></div></div>",
+            "</div>",
+            "<p><em>This category content has been reduced to only pages contained in the ZIM file.</em></p>",
+            "</div>"
+        );
+        let md = category_doc(
+            "Category:Cinematographers from Georgia (country)",
+            "",
+            generated,
+            None,
+            true,
+        );
+        assert_eq!(
+            md,
+            concat!(
+                "# Category:Cinematographers from Georgia (country)\n\n",
+                "## Pages in category \"Cinematographers from Georgia (country)\"\n\n",
+                "This category contains only the following page.\n\n",
+                "### A\n\n",
+                "- [[Vasil Amashukeli]]\n\n",
+                "*This category content has been reduced to only pages contained in the ZIM file.*\n"
+            )
+        );
+    }
+
+    /// (iii) Subcategories only (no #mw-pages block; shape probed on
+    /// Category:Fencing in North America by country, cluster 2): the
+    /// section renders under its own heading, alone.
+    #[test]
+    fn subcategories_only_category_page() {
+        let generated = concat!(
+            "<div class=\"mw-category-generated\">",
+            "<div id=\"mw-subcategories\">",
+            "<h2>Subcategories</h2>",
+            "<p>This category has the following 2 subcategories, out of 2 total.</p>",
+            "<div class=\"mw-content-ltr\"><div class=\"mw-category\">",
+            "<div class=\"mw-category-group\"><h3>C</h3><ul>",
+            "<li><a target=\"_parent\" href=\"Category%3AFencing_in_Canada\" title=\"Category:Fencing in Canada\">Fencing in Canada</a></li>",
+            "</ul></div></div></div>",
+            "</div>",
+            "<p><em>This category content has been reduced to only pages contained in the ZIM file.</em></p>",
+            "</div>"
+        );
+        let md = category_doc(
+            "Category:Fencing in North America by country",
+            "",
+            generated,
+            None,
+            true,
+        );
+        assert_eq!(
+            md,
+            concat!(
+                "# Category:Fencing in North America by country\n\n",
+                "## Subcategories\n\n",
+                "This category has the following 2 subcategories, out of 2 total.\n\n",
+                "### C\n\n",
+                "- [[Category:Fencing in Canada|Fencing in Canada]]\n\n",
+                "*This category content has been reduced to only pages contained in the ZIM file.*\n"
+            )
+        );
+    }
+
+    /// (c) An empty category (no member/subcategory section — MediaWiki
+    /// emits no lists and the archive ships no such page; the parser-output
+    /// root is empty too) stays a no-content page: title only, flag on or
+    /// off. A section reduced to pagination noise alone renders nothing.
+    #[test]
+    fn empty_category_page_stays_title_only() {
+        let md = wiki_doc_with_tail("", "", None, true);
+        assert_eq!(md, "# T\n");
+        let md = wiki_doc_with_tail("", "", None, false);
+        assert_eq!(md, "# T\n");
+        let md = wiki_doc_with_tail("", cat_pagination(), None, true);
+        assert_eq!(md, "# T\n");
+        let md = wiki_doc_with_tail(
+            "",
+            &format!("<div class=\"mw-category-generated\">{}</div>", cat_pagination()),
+            None,
+            true,
+        );
+        assert_eq!(md, "# T\n");
+    }
+
+    /// (d) Flag off on a full category page: byte-identical to the
+    /// pre-member-section output — title and description only, the
+    /// mw-category-generated section dropped with the rest of the page
+    /// furniture (parity with zim2zim.py's title-only category pages).
+    #[test]
+    fn category_page_flag_off_is_byte_identical() {
+        let md = category_doc(
+            "Category:1957 Hindi-language films",
+            "<p>This category is for <b><a rel=\"mw:WikiLink\" href=\"Hindi_language\" title=\"Hindi language\" class=\"mw-redirect\">Hindi-language</a></b> <b><a rel=\"mw:WikiLink\" href=\"Film\" title=\"Film\">films</a></b>.</p>",
+            &format!("{}{}", cat_generated(), cat_bar_local()),
+            None,
+            false,
+        );
+        assert_eq!(
+            md,
+            "# Category:1957 Hindi-language films\n\n\
+             This category is for **[[Hindi language|Hindi-language]]** **[[Film|films]]**.\n"
+        );
+    }
+
+    /// Member-section lists render through the normal list walker, so the
+    /// anchor rules hold verbatim: `./Category:…` and percent-encoded hrefs
+    /// both fold to `[[Category:…|label]]`, a label equal to the full
+    /// category title renders the bare `[[Category:…]]` form, and member
+    /// links fold underscores (label==target -> bare).
+    #[test]
+    fn member_section_link_shapes_render_through_the_list_walker() {
+        let generated = concat!(
+            "<div class=\"mw-category-generated\">",
+            "<div id=\"mw-subcategories\"><h2>Subcategories</h2>",
+            "<div class=\"mw-content-ltr\"><div class=\"mw-category\">",
+            "<div class=\"mw-category-group\"><h3>C</h3><ul>",
+            "<li><a target=\"_parent\" href=\"./Category:Comedy_films_of_1957\">Comedy films of 1957</a></li>",
+            "<li><a target=\"_parent\" href=\"Category%3A1957_films\">Category:1957 films</a></li>",
+            "<li><a target=\"_parent\" href=\"Category%3ACrime_films_of_1957\" title=\"Category:Crime films of 1957\">Crime films of 1957</a></li>",
+            "</ul></div></div></div></div>",
+            "<div id=\"mw-pages\"><div class=\"mw-content-ltr\"><div class=\"mw-category\">",
+            "<div class=\"mw-category-group\"><h3>A</h3><ul>",
+            "<li><a target=\"_parent\" href=\"Aag_(1957_film)\">Aag (1957 film)</a></li>",
+            "<li><a target=\"_parent\" href=\"Mother_India\">Mother India</a></li>",
+            "</ul></div></div></div></div>",
+            "</div>"
+        );
+        let md = wiki_doc_with_tail("", generated, None, true);
+        assert_eq!(
+            md,
+            concat!(
+                "# T\n\n",
+                "## Subcategories\n\n",
+                "### C\n\n",
+                "- [[Category:Comedy films of 1957|Comedy films of 1957]]\n",
+                "- [[Category:1957 films]]\n",
+                "- [[Category:Crime films of 1957|Crime films of 1957]]\n\n",
+                "### A\n\n",
+                "- [[Aag (1957 film)]]\n",
+                "- [[Mother India]]\n"
+            )
+        );
+    }
+
+    /// The non-letter TOC group key renders as an &nbsp;-only <h3>: an empty
+    /// heading renders nothing instead of a bare `###` line.
+    #[test]
+    fn non_letter_toc_group_header_renders_nothing() {
+        let generated = concat!(
+            "<div class=\"mw-category-generated\">",
+            "<div id=\"mw-pages\">",
+            "<div class=\"mw-category\">",
+            "<div class=\"mw-category-group\"><h3>&nbsp;</h3><ul>",
+            "<li><a target=\"_parent\" href=\"Aag_(1957_film)\">Aag (1957 film)</a></li>",
+            "</ul></div></div></div></div>"
+        );
+        let md = wiki_doc_with_tail("", generated, None, true);
+        assert_eq!(md, "# T\n\n- [[Aag (1957 film)]]\n");
     }
 
     /// The French archive language localizes the section heading.
