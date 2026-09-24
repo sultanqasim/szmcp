@@ -921,19 +921,19 @@ fn convert_article_html(
 /// gives recreated redirects and no-content pages (title-only or title plus
 /// one bare wikilink — never fulltext-indexed) their title-index documents
 /// (the default excludes them, zim2zim's --no-redirect-titles behavior);
-/// `include_categories` keeps MediaWiki category pages (ns-14 body class) in
-/// the output — they convert to markdown with their Subcategories/
-/// Pages-in-category sections and articles gain the localized Categories
-/// section. The default omits category pages entirely (no blob, no dirent;
-/// redirects pointing at them dangle and are dropped) though they still
-/// count as processed walk items.
+/// `exclude_categories` omits MediaWiki category pages (ns-14 body class)
+/// from the output entirely — no blob, no dirent; redirects pointing at
+/// them dangle and are dropped — though they still count as processed walk
+/// items. The default keeps them: they convert to markdown with their
+/// Subcategories/Pages-in-category sections and articles gain the
+/// localized Categories section.
 pub fn convert(
     zimfile: &Path,
     outfile: &Path,
     limit: i64,
     index_intro_only: bool,
     index_redirect_titles: bool,
-    include_categories: bool,
+    exclude_categories: bool,
 ) -> Result<(), String> {
     let t0 = Instant::now();
     eprintln!("Opening source ZIM: {}", zimfile.display());
@@ -1261,13 +1261,15 @@ pub fn convert(
                         }
                     };
                     // A category page (the language-agnostic ns-14 body-class
-                    // marker) is omitted ENTIRELY unless --include-categories
-                    // was given: no conversion, no blob add, no dirent — its
-                    // record stays zero, so it is not a member and redirects
+                    // marker) is omitted ENTIRELY under --exclude-categories:
+                    // no conversion, no blob add, no dirent — its record
+                    // stays zero, so it is not a member and redirects
                     // pointing at it dangle and are dropped. The no-content
                     // logic below can never see it, and the item already
-                    // counted as processed above.
-                    if !include_categories && is_category_page(&html) {
+                    // counted as processed above. By default the page
+                    // converts like any other article (member lists and
+                    // all) and is indexed like one.
+                    if exclude_categories && is_category_page(&html) {
                         continue;
                     }
                     let Some(md) = convert_article_html(
@@ -1275,7 +1277,7 @@ pub fn convert(
                         &item_path,
                         &title,
                         &conv_lang,
-                        include_categories,
+                        !exclude_categories,
                     )?
                     else {
                         shared.failed.fetch_add(1, Ordering::Relaxed);
@@ -1741,12 +1743,12 @@ mod e2e {
         zim: Zim,
     }
 
-    fn convert_fixture(limit: i64, intro_only: bool, redirect_titles: bool, include_categories: bool) -> Converted {
+    fn convert_fixture(limit: i64, intro_only: bool, redirect_titles: bool, exclude_categories: bool) -> Converted {
         let dir = tempfile::tempdir().unwrap();
         let src = dir.path().join("src.zim");
         std::fs::write(&src, fixture()).unwrap();
         let out = dir.path().join("out.zim");
-        convert(&src, &out, limit, intro_only, redirect_titles, include_categories).unwrap();
+        convert(&src, &out, limit, intro_only, redirect_titles, exclude_categories).unwrap();
         let zim = Zim::open(&out).unwrap();
         Converted { _dir: dir, zim }
     }
@@ -1833,12 +1835,15 @@ mod e2e {
         )
     }
 
-    fn convert_category_fixture(include_categories: bool) -> Converted {
+    /// Converts the category fixture; `exclude_categories` selects the
+    /// omission mode (--exclude-categories), the default converts the
+    /// category page like any article.
+    fn convert_category_fixture(exclude_categories: bool) -> Converted {
         let dir = tempfile::tempdir().unwrap();
         let src = dir.path().join("src.zim");
         std::fs::write(&src, category_fixture()).unwrap();
         let out = dir.path().join("out.zim");
-        convert(&src, &out, -1, false, false, include_categories).unwrap();
+        convert(&src, &out, -1, false, false, exclude_categories).unwrap();
         let zim = Zim::open(&out).unwrap();
         Converted { _dir: dir, zim }
     }
@@ -2277,12 +2282,12 @@ mod e2e {
     }
 
     #[test]
-    fn category_pages_are_omitted_by_default() {
-        // No --include-categories: the category page (ns-14 body class) is
+    fn exclude_categories_omits_category_pages() {
+        // --exclude-categories: the category page (ns-14 body class) is
         // absent from the output entirely — no dirent, so the redirect
         // pointing at it dangles and is dropped too — and the article keeps
         // no Categories section.
-        let c = convert_category_fixture(false);
+        let c = convert_category_fixture(true);
         let z = &c.zim;
         assert!(z.resolve_path("C/Category:Fruits").unwrap().is_none());
         assert!(z.resolve_path("C/All_fruits").unwrap().is_none());
@@ -2299,13 +2304,13 @@ mod e2e {
     }
 
     #[test]
-    fn include_categories_keeps_and_converts_category_pages() {
-        let c = convert_category_fixture(true);
+    fn category_pages_convert_and_index_by_default() {
+        // Default (no --exclude-categories): the category page converts to
+        // text/markdown; its generated member section renders with the real
+        // pages' Subcategories / Pages in category headings and the member
+        // wikilink bullets.
+        let c = convert_category_fixture(false);
         let z = &c.zim;
-
-        // The category page converts to text/markdown; its generated member
-        // section renders with the real pages' Subcategories / Pages in
-        // category headings and the member wikilink bullets.
         let cat_idx = z.resolve_path("C/Category:Fruits").unwrap().unwrap();
         let cat_entry = z.get_entry(cat_idx).unwrap();
         assert_eq!(z.mime_type(cat_entry.mime), Some("text/markdown"));

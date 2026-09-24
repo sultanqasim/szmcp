@@ -81,10 +81,12 @@ fn markdown_title(article: &crate::zim::Article) -> String {
 /// does: infoboxes as a '## Key facts' block, localized by the archive's
 /// language metadata (English default). Pages without a wiki article body
 /// (scraped non-wiki ZIMs) render from their <body> element instead, so
-/// every text/html entry converts.
+/// every text/html entry converts. Categories are included: articles gain
+/// the localized '## Categories' section and category pages render with
+/// their member lists.
 fn convert_html(arc: &Archive, article: &crate::zim::Article, html: &str) -> String {
     let lang = arc.language().unwrap_or_else(|| "eng".to_string());
-    html2md::html_to_md(html, Some(&markdown_title(article)), Some(&lang), false)
+    html2md::html_to_md(html, Some(&markdown_title(article)), Some(&lang), true)
 }
 
 #[derive(Serialize, JsonSchema)]
