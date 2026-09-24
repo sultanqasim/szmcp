@@ -463,7 +463,7 @@ const CHUNK_ENTRIES: u64 = 512;
 /// only writes on commit, so this bounds the uncommitted glass buffers
 /// (tens of KB per document) while keeping the number of flush/merge
 /// passes — and their write amplification — low.
-const COMMIT_EVERY: u64 = 50_000;
+const COMMIT_EVERY: u64 = 250_000;
 
 /// Progress-line interval (carriage-return overwrite, zim2zim style).
 const STATUS_EVERY: u64 = 1_000;
