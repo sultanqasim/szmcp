@@ -13,16 +13,18 @@
 //! member dirents in source order and builds the title-ordered listing.
 //! Every entry is converted (text/html → markdown), recreated (redirect
 //! resolving to a converted article) or skipped and tallied by MIME.
-//! Document order inside the Xapian databases is nondeterministic (the
-//! parallel adds race like libzim's workers); both sides are equivalent as
-//! sets keyed by document data.
+//! Indexing runs on a dedicated thread fed by a bounded document queue, so
+//! document order inside the Xapian databases is nondeterministic (FIFO of
+//! worker completion — the parallel adds race like libzim's workers); both
+//! sides are equivalent as sets keyed by document data.
 
 use crate::zim::{Target, Zim};
 use crate::zimcommon::MIME_REDIRECT;
 use crate::zimwrite::{BlobRef, DirentOut, ZimCreator};
+use std::collections::VecDeque;
 use std::path::Path;
 use std::sync::atomic::{AtomicU32, AtomicU64, AtomicU8, Ordering};
-use std::sync::Mutex;
+use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::time::Instant;
 use xapian2::{
     Document, Stem, StemStrategy, TermGenerator, WritableDatabase,
@@ -251,8 +253,8 @@ impl IndexLang {
 ///
 /// The document builds WITHOUT the database: the TermGenerator/Document FFI
 /// never touches the WDB pointer (exactly libzim's own worker design, which
-/// indexes into Document objects on worker threads), so pass-1 workers
-/// build outside the mutex and only `add_document` serializes.
+/// indexes into Document objects on worker threads), so pass-1 workers build
+/// outside any lock and ship the finished documents to the indexer thread.
 fn build_fulltext_document(
     lang: &IndexLang,
     path: &str,
@@ -558,7 +560,8 @@ impl<'a> Rank<'a> {
 /// records stored by the pre-pass, and `articles_done`/`articles_total` is
 /// the walk's per-article progress.
 /// `ft_docs` IS the converted-article count: every successful conversion
-/// adds exactly one fulltext document.
+/// adds exactly one fulltext document, and only the indexer thread
+/// increments `ft_docs`/`ti_docs`.
 #[derive(Default)]
 struct Shared {
     next: AtomicU64,
@@ -568,8 +571,10 @@ struct Shared {
     articles_total: u64,
     failed: AtomicU64,
     md_bytes: AtomicU64,
-    ft_docs: AtomicU64,
-    ti_docs: AtomicU64,
+    // Arc so the dedicated indexer thread (plain-spawned, not scoped) can
+    // own clones by value; it is the only writer of both counters.
+    ft_docs: Arc<AtomicU64>,
+    ti_docs: Arc<AtomicU64>,
     /// Skipped-entry counts indexed by MIME id, sized to the archive's MIME
     /// list; `skipped_unknown` counts entries whose id is past the list.
     skipped: Vec<AtomicU64>,
@@ -643,6 +648,161 @@ fn run_task_workers<T: Sync>(
         Some(e) => Err(e),
         None => Ok(()),
     }
+}
+
+/// Document-queue cap: at most this many built articles' documents wait for
+/// the indexer thread, bounding the queue's RAM (backpressure) while the
+/// walk stays ahead of the index adds.
+const DOC_QUEUE_CAP: usize = 2000;
+
+/// State under [`DocQueue`]'s mutex.
+struct QueueState {
+    /// Built (fulltext, title) document pairs with the article path (for
+    /// error messages), in worker-completion order.
+    docs: VecDeque<(Document, Document, String)>,
+    /// No more documents will arrive (the walk joined, or the indexer
+    /// stopped on its first error).
+    closed: bool,
+    /// The indexer's first add/commit error (the queue closes with it).
+    error: Option<String>,
+}
+
+/// The bounded channel between the walk workers and the dedicated indexer
+/// thread (same Mutex+Condvar shape as zimwrite's compression pool): workers
+/// block while full (backpressure), the indexer blocks while empty, `close`
+/// releases a drained queue, and the indexer's first error closes it so
+/// every waiting worker aborts instead of hanging.
+struct DocQueue {
+    state: Mutex<QueueState>,
+    wake: Condvar,
+}
+
+impl DocQueue {
+    fn new() -> Self {
+        DocQueue {
+            state: Mutex::new(QueueState {
+                docs: VecDeque::new(),
+                closed: false,
+                error: None,
+            }),
+            wake: Condvar::new(),
+        }
+    }
+
+    /// Lock, recovering from a poisoned mutex: a panic must not turn the
+    /// error path into a hang.
+    fn lock(&self) -> MutexGuard<'_, QueueState> {
+        self.state.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Queue one article's documents. Blocks while the queue is full; fails
+    /// fast with the indexer's error once it has stopped.
+    fn push(&self, ft_doc: Document, ti_doc: Document, path: String) -> Result<(), String> {
+        let mut st = self.lock();
+        loop {
+            if let Some(e) = &st.error {
+                return Err(e.clone());
+            }
+            if st.closed {
+                return Err("indexer stopped unexpectedly".to_string());
+            }
+            if st.docs.len() < DOC_QUEUE_CAP {
+                break;
+            }
+            st = self.wake.wait(st).unwrap_or_else(|e| e.into_inner());
+        }
+        st.docs.push_back((ft_doc, ti_doc, path));
+        drop(st);
+        self.wake.notify_all();
+        Ok(())
+    }
+
+    /// Take the next document pair; `None` once the queue is closed and
+    /// drained (the indexer's exit condition).
+    fn pop(&self) -> Option<(Document, Document, String)> {
+        let mut st = self.lock();
+        loop {
+            if let Some(doc) = st.docs.pop_front() {
+                drop(st);
+                self.wake.notify_all(); // a queue slot freed (backpressure waiters)
+                return Some(doc);
+            }
+            if st.closed {
+                return None;
+            }
+            st = self.wake.wait(st).unwrap_or_else(|e| e.into_inner());
+        }
+    }
+
+    /// No more documents will arrive (the walk's join is done). Idempotent.
+    fn close(&self) {
+        self.lock().closed = true;
+        self.wake.notify_all();
+    }
+
+    /// Record the indexer's first error and stop the queue: every waiting
+    /// worker wakes and aborts with it.
+    fn fail(&self, error: String) {
+        let mut st = self.lock();
+        if st.error.is_none() {
+            st.error = Some(error);
+        }
+        st.closed = true;
+        drop(st);
+        self.wake.notify_all();
+    }
+}
+
+/// The dedicated indexer thread's body: owns both WritableDatabases for the
+/// whole walk, drains the document queue (FIFO of worker completion),
+/// increments the document counters and paces commits every
+/// [`COMMIT_EVERY`] documents exactly like the old per-worker lock scopes,
+/// then performs the final commits of both databases and hands them back to
+/// the caller. The first add/commit error stops it (the queue closes with
+/// the error, so workers abort); on error the final commits are skipped.
+fn run_indexer(
+    mut ft: WritableDatabase,
+    mut ti: WritableDatabase,
+    queue: &DocQueue,
+    ft_docs: &AtomicU64,
+    ti_docs: &AtomicU64,
+) -> (WritableDatabase, WritableDatabase, Result<(), String>) {
+    let mut error: Option<String> = None;
+    while let Some((ft_doc, ti_doc, path)) = queue.pop() {
+        if let Err(e) = ft.add_document(&ft_doc) {
+            error = Some(format!("indexing {path:?}: {e}"));
+            break;
+        }
+        let d = ft_docs.fetch_add(1, Ordering::Relaxed) + 1;
+        if d % COMMIT_EVERY == 0 {
+            if let Err(e) = ft.commit() {
+                error = Some(format!("fulltext index commit: {e}"));
+                break;
+            }
+        }
+        if let Err(e) = ti.add_document(&ti_doc) {
+            error = Some(format!("title indexing {path:?}: {e}"));
+            break;
+        }
+        let d = ti_docs.fetch_add(1, Ordering::Relaxed) + 1;
+        if d % COMMIT_EVERY == 0 {
+            if let Err(e) = ti.commit() {
+                error = Some(format!("title index commit: {e}"));
+                break;
+            }
+        }
+    }
+    if let Some(e) = error {
+        queue.fail(e.clone());
+        return (ft, ti, Err(e));
+    }
+    if let Err(e) = ft.commit() {
+        return (ft, ti, Err(format!("fulltext index commit: {e}")));
+    }
+    if let Err(e) = ti.commit() {
+        return (ft, ti, Err(format!("title index commit: {e}")));
+    }
+    (ft, ti, Ok(()))
 }
 
 /// Convert one article's resolved HTML bytes to markdown. `Ok(None)` is a
@@ -760,25 +920,25 @@ pub fn convert(
         // (xapianIndexer.cpp indexingPrelude).
         let ft_path = tmp.join("fulltext.idx");
         let ti_path = tmp.join("title.idx");
-        let ft_wdb = Mutex::new(create_index_wdb(
+        let ft_wdb = create_index_wdb(
             &tmp.join("fulltext.idx.tmp"),
             "fulltext",
             "title:0;wordcount:1;geo.position:2",
             &lang.raw,
-        )?);
-        let ti_wdb = Mutex::new(create_index_wdb(
+        )?;
+        let ti_wdb = create_index_wdb(
             &tmp.join("title.idx.tmp"),
             "title",
             "title:0;targetPath:1",
             &lang.raw,
-        )?);
+        )?;
 
         // Thread pool: N workers pulling work from a shared atomic counter
         // - fixed 512-entry chunks in the classification pre-pass, one
         // cluster task per fetch-add in the conversion walk - dynamic, so
-        // heterogeneous cores stay busy. No queues: a worker holds at most
-        // one article's working set and pushes each result through short
-        // mutex-locked adds; the mutex IS the backpressure.
+        // heterogeneous cores stay busy. Blob adds still go through short
+        // mutex-locked adds on the shared creator; index documents cross to
+        // the indexer thread through a bounded queue (see the walk below).
         let threads = std::env::var("SZMCP_CONVERT_THREADS")
             .ok()
             .and_then(|v| v.parse::<usize>().ok())
@@ -940,7 +1100,20 @@ pub fn convert(
         // compressed cluster exactly once and keeps the source reads
         // sequential. ZERO dirent reads: every path and title rides in the
         // pre-pass's string arena (borrowed below).
-        if !tasks.is_empty() {
+        //
+        // Indexing runs on ONE dedicated thread that owns both databases for
+        // the whole walk: workers build each article's documents outside any
+        // lock and ship the pair over a bounded queue — blocking while full,
+        // so neither add_document nor the every-[`COMMIT_EVERY`] commits
+        // ever stall the workers.
+        let queue = Arc::new(DocQueue::new());
+        let indexer = {
+            let queue = Arc::clone(&queue);
+            let ft_docs = Arc::clone(&shared.ft_docs);
+            let ti_docs = Arc::clone(&shared.ti_docs);
+            std::thread::spawn(move || run_indexer(ft_wdb, ti_wdb, &queue, &ft_docs, &ti_docs))
+        };
+        let walked = if !tasks.is_empty() {
             run_task_workers(threads, &shared.next, &tasks, |(cluster, items)| {
                 let compressed = z
                     .cluster_is_compressed(*cluster)
@@ -1004,12 +1177,13 @@ pub fn convert(
                         shared.failed.fetch_add(1, Ordering::Relaxed);
                         continue;
                     };
-                    // Both documents build OUTSIDE the database mutexes — the
-                    // TermGenerator/Document FFI never touches the WDB pointer
-                    // (exactly libzim's own worker design), so only add_document
-                    // serializes. Commits every [`COMMIT_EVERY`] documents bound
-                    // the uncommitted glass buffers (they hold every indexed term
-                    // in RAM until committed — tens of KB per document).
+                    // Both documents build OUTSIDE any lock — the TermGenerator/Document
+                    // FFI never touches the WDB pointer (exactly libzim's own
+                    // worker design, which indexes into Document objects on
+                    // worker threads) — then cross to the indexer thread
+                    // through the bounded queue, which blocks while full (its
+                    // backpressure) and aborts with the indexer's error once
+                    // indexing has stopped.
                     let folded_title = crate::search::fold_accents(&title);
                     let folded_content = if index_intro_only {
                         crate::search::fold_accents(&intro_for_index(&md))
@@ -1021,25 +1195,7 @@ pub fn convert(
                             .map_err(|e| format!("indexing {item_path:?}: {e}"))?;
                     let ti_doc = build_title_document(&lang, &item_path, &title, None)
                         .map_err(|e| format!("title indexing {item_path:?}: {e}"))?;
-                    {
-                        let mut wdb = ft_wdb.lock().unwrap();
-                        wdb.add_document(&ft_doc)
-                            .map_err(|e| format!("indexing {item_path:?}: {e}"))?;
-                        let d = shared.ft_docs.fetch_add(1, Ordering::Relaxed) + 1;
-                        if d % COMMIT_EVERY == 0 {
-                            wdb.commit()
-                                .map_err(|e| format!("fulltext index commit: {e}"))?;
-                        }
-                    }
-                    {
-                        let mut wdb = ti_wdb.lock().unwrap();
-                        wdb.add_document(&ti_doc)
-                            .map_err(|e| format!("title indexing {item_path:?}: {e}"))?;
-                        let d = shared.ti_docs.fetch_add(1, Ordering::Relaxed) + 1;
-                        if d % COMMIT_EVERY == 0 {
-                            wdb.commit().map_err(|e| format!("title index commit: {e}"))?;
-                        }
-                    }
+                    queue.push(ft_doc, ti_doc, item_path.to_string())?;
                     // Writer add in its own lock scope (no nesting): the
                     // record carries the blob's ref.
                     {
@@ -1058,11 +1214,25 @@ pub fn convert(
                     shared.md_bytes.fetch_add(md.len() as u64, Ordering::Relaxed);
                 }
                 Ok(())
-            })?;
-            // Final status: the join is done, so the counters are final — the last
-            // periodic line can be up to STATUS_EVERY-1 items stale. Always emit
-            // the completed state. The cursor is at column 0 here (every earlier
-            // status ends in \r or \n), so a plain eprintln overwrites it.
+            })
+        } else {
+            Ok(())
+        };
+        // The walk's join is done: close the queue and wait for the indexer
+        // to drain the remaining documents, do the final commits of both
+        // databases and hand them back. ft_docs keeps rising until then, so
+        // the final status print below must follow this join.
+        queue.close();
+        let (ft, mut ti, index_result) =
+            indexer.join().unwrap_or_else(|p| std::panic::resume_unwind(p));
+        walked?;
+        index_result?;
+        if !tasks.is_empty() {
+            // Final status: workers and indexer are done, so the counters
+            // are final — the last periodic line can be up to STATUS_EVERY-1
+            // items stale. Always emit the completed state. The cursor is at
+            // column 0 here (every earlier status ends in \r or \n), so a
+            // plain eprintln overwrites it.
             eprintln!(
                 "[{}/{}] articles: {} converted ({:.1} MB written)",
                 shared.articles_done.load(Ordering::Relaxed),
@@ -1072,12 +1242,8 @@ pub fn convert(
             );
         }
 
-        // ---- post-join: final commits; the mutexes end here and the serial
-        // rest owns both databases outright.
-        let mut ft = ft_wdb.into_inner().unwrap();
-        ft.commit().map_err(|e| format!("fulltext index commit: {e}"))?;
-        let mut ti = ti_wdb.into_inner().unwrap();
-        ti.commit().map_err(|e| format!("title index commit: {e}"))?;
+        // ---- post-join: the indexer handed both databases back with their
+        // final commits done; the serial rest owns them outright.
 
         // Membership is pure arithmetic over the record flags, no IO: an
         // article is a member iff it was written; a redirect iff its chain
