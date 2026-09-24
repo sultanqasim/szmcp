@@ -601,14 +601,17 @@ struct InlineCtx {
     keep_category_links: bool,
 }
 
+impl InlineCtx {
+    /// Inline text: verbatim when `no_escape` is set, else asterisk-escaped.
+    fn text(&self, t: &str) -> String {
+        if self.no_escape { t.to_string() } else { escape_plain_asterisks(t) }
+    }
+}
+
 /// Render one element (or text node) in inline context.
 fn render_inline(node: NodeRef, ctx: InlineCtx) -> String {
     if let NodeKind::Text(t) = node.kind() {
-        return if ctx.no_escape {
-            t.to_string()
-        } else {
-            escape_plain_asterisks(t)
-        };
+        return ctx.text(t);
     }
     if !node.is_element() || is_dropped(node) {
         return String::new();
@@ -693,13 +696,11 @@ fn render_inline(node: NodeRef, ctx: InlineCtx) -> String {
 /// leading text is handled upfront; every child's tail is consumed at the
 /// child (text nodes are tails; comments render empty but keep theirs).
 fn render_children(el: NodeRef, ctx: InlineCtx) -> String {
-    let mut out: Vec<String> = Vec::new();
+    let mut out = String::new();
     let mut last: Option<char> = None;
     if let Some(t) = el.text() {
-        out.push(if ctx.no_escape { t.to_string() } else { escape_plain_asterisks(t) });
-        if !t.is_empty() {
-            last = t.chars().last();
-        }
+        out.push_str(&ctx.text(t));
+        last = t.chars().last();
     }
     for child in el.children() {
         if child.is_text() {
@@ -717,7 +718,7 @@ fn render_children(el: NodeRef, ctx: InlineCtx) -> String {
                 && child.is_element()
                 && starts_block(child)
             {
-                out.push(" ".to_string());
+                out.push(' ');
                 last = Some(' ');
             }
         }
@@ -725,29 +726,19 @@ fn render_children(el: NodeRef, ctx: InlineCtx) -> String {
         // whitespace stranded between the surviving text and the
         // punctuation.
         if piece.is_empty() && !out.is_empty() && !tail.is_empty() && drop_boundary_punct(tail) {
-            while let Some(s) = out.last() {
-                if s.trim_matches(|c| c == ' ' || c == '\t').is_empty() {
-                    out.pop();
-                } else {
-                    break;
-                }
-            }
-            if let Some(s) = out.last_mut() {
-                let keep = s.trim_end_matches(|c| c == ' ' || c == '\t').len();
-                s.truncate(keep);
-            }
-            last = out.last().and_then(|s| s.chars().last());
+            out.truncate(out.trim_end_matches([' ', '\t']).len());
+            last = out.chars().last();
         }
         if !piece.is_empty() {
             last = piece.chars().last();
         }
-        out.push(piece);
+        out.push_str(&piece);
         if !tail.is_empty() {
-            out.push(if ctx.no_escape { tail.to_string() } else { escape_plain_asterisks(tail) });
+            out.push_str(&ctx.text(tail));
             last = tail.chars().last();
         }
     }
-    out.join("")
+    out
 }
 
 /// The link markdown around an anchor's already-rendered label: external
@@ -901,6 +892,7 @@ pub(crate) fn list_item_lines_ctx(
     };
     let indent = "  ".repeat(depth);
     let br_mode = if raw { BrMode::Keep } else { BrMode::Space };
+    let ctx = InlineCtx { no_escape: raw, br_mode, keep_category_links, ..Default::default() };
     let mut out: Vec<String> = Vec::new();
     for li in list_el.children() {
         if li.tag() != Some("li") || is_dropped(li) {
@@ -911,7 +903,7 @@ pub(crate) fn list_item_lines_ctx(
         for ch in li.children() {
             match ch.kind() {
                 NodeKind::Text(t) => {
-                    parts.push(if raw { t.to_string() } else { escape_plain_asterisks(t) });
+                    parts.push(ctx.text(t));
                 }
                 NodeKind::Element { .. }
                     if matches!(ch.tag(), Some("ul") | Some("ol")) && !is_dropped(ch) =>
@@ -919,15 +911,7 @@ pub(crate) fn list_item_lines_ctx(
                     subs.push(ch);
                 }
                 NodeKind::Element { .. } => {
-                    parts.push(render_inline(
-                        ch,
-                        InlineCtx {
-                            no_escape: raw,
-                            br_mode,
-                            keep_category_links,
-                            ..Default::default()
-                        },
-                    ));
+                    parts.push(render_inline(ch, ctx));
                 }
                 _ => {}
             }
