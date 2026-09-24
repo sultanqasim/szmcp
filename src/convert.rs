@@ -1140,10 +1140,9 @@ pub fn convert(
                         // \r, not \n: the next status overwrites this one; the
                         // epilogue after the join submits the final newline.
                         eprint!(
-                            "[{}/{}] articles: {} converted ({:.1} MB written)\r",
+                            "[{}/{}] processed ({:.1} MB written)\r",
                             n + 1,
                             shared.articles_total,
-                            shared.ft_docs.load(Ordering::Relaxed),
                             shared.md_bytes.load(Ordering::Relaxed) as f64 / 1e6
                         );
                     }
@@ -1241,7 +1240,7 @@ pub fn convert(
         // The walk's join is done: close the queue and wait for the indexer
         // to drain the remaining documents, do the final commits of both
         // databases and hand them back. ft_docs keeps rising until then, so
-        // the final status print below must follow this join.
+        // the summary below must follow this join.
         queue.close();
         let (ft, mut ti, index_result) =
             indexer.join().unwrap_or_else(|p| std::panic::resume_unwind(p));
@@ -1254,10 +1253,9 @@ pub fn convert(
             // column 0 here (every earlier status ends in \r or \n), so a
             // plain eprintln overwrites it.
             eprintln!(
-                "[{}/{}] articles: {} converted ({:.1} MB written)",
+                "[{}/{}] processed ({:.1} MB written)",
                 shared.articles_done.load(Ordering::Relaxed),
                 shared.articles_total,
-                shared.ft_docs.load(Ordering::Relaxed),
                 shared.md_bytes.load(Ordering::Relaxed) as f64 / 1e6
             );
         }
