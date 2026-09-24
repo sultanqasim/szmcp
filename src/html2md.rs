@@ -973,8 +973,7 @@ pub(crate) fn render_dl(el: NodeRef, depth: usize) -> String {
 pub(crate) fn render_dl_ctx(el: NodeRef, depth: usize, keep_category_links: bool) -> String {
     let mut out: Vec<String> = Vec::new();
     let indent = "  ".repeat(depth);
-    let mut last_term: Option<String> = None;
-    let mut term_has_def = false;
+    let mut open_term: Option<usize> = None;
     for ch in el.children() {
         if !ch.is_element() || is_dropped(ch) {
             continue;
@@ -982,10 +981,10 @@ pub(crate) fn render_dl_ctx(el: NodeRef, depth: usize, keep_category_links: bool
         match ch.tag() {
             Some("dt") => {
                 let term = inline_text_keep(ch, keep_category_links).trim().to_string();
-                last_term = Some(term.clone());
-                term_has_def = false;
+                open_term = None;
                 if !term.is_empty() {
                     out.push(format!("{}- **{}**", indent, term));
+                    open_term = Some(out.len() - 1);
                 }
             }
             Some("dd") => {
@@ -1004,16 +1003,12 @@ pub(crate) fn render_dl_ctx(el: NodeRef, depth: usize, keep_category_links: bool
                     }
                 }
                 let defn = collapse_ws(&parts.join("")).trim().to_string();
-                // Attach the definition BEFORE any sub-list renders: an
-                // open term's line is still out[-1] here (nothing was
-                // pushed since it), so the definition lands on the term
-                // line and the sub-lists follow it in document order.
+                // Attach to the term's line only while it is still the last line.
                 if !defn.is_empty() {
-                    match last_term.as_deref() {
-                        Some(t) if !t.is_empty() && !term_has_def => {
-                            let idx = out.len() - 1;
+                    match open_term {
+                        Some(idx) if idx + 1 == out.len() => {
                             out[idx] = format!("{}: {}", out[idx], defn);
-                            term_has_def = true;
+                            open_term = None;
                         }
                         _ => out.push(format!("{}- {}", indent, defn)),
                     }
@@ -1704,6 +1699,22 @@ mod tests {
     fn dd_with_only_a_sublist_leaves_the_term_line_untouched() {
         let md = wiki_doc("<dl><dt>T</dt><dd><ul><li>s1</li><li>s2</li></ul></dd></dl>");
         assert_eq!(md, "# T\n\n- **T**\n  - s1\n  - s2\n");
+    }
+
+    /// A sibling sub-list between the dt and the dd: the definition must
+    /// not glue onto the sub-list's last item line but get its own line.
+    #[test]
+    fn sibling_sublist_before_dd_gives_the_definition_its_own_line() {
+        let md = wiki_doc("<dl><dt>T</dt><ul><li>x</li></ul><dd>D</dd></dl>");
+        assert_eq!(md, "# T\n\n- **T**\n  - x\n- D\n");
+    }
+
+    /// A second dd after a dd holding only a sub-list: the definition gets
+    /// its own line instead of gluing onto the sub-list's last item.
+    #[test]
+    fn second_dd_after_sublist_only_dd_gets_its_own_line() {
+        let md = wiki_doc("<dl><dt>T</dt><dd><ul><li>x</li></ul></dd><dd>D</dd></dl>");
+        assert_eq!(md, "# T\n\n- **T**\n  - x\n- D\n");
     }
 
     /// A complex table (spans force the HTML-table path) keeps its
