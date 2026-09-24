@@ -728,6 +728,69 @@ fn render_children(el: NodeRef, ctx: InlineCtx) -> String {
     out.join("")
 }
 
+/// The link markdown around an anchor's already-rendered label: external
+/// `[label](url)`/`<url>`, wikilink `[[Target]]`/`[[Target|label]]`, the
+/// bare label for fragment-only hrefs, or '' (dropped media/namespace
+/// link). Shared by render_anchor (which adds the whole-label emphasis
+/// handling) and the block-level `a` arm of block_md.
+fn anchor_md(
+    el: NodeRef,
+    href: &str,
+    label: &str,
+    emph_mark: Option<&str>,
+    in_link: bool,
+) -> String {
+    let label_stripped = label.trim();
+    let scheme = href_scheme(href);
+    if el.has_class("external") || el.attr("rel") == Some("nofollow") || scheme.is_some() {
+        if scheme.as_deref() == Some("geo") {
+            // coordinate microformat links: the label carries the same
+            // data as the URL; render coordinates as plain text
+            return label.to_string();
+        }
+        if label_stripped.is_empty() || label_stripped == href {
+            return format!("<{}>", href);
+        }
+        let lead = &label[..label.len() - label.trim_start().len()];
+        let trail = &label[label.trim_end().len()..];
+        return format!("{}[{}]({}){}", lead, label_stripped, md_link_url(href), trail);
+    }
+
+    // internal link (or interwiki / fragment-only); the citation-residue
+    // check reads the raw href — a '#…' href has an empty path by
+    // construction, so `#cite_note…` is detected there and not via frag.
+    let (path, frag) = split_href(href);
+    if path.is_empty() {
+        if href.starts_with("#cite_note") {
+            return String::new(); // citation residue: drop entirely
+        }
+        return label.to_string(); // fragment-only: keep label text
+    }
+    let target = match link_target_parts(&path, &frag) {
+        Some(t) if !t.is_empty() => t,
+        _ => return label.to_string(),
+    };
+    if in_dropped_ns(&target) {
+        return String::new(); // [[File:…]]/[[Category:…]]-style link: dropped whole
+    }
+    if let Some(mark) = emph_mark {
+        return emph_wikilink(mark, &target, label_stripped);
+    }
+    if !in_link {
+        if let Some((mark, core)) = emph_is_whole(label_stripped) {
+            return emph_wikilink(mark, &target, core);
+        }
+    }
+    // omit |label when the label equals the target page title (query
+    // string included, since split_href keeps it)
+    let bare = path.replace('_', " ");
+    let label_cmp = label_stripped.replace('_', " ");
+    if label_cmp == bare || label_cmp == target {
+        return format!("[[{}]]", target);
+    }
+    format!("[[{}|{}]]", target, label_stripped)
+}
+
 /// Render an <a> element: wikilink, external link, fragment-only label,
 /// or dropped media link.
 fn render_anchor(el: NodeRef, ctx: InlineCtx) -> String {
@@ -755,7 +818,6 @@ fn render_anchor(el: NodeRef, ctx: InlineCtx) -> String {
     // fresh link-label context: '*' verbatim, emphasis stripped (the
     // outer <br> and hatnote contexts do not leak into the label)
     let label = render_children(el, InlineCtx { no_escape: true, in_link: true, ..Default::default() });
-    let label_stripped = label.trim().to_string();
 
     // Hatnote edit/admin anchor: an edit-section widget inside a hatnote
     // renders as a clean wikilink to the URL's title parameter.
@@ -768,54 +830,7 @@ fn render_anchor(el: NodeRef, ctx: InlineCtx) -> String {
         }
     }
 
-    let scheme = href_scheme(href);
-    if el.has_class("external") || el.attr("rel") == Some("nofollow") || scheme.is_some() {
-        if scheme.as_deref() == Some("geo") {
-            // coordinate microformat links: the label carries the same
-            // data as the URL; render coordinates as plain text
-            return label;
-        }
-        if label_stripped.is_empty() || label_stripped == href {
-            return format!("<{}>", href);
-        }
-        let lead = &label[..label.len() - label.trim_start().len()];
-        let trail = &label[label.trim_end().len()..];
-        return format!("{}[{}]({}){}", lead, label_stripped, md_link_url(href), trail);
-    }
-
-    // internal link (or interwiki / fragment-only); the citation-residue
-    // check reads the raw href — a '#…' href has an empty path by
-    // construction, so `#cite_note…` is detected there and not via frag.
-    let (path, frag) = split_href(href);
-    if path.is_empty() {
-        if href.starts_with("#cite_note") {
-            return String::new(); // citation residue: drop entirely
-        }
-        return label; // fragment-only: keep label text
-    }
-    let target = match link_target_parts(&path, &frag) {
-        Some(t) if !t.is_empty() => t,
-        _ => return label,
-    };
-    if in_dropped_ns(&target) {
-        return String::new(); // [[File:…]]/[[Category:…]]-style link: dropped whole
-    }
-    if let Some(mark) = emph_mark {
-        return emph_wikilink(mark, &target, &label_stripped);
-    }
-    if !ctx.in_link {
-        if let Some((mark, core)) = emph_is_whole(&label_stripped) {
-            return emph_wikilink(mark, &target, core);
-        }
-    }
-    // omit |label when the label equals the target page title (query
-    // string included, since split_href keeps it)
-    let bare = path.replace('_', " ");
-    let label_cmp = label_stripped.replace('_', " ");
-    if label_cmp == bare || label_cmp == target {
-        return format!("[[{}]]", target);
-    }
-    format!("[[{}|{}]]", target, label_stripped)
+    anchor_md(el, href, &label, emph_mark, ctx.in_link)
 }
 
 /// Render an element in inline context to markdown text (links,
@@ -1132,6 +1147,25 @@ pub(crate) fn block_md(ch: NodeRef, in_blockquote: bool) -> String {
         "pre" => render_pre(ch),
         "table" => tables::render_table(ch),
         "span" => collapse_ws(&inline_text(ch)).trim().to_string(),
+        // Block-level anchor: inline anchor semantics (via anchor_md) with
+        // the content rendered as inline text, the span arm's mechanism —
+        // block containers walk element children only, so a bare <a> (a
+        // mwoffliner meta-refresh redirect stub) used to render empty and
+        // leave its page title-only.  Deliberate divergence from
+        // zim2zim.py, which still emits these pages title-only.
+        "a" => {
+            let href = ch.attr("href").unwrap_or("");
+            if is_media_href(href) {
+                return String::new();
+            }
+            let label = collapse_ws(&render_children(
+                ch,
+                InlineCtx { no_escape: true, in_link: true, ..Default::default() },
+            ))
+            .trim()
+            .to_string();
+            anchor_md(ch, href, &label, None, false)
+        }
         _ => render_block_container(ch, in_blockquote),
     }
 }
@@ -1536,5 +1570,80 @@ mod tests {
             "<table><tr><th>H</th></tr><tr><td><div><ul><li>solo</li></ul></div></td></tr></table>",
         );
         assert!(md.contains("<td>solo</td>"), "{md}");
+    }
+
+    // Block-level anchors mirror inline anchor semantics; a deliberate
+    // divergence from zim2zim.py, which leaves bare <a> pages title-only.
+
+    /// A bare block-level <a> — mwoffliner's meta-refresh redirect stub —
+    /// renders as a wikilink under the title line instead of leaving the
+    /// page title-only (block containers walk element children only, so
+    /// the stub's bare-text label used to vanish).
+    #[test]
+    fn block_anchor_stub_page_renders_as_a_wikilink() {
+        let md = html_to_md(
+            "<html><body><a href=\"./Equals_sign#Not_equal\">!=</a></body></html>",
+            Some("!="),
+            None,
+        );
+        assert_eq!(md, "# !=\n\n[[Equals sign#Not equal|!=]]\n");
+    }
+
+    /// A block-level anchor whose label equals its target renders the
+    /// bare `[[Target]]` form, like its inline counterpart.
+    #[test]
+    fn block_anchor_with_equal_label_renders_the_bare_wikilink() {
+        let md = wiki_doc("<a href=\"./Target\">Target</a>");
+        assert_eq!(md, "# T\n\n[[Target]]\n");
+    }
+
+    /// A block-level external anchor renders `[label](url)`; without a
+    /// label it degrades to `<url>`, like its inline counterpart.
+    #[test]
+    fn block_external_anchor_renders_a_markdown_link() {
+        let md = wiki_doc("<a class=\"external\" href=\"https://x.example/a\">Site</a>");
+        assert_eq!(md, "# T\n\n[Site](https://x.example/a)\n");
+        let md = wiki_doc("<a class=\"external\" href=\"https://x.example/a\"></a>");
+        assert_eq!(md, "# T\n\n<https://x.example/a>\n");
+    }
+
+    /// A block-level anchor wrapping a <span> renders the span's inline
+    /// content as the link label (asterisks stay verbatim, like inline).
+    #[test]
+    fn block_anchor_wrapping_a_span_uses_it_as_the_label() {
+        let md = wiki_doc("<a href=\"./Foo\"><span>la *bel*</span></a>");
+        assert_eq!(md, "# T\n\n[[Foo|la *bel*]]\n");
+    }
+
+    /// Fragment-only and href-less block anchors render the bare label.
+    #[test]
+    fn block_fragment_only_and_missing_href_render_the_label() {
+        let md = wiki_doc("<a href=\"#Sec\">label</a>");
+        assert_eq!(md, "# T\n\nlabel\n");
+        let md = wiki_doc("<a>label</a>");
+        assert_eq!(md, "# T\n\nlabel\n");
+    }
+
+    /// Media hrefs and File:/Category:-style targets drop the whole block
+    /// anchor, exactly like inline anchors.
+    #[test]
+    fn block_media_and_file_hrefs_drop_the_anchor() {
+        let md = wiki_doc("<a href=\"./File:Foo.jpg\">img</a>");
+        assert_eq!(md, "# T\n");
+        let md = wiki_doc("<a href=\"./Song.ogg\">song</a>");
+        assert_eq!(md, "# T\n");
+        let md = wiki_doc("<a href=\"https://upload.wikimedia.org/x/song.ogg\">song</a>");
+        assert_eq!(md, "# T\n");
+    }
+
+    /// Slashes pass through the wikilink target and underscores fold to
+    /// spaces on both sides: `./Page/Sub_page` labelled `Page/Sub_page`
+    /// renders `[[Page/Sub page]]`.
+    #[test]
+    fn block_anchor_target_keeps_slashes_and_folds_underscores() {
+        let md = wiki_doc("<a href=\"./Page/Sub_page\">Page/Sub_page</a>");
+        assert_eq!(md, "# T\n\n[[Page/Sub page]]\n");
+        let md = wiki_doc("<a href=\"./Page/Sub_page\">Sub page</a>");
+        assert_eq!(md, "# T\n\n[[Page/Sub page|Sub page]]\n");
     }
 }
