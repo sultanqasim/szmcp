@@ -110,13 +110,7 @@ fn is_hatnote_para(para: &str) -> bool {
 fn intro_for_index(md: &str) -> String {
     let mut lines = md.split('\n');
     let head = lines.next().unwrap_or("");
-    let mut body: Vec<&str> = lines.collect();
-    for (i, line) in body.iter().enumerate() {
-        if line.starts_with("## ") {
-            body.truncate(i);
-            break;
-        }
-    }
+    let body: Vec<&str> = lines.take_while(|l| !l.starts_with("## ")).collect();
     let mut paras: Vec<String> = Vec::new();
     let mut cur: Vec<&str> = Vec::new();
     for line in body {
