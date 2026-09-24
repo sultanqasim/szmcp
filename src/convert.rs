@@ -184,18 +184,9 @@ fn raw_language_metadata(z: &Zim) -> Option<String> {
 /// (`zim::ZimHeader.main_page`) followed through its redirect chain to the
 /// terminal entry.
 fn main_entry_path(z: &Zim) -> Option<String> {
-    let main_page = z.header.main_page;
-    if main_page == u32::MAX {
-        return None;
-    }
-    let mut entry = z.get_entry(main_page).ok()?;
-    for _ in 0..64 {
-        match entry.target {
-            Target::Redirect(next) => entry = z.get_entry(next).ok()?,
-            _ => return Some(entry.url),
-        }
-    }
-    None
+    z.redirect_terminal(z.header.main_page)
+        .and_then(|t| z.get_entry(t).ok())
+        .map(|e| e.url)
 }
 
 /// The display name for a skipped entry's MIME id: the MIME string from the

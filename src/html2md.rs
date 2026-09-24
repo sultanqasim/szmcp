@@ -1598,7 +1598,7 @@ mod tests {
     #[test]
     fn dropped_namespace_links_vanish() {
         let md = html_to_md(
-            "<html><body><div id=\"mw-content-text\"><div class=\"mw-parser-output\"><p>Text <a href=\"Category%3AFoo\"Category:Foo\">label</a><a href=\"./File%3ABar\">img</a>.</p></div></div></body></html>",
+            "<html><body><div id=\"mw-content-text\"><div class=\"mw-parser-output\"><p>Text <a href=\"Category%3AFoo\"\">label</a><a href=\"./File%3ABar\">img</a>.</p></div></div></body></html>",
             Some("T"),
             None,
             false,

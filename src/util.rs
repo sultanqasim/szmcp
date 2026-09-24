@@ -286,11 +286,10 @@ fn parse_charref(after: &str) -> Option<(String, usize)> {
             consumed += 1;
         }
         let digits = &after[start..j];
-        let num: u32 = if hex {
-            u32::from_str_radix(digits, 16).ok()?
-        } else {
-            digits.parse().ok()?
-        };
+        let radix = if hex { 16 } else { 10 };
+        let num = digits.bytes().fold(0u32, |acc, d| {
+            acc.saturating_mul(radix).saturating_add((d as char).to_digit(radix).unwrap_or(0))
+        });
         if let Some((_, v)) = INVALID_CHARREFS.iter().find(|(n, _)| *n == num) {
             return Some((v.to_string(), consumed));
         }
@@ -340,4 +339,19 @@ fn parse_charref(after: &str) -> Option<(String, usize)> {
         }
     }
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::html_unescape;
+
+    #[test]
+    fn huge_decimal_charref_is_replacement_char() {
+        assert_eq!(html_unescape("&#12345678901234567890;"), "\u{FFFD}");
+    }
+
+    #[test]
+    fn huge_hex_charref_is_replacement_char() {
+        assert_eq!(html_unescape("&#x111111111;"), "\u{FFFD}");
+    }
 }
