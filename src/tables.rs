@@ -95,7 +95,6 @@ fn table_caption_text(tbl: NodeRef, keep_br: bool) -> String {
 /// as list lines).
 fn has_list_descendant(el: NodeRef) -> bool {
     el.descendants()
-        .into_iter()
         .any(|d| matches!(d.tag(), Some("ul") | Some("ol") | Some("dl")))
 }
 

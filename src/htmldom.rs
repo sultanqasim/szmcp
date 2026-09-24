@@ -346,30 +346,25 @@ impl<'a> NodeRef<'a> {
 
     /// This node and all descendants, pre-order (lxml's `iter()`).
     pub fn self_and_descendants(&self) -> impl Iterator<Item = NodeRef<'a>> + 'a {
-        std::iter::once(*self).chain(self.descendants_iter())
+        std::iter::once(*self).chain(self.descendants())
     }
 
     /// All descendants, pre-order, self excluded (lxml's
-    /// `iterdescendants()`).
-    pub fn descendants(&self) -> Vec<NodeRef<'a>> {
-        self.descendants_iter().collect()
-    }
-
-    /// The lazy pre-order walk (self excluded) backing [`Self::descendants`]:
-    /// [`Self::find`] early-exits on it, [`Self::find_all`] collects only
-    /// its matches — no whole-subtree materialization.
-    fn descendants_iter(&self) -> Descendants<'a> {
+    /// `iterdescendants()`). Lazy: [`Self::find`] early-exits on the walk
+    /// and [`Self::find_all`] collects only its matches — no whole-subtree
+    /// materialization.
+    pub fn descendants(&self) -> Descendants<'a> {
         Descendants::new(self.dom, self.id)
     }
 
     /// The first descendant (self excluded) with the given tag.
     pub fn find(&self, tag: &str) -> Option<NodeRef<'a>> {
-        self.descendants_iter().find(|n| n.tag() == Some(tag))
+        self.descendants().find(|n| n.tag() == Some(tag))
     }
 
     /// All descendants (self excluded) with the given tag.
     pub fn find_all(&self, tag: &str) -> Vec<NodeRef<'a>> {
-        self.descendants_iter().filter(|n| n.tag() == Some(tag)).collect()
+        self.descendants().filter(|n| n.tag() == Some(tag)).collect()
     }
 }
 
@@ -391,7 +386,7 @@ impl<'a> Iterator for Ancestors<'a> {
 
 /// Explicit-stack pre-order walk of a node's descendants (self excluded);
 /// same visit order as the recursive collect it replaced.
-struct Descendants<'a> {
+pub struct Descendants<'a> {
     dom: &'a Dom,
     /// Siblings still to visit (children are pushed in reverse, so the
     /// first child pops first).

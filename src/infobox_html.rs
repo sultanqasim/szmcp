@@ -137,7 +137,6 @@ fn strip_toggles(dom: &mut Dom) {
 fn element_ids(dom: &Dom, pred: impl Fn(NodeRef) -> bool) -> Vec<NodeId> {
     dom.ref_(dom.root().id())
         .self_and_descendants()
-        .into_iter()
         .filter(|e| e.is_element() && pred(*e))
         .map(|e| e.id())
         .collect()
@@ -146,7 +145,6 @@ fn element_ids(dom: &Dom, pred: impl Fn(NodeRef) -> bool) -> Vec<NodeId> {
 /// True when `el` carries inline emphasis or a collapse-widget element.
 fn needs_plain_copy(el: NodeRef) -> bool {
     el.self_and_descendants()
-        .into_iter()
         .any(|e| {
             if !e.is_element() {
                 return false;
@@ -215,7 +213,6 @@ fn top_lists<'a>(cell: NodeRef<'a>) -> Vec<NodeRef<'a>> {
 /// A full-data row containing a nested table or a map/media structure.
 fn is_map_row(cell: NodeRef) -> bool {
     cell.descendants()
-        .into_iter()
         .any(|el| el.tag() == Some("table") || el.has_any_class(MAP_CLASSES))
 }
 
@@ -447,7 +444,6 @@ fn full_data_row(cell: NodeRef) -> Option<Row> {
     }
     if cell
         .descendants()
-        .into_iter()
         .any(|el| el.is_element() && is_media_el(el))
     {
         return None;
@@ -746,7 +742,6 @@ pub(crate) fn extract_infoboxes(dom: &Dom) -> Vec<Infobox> {
         // and taxobox_v3 bloc label/value pairs join the first box.
         let above = el
             .descendants()
-            .into_iter()
             .filter(|d| d.is_element() && d.has_class("entete"))
             .map(|d| visible_text(d))
             .find(|t| !t.is_empty())

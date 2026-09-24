@@ -1293,7 +1293,6 @@ fn get_parser_output(root: NodeRef) -> Option<NodeRef> {
     }
     // last resort: first element with the class token anywhere
     root.descendants()
-        .into_iter()
         .find(|el| el.is_element() && el.has_class("mw-parser-output"))
 }
 
@@ -1325,7 +1324,6 @@ fn key_facts_of(dom: &Dom, lang: Option<&str>) -> String {
 /// First descendant element carrying the given id attribute.
 fn find_id<'a>(el: NodeRef<'a>, id: &str) -> Option<NodeRef<'a>> {
     el.descendants()
-        .into_iter()
         .find(|d| d.is_element() && d.attr("id") == Some(id))
 }
 
@@ -1347,7 +1345,6 @@ fn is_category_target(target: &str) -> bool {
 fn category_generated_id(dom: &Dom) -> Option<crate::htmldom::NodeId> {
     dom.root()
         .descendants()
-        .into_iter()
         .find(|el| el.is_element() && el.has_class("mw-category-generated"))
         .map(|el| el.id())
 }
