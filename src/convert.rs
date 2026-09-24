@@ -1169,6 +1169,9 @@ pub fn convert(
             // extend both under the same lock so coordinates and strings
             // stay consistent.
             let mut pre = collector.lock().unwrap();
+            if pre.arena.len() + arena.len() > u32::MAX as usize {
+                return Err("article path/title arena exceeds 4 GiB".to_string());
+            }
             let base = pre.arena.len() as u32;
             for c in found.iter_mut() {
                 c.path.0 += base;
