@@ -145,19 +145,11 @@ fn intro_for_index(md: &str) -> String {
 /// subtags stripped, lowercased ("fr-FR" -> "fr"); "eng" when nothing is
 /// left. libzim picks its stemmer by exactly this code.
 fn indexing_language(raw: Option<&str>) -> String {
-    const DEFAULT: &str = "eng";
-    let Some(raw) = raw else { return DEFAULT.to_string() };
-    let tok = raw
-        .trim()
+    raw.unwrap_or("")
         .split(|c: char| c == ',' || c == ';' || c.is_whitespace())
         .find(|t| !t.is_empty())
-        .unwrap_or("");
-    let tok = tok.split('-').next().unwrap_or("").trim().to_lowercase();
-    if tok.is_empty() {
-        DEFAULT.to_string()
-    } else {
-        tok
-    }
+        .map(|t| t.split('-').next().unwrap().to_lowercase())
+        .unwrap_or_else(|| "eng".to_string())
 }
 
 // ---------------------------------------------------------------------------
