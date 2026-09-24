@@ -593,10 +593,11 @@ struct InlineCtx {
     in_link: bool,
     br_mode: BrMode,
     in_hatnote: bool,
-    /// Rendering a category page's member section: `[[Category:…]]` links are
-    /// the section's subject and survive the dropped-namespace rule (the same
-    /// exception `categories_section` makes for the catlinks bar). False
-    /// everywhere else.
+    /// `[[Category:…]]` links are the subject of the page being rendered and
+    /// survive the dropped-namespace rule: in a category page's member
+    /// section, and — when categories are included — in ordinary article
+    /// text (a hatnote's "See also: Category:…" link must survive). False
+    /// for tables, infoboxes and headings, where the flag is never threaded.
     keep_category_links: bool,
 }
 
@@ -883,8 +884,8 @@ pub(crate) fn list_item_lines(list_el: NodeRef, depth: usize, raw: bool) -> Vec<
     list_item_lines_ctx(list_el, depth, raw, false)
 }
 
-/// [`list_item_lines`] with the category page's member-section flag: `keep`
-/// lets `[[Category:…]]` item links through the dropped-namespace rule.
+/// [`list_item_lines`] with the body's keep-category-links flag (see
+/// [`InlineCtx`]).
 pub(crate) fn list_item_lines_ctx(
     list_el: NodeRef,
     depth: usize,
@@ -945,10 +946,15 @@ pub(crate) fn render_list(el: NodeRef, depth: usize) -> String {
     render_list_ctx(el, depth, false)
 }
 
-/// [`render_list`] with the category page's member-section flag (see
-/// [`list_item_lines_ctx`]).
+/// [`render_list`] with the body's keep-category-links flag (see
+/// [`InlineCtx`]).
 pub(crate) fn render_list_ctx(el: NodeRef, depth: usize, keep_category_links: bool) -> String {
     list_item_lines_ctx(el, depth, false, keep_category_links).join("\n")
+}
+
+/// [`inline_text`] carrying the enclosing render's keep-category-links flag.
+fn inline_text_keep(el: NodeRef, keep_category_links: bool) -> String {
+    render_inline(el, InlineCtx { keep_category_links, ..Default::default() })
 }
 
 /// Definition list: <dt> -> `- **term**`, <dt>+<dd> -> `- **term**: def`,
@@ -959,6 +965,12 @@ pub(crate) fn render_list_ctx(el: NodeRef, depth: usize, keep_category_links: bo
 /// line — or emitted as a lone `- ` item — *before* the sub-lists, so
 /// definition and sub-list stay in document order.
 pub(crate) fn render_dl(el: NodeRef, depth: usize) -> String {
+    render_dl_ctx(el, depth, false)
+}
+
+/// [`render_dl`] with the body's keep-category-links flag (see
+/// [`InlineCtx`]).
+pub(crate) fn render_dl_ctx(el: NodeRef, depth: usize, keep_category_links: bool) -> String {
     let mut out: Vec<String> = Vec::new();
     let indent = "  ".repeat(depth);
     let mut last_term: Option<String> = None;
@@ -969,7 +981,7 @@ pub(crate) fn render_dl(el: NodeRef, depth: usize) -> String {
         }
         match ch.tag() {
             Some("dt") => {
-                let term = inline_text(ch).trim().to_string();
+                let term = inline_text_keep(ch, keep_category_links).trim().to_string();
                 last_term = Some(term.clone());
                 term_has_def = false;
                 if !term.is_empty() {
@@ -987,7 +999,7 @@ pub(crate) fn render_dl(el: NodeRef, depth: usize) -> String {
                     match sub.kind() {
                         NodeKind::Text(t) => parts.push(escape_plain_asterisks(t)),
                         NodeKind::Element { .. } if matches!(sub.tag(), Some("ul") | Some("ol")) => {}
-                        NodeKind::Element { .. } => parts.push(inline_text(sub)),
+                        NodeKind::Element { .. } => parts.push(inline_text_keep(sub, keep_category_links)),
                         _ => {}
                     }
                 }
@@ -1008,7 +1020,7 @@ pub(crate) fn render_dl(el: NodeRef, depth: usize) -> String {
                 }
                 for sub in ch.element_children() {
                     if matches!(sub.tag(), Some("ul") | Some("ol")) && !is_dropped(sub) {
-                        let sub_md = render_list(sub, depth + 1);
+                        let sub_md = render_list_ctx(sub, depth + 1, keep_category_links);
                         if !sub_md.is_empty() {
                             out.push(sub_md);
                         }
@@ -1016,13 +1028,13 @@ pub(crate) fn render_dl(el: NodeRef, depth: usize) -> String {
                 }
             }
             Some("ul") | Some("ol") => {
-                let sub_md = render_list(ch, depth + 1);
+                let sub_md = render_list_ctx(ch, depth + 1, keep_category_links);
                 if !sub_md.is_empty() {
                     out.push(sub_md);
                 }
             }
             Some("dl") => {
-                let sub_md = render_dl(ch, depth + 1);
+                let sub_md = render_dl_ctx(ch, depth + 1, keep_category_links);
                 if !sub_md.is_empty() {
                     out.push(sub_md);
                 }
@@ -1035,10 +1047,12 @@ pub(crate) fn render_dl(el: NodeRef, depth: usize) -> String {
 
 /// Render one <p>: <br> splits the paragraph (the <br>'s tail opens the
 /// next segment — the next quote line in a blockquote), everything else
-/// is inline.
-fn render_paragraph(p: NodeRef, in_blockquote: bool) -> Vec<String> {
+/// is inline. `keep_category_links` threads the enclosing render's flag
+/// into the paragraph's inline context.
+fn render_paragraph(p: NodeRef, in_blockquote: bool, keep_category_links: bool) -> Vec<String> {
     let ctx = InlineCtx {
         br_mode: if in_blockquote { BrMode::Nl } else { BrMode::Space },
+        keep_category_links,
         ..Default::default()
     };
     let mut segs: Vec<String> = vec![String::new()];
@@ -1093,8 +1107,8 @@ fn render_pre(pre: NodeRef) -> String {
 }
 
 /// `> ` line-per-line blockquote; empty lines inside become `>`.
-fn render_blockquote(bq: NodeRef) -> String {
-    let inner = block_children_md(bq, None, true, false);
+fn render_blockquote(bq: NodeRef, keep_category_links: bool) -> String {
+    let inner = block_children_md(bq, None, true, keep_category_links);
     let inner = inner.trim_matches('\n');
     if inner.is_empty() {
         return String::new();
@@ -1120,18 +1134,26 @@ fn render_block_container(
     keep_category_links: bool,
 ) -> String {
     if el.attr("role") == Some("note") || el.has_class("hatnote") {
-        return render_hatnote(el);
+        return render_hatnote(el, keep_category_links);
     }
     block_children_md(el, None, in_blockquote, keep_category_links)
 }
 
 /// Render a hatnote container as a standalone fully-italic paragraph; only
 /// [[...]] links survive (emphasis flattened) and anchors pointing at a
-/// wiki edit/admin URL become [[title]] wikilinks.
-fn render_hatnote(el: NodeRef) -> String {
+/// wiki edit/admin URL become [[title]] wikilinks. `keep_category_links`
+/// threads the enclosing render's flag: with categories included, a
+/// hatnote's "See also: Category:…" link survives the dropped-namespace
+/// rule like any other article-text category link.
+fn render_hatnote(el: NodeRef, keep_category_links: bool) -> String {
     let txt = collapse_ws(&render_inline(
         el,
-        InlineCtx { in_link: true, in_hatnote: true, ..Default::default() },
+        InlineCtx {
+            in_link: true,
+            in_hatnote: true,
+            keep_category_links,
+            ..Default::default()
+        },
     ))
     .trim()
     .to_string();
@@ -1175,9 +1197,8 @@ pub(crate) fn block_md(ch: NodeRef, in_blockquote: bool) -> String {
     block_md_in(ch, in_blockquote, false)
 }
 
-/// [`block_md`] with the category page's member-section flag: `keep` lets
-/// `[[Category:…]]` links inside the section's lists through the
-/// dropped-namespace rule.
+/// [`block_md`] with the body's keep-category-links flag (see
+/// [`InlineCtx`]).
 pub(crate) fn block_md_in(ch: NodeRef, in_blockquote: bool, keep_category_links: bool) -> String {
     // a bare hN, or a div.mw-heading wrapper, renders as a Markdown heading;
     // a heading with no text (category pages' TOC groups carry
@@ -1192,7 +1213,7 @@ pub(crate) fn block_md_in(ch: NodeRef, in_blockquote: bool, keep_category_links:
     }
     match ch.tag().unwrap_or("") {
         "p" => {
-            let p_lines = render_paragraph(ch, in_blockquote);
+            let p_lines = render_paragraph(ch, in_blockquote, keep_category_links);
             if in_blockquote {
                 p_lines.join("\n")
             } else {
@@ -1200,11 +1221,11 @@ pub(crate) fn block_md_in(ch: NodeRef, in_blockquote: bool, keep_category_links:
             }
         }
         "ul" | "ol" => render_list_ctx(ch, 0, keep_category_links),
-        "dl" => render_dl(ch, 0),
-        "blockquote" => render_blockquote(ch),
+        "dl" => render_dl_ctx(ch, 0, keep_category_links),
+        "blockquote" => render_blockquote(ch, keep_category_links),
         "pre" => render_pre(ch),
         "table" => tables::render_table(ch),
-        "span" => collapse_ws(&inline_text(ch)).trim().to_string(),
+        "span" => collapse_ws(&inline_text_keep(ch, keep_category_links)).trim().to_string(),
         // Block-level anchor: inline anchor semantics (via anchor_md) with
         // the content rendered as inline text, the span arm's mechanism —
         // block containers walk element children only, so a bare <a> (a
@@ -1232,8 +1253,8 @@ pub(crate) fn block_md_in(ch: NodeRef, in_blockquote: bool, keep_category_links:
 /// blank lines). A non-empty `key_facts` block is emitted structurally
 /// immediately before the first heading (or at the end for lead-only
 /// pages). `in_blockquote` keeps <br>-separated paragraph lines within one
-/// quote paragraph. `keep_category_links` is the category page's
-/// member-section flag (see [`list_item_lines_ctx`]).
+/// quote paragraph. `keep_category_links` is the body's keep-category-links
+/// flag (see [`InlineCtx`]).
 pub(crate) fn block_children_md(
     el: NodeRef,
     key_facts: Option<&str>,
@@ -1400,13 +1421,17 @@ fn categories_section(root: NodeRef, lang: Option<&str>) -> String {
 /// Render the article body around the already-located container: Parsoid
 /// sections flattened, blocks rendered, sections assembled, title line
 /// prepended, the category page's member section (when rendering) and the
-/// categories section appended, and the cleanup pass applied.
+/// categories section appended, and the cleanup pass applied. The body's
+/// inline contexts carry `keep_category_links` (true for ordinary articles
+/// when categories are included — a hatnote's "See also: Category:…"
+/// link survives; always true for the category page's member section).
 fn render_article(
     mut dom: Dom,
     body: crate::htmldom::NodeId,
     key_facts: String,
     category_generated: Option<crate::htmldom::NodeId>,
     categories: String,
+    keep_category_links: bool,
     title: Option<&str>,
     lang: Option<&str>,
 ) -> String {
@@ -1415,7 +1440,7 @@ fn render_article(
         dom.ref_(body),
         if key_facts.is_empty() { None } else { Some(&key_facts) },
         false,
-        false,
+        keep_category_links,
     );
     let content = cleanup::assemble(&body_md, lang);
     // The category page's member/subcategory section renders through the
@@ -1426,6 +1451,8 @@ fn render_article(
     // ./Category:… — split_href handles both). DOM order also puts it
     // before the catlinks bar, so the generated section is appended before
     // the '## Categories' section below.
+    // The member section always forces the flag true: its Category links
+    // are the section's subject regardless of the body's mode.
     let generated = category_generated
         .map(|id| block_children_md(dom.ref_(id), None, false, true))
         .unwrap_or_default();
@@ -1461,7 +1488,11 @@ fn render_article(
 /// select French) localizes the '## Key facts' heading and the dropped
 /// boilerplate sections. `include_categories` opt-in appends a localized
 /// '## Categories' section listing the page's normal categories after the
-/// body content. It also renders category pages usefully: their member and
+/// body content, and — for ordinary article text — lets `[[Category:…]]`
+/// links through the dropped-namespace rule (a hatnote's "See also:
+/// Category:…" link survives; without categories such links still drop,
+/// their target being absent from the output). It also renders category
+/// pages usefully: their member and
 /// subcategory lists live in a sibling div.mw-category-generated outside
 /// the render root and are dropped with the flag off (the page renders
 /// title/description-only, like zim2zim.py); with the flag on that section
@@ -1510,6 +1541,7 @@ pub fn html_to_md(
         key_facts,
         category_generated,
         categories,
+        include_categories,
         title.as_deref(),
         lang,
     )
@@ -1917,6 +1949,73 @@ mod tests {
     fn without_catlinks_bar_no_section() {
         let md = wiki_doc_with_tail("<p>Body.</p>", "", None, true);
         assert_eq!(md, "# T\n\nBody.\n");
+    }
+
+    // Category links in article text: including the categories also
+    // re-allows `[[Category:…]]` targets in the body's inline contexts
+    // (hatnotes, paragraphs, block anchors), not just the Categories
+    // section — a hatnote's "See also: Category:…" link must survive the
+    // dropped-namespace rule when the target page is part of the output.
+    // Under --exclude-categories the target is absent, so the link drops
+    // again (a dangling wikilink would be worse); File:/Media: drops stay
+    // unconditional either way. HTML shapes are the archive's real ones
+    // (e.g. "See also: Category:Children of Gaia" — label carries the
+    // namespace, href is the percent-encoded colon).
+
+    /// A hatnote linking a category, as the archive carries it.
+    const HATNOTE_SEE_ALSO_CAT: &str = concat!(
+        "<div role=\"note\" class=\"hatnote navigation-not-searchable\">See also: ",
+        "<a rel=\"mw:WikiLink\" href=\"Category%3A1838_deaths\" ",
+        "title=\"Category:1838 deaths\">Category:1838 deaths</a></div>"
+    );
+
+    /// Flag on (the default): the hatnote keeps its Category link as a
+    /// wikilink; the label equals the target, so the bare `[[Target]]`
+    /// form renders.
+    #[test]
+    fn hatnote_category_link_survives_when_categories_included() {
+        let md = wiki_doc_with_tail(HATNOTE_SEE_ALSO_CAT, "", None, true);
+        assert_eq!(md, "# T\n\n*See also: [[Category:1838 deaths]]*\n");
+    }
+
+    /// Flag off (--exclude-categories): the whole anchor drops, leaving
+    /// the bare "*See also:*" run.
+    #[test]
+    fn hatnote_category_link_drops_when_categories_excluded() {
+        let md = wiki_doc_with_tail(HATNOTE_SEE_ALSO_CAT, "", None, false);
+        assert_eq!(md, "# T\n\n*See also:*\n");
+    }
+
+    /// A Category link inline in a paragraph with surrounding text keeps
+    /// it when categories are included and drops it (surroundings intact)
+    /// when they are excluded.
+    #[test]
+    fn paragraph_category_link_follows_the_categories_flag() {
+        let inner = concat!(
+            "<p>Full lists: <a rel=\"mw:WikiLink\" href=\"Category%3A1838_deaths\" ",
+            "title=\"Category:1838 deaths\">Category:1838 deaths</a> and its subcategories.</p>"
+        );
+        let md = wiki_doc_with_tail(inner, "", None, true);
+        assert_eq!(
+            md,
+            "# T\n\nFull lists: [[Category:1838 deaths]] and its subcategories.\n"
+        );
+        let md = wiki_doc_with_tail(inner, "", None, false);
+        assert_eq!(md, "# T\n\nFull lists: and its subcategories.\n");
+    }
+
+    /// File: links stay dropped in BOTH modes — only Category targets are
+    /// re-allowed.
+    #[test]
+    fn file_links_still_drop_in_both_modes() {
+        let inner = concat!(
+            "<p>Depicted <a rel=\"mw:WikiLink\" href=\"File%3AExample.jpg\" ",
+            "title=\"File:Example.jpg\">File:Example.jpg</a> above.</p>"
+        );
+        for flag in [false, true] {
+            let md = wiki_doc_with_tail(inner, "", None, flag);
+            assert_eq!(md, "# T\n\nDepicted above.\n", "flag={flag}");
+        }
     }
 
     // The category page's member section (div.mw-category-generated, a sibling
