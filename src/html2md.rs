@@ -7,7 +7,7 @@
 //! [`block_children_md`], and (via [`tables`]) `render_table`.
 
 use crate::cleanup;
-use crate::htmldom::{Dom, NodeKind, NodeRef};
+use crate::htmldom::{Dom, NodeId, NodeKind, NodeRef};
 use crate::tables;
 use crate::util::{
     collapse_space_tab, collapse_ws, parse_query, percent_decode, prev_char, re, run_end, urlsplit,
@@ -186,10 +186,10 @@ fn is_wikidata_badge(el: NodeRef) -> bool {
 }
 
 /// Direct children of `el` that are rendered at all.
-pub(crate) fn renderable_children<'a>(el: NodeRef<'a>) -> Vec<NodeRef<'a>> {
-    el.children()
-        .filter(|c| c.is_element() && !is_dropped(*c))
-        .collect()
+pub(crate) fn renderable_children<'a>(
+    el: NodeRef<'a>,
+) -> impl Iterator<Item = NodeRef<'a>> + 'a {
+    el.children().filter(|c| c.is_element() && !is_dropped(*c))
 }
 
 // ---------------------------------------------------------------------------
@@ -565,7 +565,7 @@ fn starts_block(ch: NodeRef) -> bool {
 // ---------------------------------------------------------------------------
 
 /// <br> rendering: a space, the literal `<br>`, or a newline.
-#[derive(Clone, Copy, PartialEq, Default)]
+#[derive(Clone, Copy, Default)]
 enum BrMode {
     #[default]
     Space,
@@ -635,7 +635,7 @@ fn render_inline(node: NodeRef, ctx: InlineCtx) -> String {
             format!("{}{}{}", mark, inner, mark)
         }
         "br" => {
-            if ctx.br_mode == BrMode::Keep {
+            if matches!(ctx.br_mode, BrMode::Keep) {
                 return "<br>".to_string();
             }
             // The layout <br> of a CSS-stacked sup/sub construct only
@@ -1242,10 +1242,8 @@ pub(crate) fn block_children_md(
     if let Some(kf) = key_facts_pending {
         out.push(kf.to_string());
     }
-    out.into_iter()
-        .filter(|o| !o.trim().is_empty())
-        .collect::<Vec<_>>()
-        .join("\n\n")
+    out.retain(|o| !o.trim().is_empty());
+    out.join("\n\n")
 }
 
 // ---------------------------------------------------------------------------
@@ -1269,9 +1267,9 @@ fn get_parser_output(root: NodeRef) -> Option<NodeRef> {
 
 /// Normalize Parsoid-sectioned HTML back to the legacy flat shape: replace
 /// every <section> wrapper under the body container by its children.
-fn flatten_parsoid_sections(dom: &mut Dom, body: crate::htmldom::NodeId) {
-    let sections: Vec<crate::htmldom::NodeId> =
-        dom.ref_(body).find_all("section").iter().map(|n| n.id()).collect();
+fn flatten_parsoid_sections(dom: &mut Dom, body: NodeId) {
+    let sections: Vec<NodeId> =
+        dom.ref_(body).find_all("section").into_iter().map(|n| n.id()).collect();
     for sec in sections {
         dom.replace_with_children(sec);
     }
@@ -1310,7 +1308,7 @@ fn is_category_target(target: &str) -> bool {
 /// subcategories or members (empty ones, which mwoffliner does not ship, have
 /// no lists and no section); located by the class token, present on every
 /// member-listing category page in the archive.
-fn category_generated_id(dom: &Dom) -> Option<crate::htmldom::NodeId> {
+fn category_generated_id(dom: &Dom) -> Option<NodeId> {
     dom.root()
         .descendants()
         .find(|el| el.is_element() && el.has_class("mw-category-generated"))
@@ -1368,9 +1366,9 @@ fn categories_section(root: NodeRef, lang: Option<&str>) -> String {
 /// link survives; always true for the category page's member section).
 fn render_article(
     mut dom: Dom,
-    body: crate::htmldom::NodeId,
+    body: NodeId,
     key_facts: String,
-    category_generated: Option<crate::htmldom::NodeId>,
+    category_generated: Option<NodeId>,
     categories: String,
     keep_category_links: bool,
     title: Option<&str>,
