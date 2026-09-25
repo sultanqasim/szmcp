@@ -44,12 +44,11 @@ fn strip_inline(s: &str) -> String {
         };
         out.push_str(&rest[..open]);
         let inner = &rest[open + 2..close];
-        let text = match inner.split_once('|') {
-            Some((_, label)) if !label.is_empty() => label.to_string(),
-            _ => {
-                let target = inner.split('|').next().unwrap_or(inner);
-                target.split('#').next().unwrap_or(target).replace('_', " ")
-            }
+        let (target, label) = inner.split_once('|').unwrap_or((inner, ""));
+        let text = if !label.is_empty() {
+            label.to_string()
+        } else {
+            target.split_once('#').map_or(target, |(t, _)| t).replace('_', " ")
         };
         out.push_str(&text);
         rest = &rest[close + 2..];
