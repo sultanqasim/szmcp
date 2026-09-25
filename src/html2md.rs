@@ -595,6 +595,12 @@ impl InlineCtx {
     }
 }
 
+/// The fresh context a link's own label renders in: verbatim text,
+/// emphasis stripped, no nested-link handling.
+fn link_label_ctx() -> InlineCtx {
+    InlineCtx { no_escape: true, in_link: true, ..Default::default() }
+}
+
 /// Render one element (or text node) in inline context.
 fn render_inline(node: NodeRef, ctx: InlineCtx) -> String {
     if let NodeKind::Text(t) = node.kind() {
@@ -811,7 +817,7 @@ fn render_anchor(el: NodeRef, ctx: InlineCtx) -> String {
     }
     // fresh link-label context: '*' verbatim, emphasis stripped (the
     // outer <br> and hatnote contexts do not leak into the label)
-    let label = render_children(el, InlineCtx { no_escape: true, in_link: true, ..Default::default() });
+    let label = render_children(el, link_label_ctx());
 
     // Hatnote edit/admin anchor: an edit-section widget inside a hatnote
     // renders as a clean wikilink to the URL's title parameter.
@@ -1204,12 +1210,7 @@ pub(crate) fn block_md_in(ch: NodeRef, in_blockquote: bool, keep_category_links:
             if is_media_href(href) {
                 return String::new();
             }
-            let label = collapse_ws(&render_children(
-                ch,
-                InlineCtx { no_escape: true, in_link: true, ..Default::default() },
-            ))
-            .trim()
-            .to_string();
+            let label = collapse_ws(&render_children(ch, link_label_ctx())).trim().to_string();
             anchor_md(ch, href, &label, None, false, keep_category_links)
         }
         _ => render_block_container(ch, in_blockquote, keep_category_links),
@@ -1352,12 +1353,7 @@ fn categories_section(root: NodeRef, lang: Option<&str>) -> String {
                 continue;
             }
             // Like render_anchor's label: verbatim text, flattened markup.
-            let label = render_children(
-                a,
-                InlineCtx { no_escape: true, in_link: true, ..Default::default() },
-            )
-            .trim()
-            .to_string();
+            let label = render_children(a, link_label_ctx()).trim().to_string();
             if label.is_empty() {
                 continue; // no text to label the category with
             }
