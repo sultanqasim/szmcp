@@ -545,18 +545,17 @@ fn repair_line(ln: &str) -> String {
 fn rejoin_split_lists(lines: Vec<String>, prot: &[bool]) -> Vec<String> {
     let list_item = re(r"^\s*(?:[-*+]|\d+[.)])\s");
     let mut out: Vec<String> = Vec::new();
-    for (i, ln) in lines.iter().enumerate() {
+    let mut it = lines.into_iter().enumerate().peekable();
+    while let Some((i, ln)) = it.next() {
         if ln.trim().is_empty()
             && !prot[i]
             && !out.is_empty()
-            && i + 1 < lines.len()
-            && !prot[i + 1]
+            && matches!(it.peek(), Some((j, next)) if !prot[*j] && list_item.is_match(next))
             && list_item.is_match(out.last().unwrap())
-            && list_item.is_match(&lines[i + 1])
         {
             continue;
         }
-        out.push(ln.clone());
+        out.push(ln);
     }
     out
 }
