@@ -136,6 +136,7 @@ fn indexing_language(raw: Option<&str>) -> String {
         .split(|c: char| c == ',' || c == ';' || c.is_whitespace())
         .find(|t| !t.is_empty())
         .map(|t| t.split('-').next().unwrap().to_lowercase())
+        .filter(|t| !t.is_empty())
         .unwrap_or_else(|| "eng".to_string())
 }
 
