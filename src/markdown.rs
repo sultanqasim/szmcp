@@ -236,10 +236,8 @@ fn md_paragraphs(lines: &[&str]) -> Vec<String> {
 pub fn sections(md: &str) -> Vec<(String, Vec<String>)> {
     let lines: Vec<&str> = md.lines().collect();
     let headings = collect_headings(&lines);
-    let (intro_start, first_section) = title_split(&lines, &headings);
-    let intro_end = headings
-        .get(first_section)
-        .map_or(lines.len(), |h| h.line);
+    let (intro_start, intro_end) = intro_bounds(&lines, &headings);
+    let first_section = usize::from(intro_start > 0); // a leading title was dropped
     let mut out = vec![(INTRO_SECTION.to_string(), md_paragraphs(&lines[intro_start..intro_end]))];
     for (i, h) in headings.iter().enumerate().skip(first_section) {
         let end = headings[i + 1..]
@@ -260,10 +258,7 @@ pub fn sections(md: &str) -> Vec<(String, Vec<String>)> {
 pub fn intro_paragraphs(md: &str) -> Vec<String> {
     let lines: Vec<&str> = md.lines().collect();
     let headings = collect_headings(&lines);
-    let (intro_start, first_section) = title_split(&lines, &headings);
-    let intro_end = headings
-        .get(first_section)
-        .map_or(lines.len(), |h| h.line);
+    let (intro_start, intro_end) = intro_bounds(&lines, &headings);
     md_paragraphs(&lines[intro_start..intro_end])
 }
 
@@ -278,6 +273,13 @@ fn title_split(lines: &[&str], headings: &[Heading]) -> (usize, usize) {
         Some(t) => (t.line + 1, 1),
         None => (0, 0),
     }
+}
+
+/// The intro region's line range: per [`title_split`] for the start, ending
+/// at the first section heading's line (the document's end if there is none).
+fn intro_bounds(lines: &[&str], headings: &[Heading]) -> (usize, usize) {
+    let (intro_start, first_section) = title_split(lines, headings);
+    (intro_start, headings.get(first_section).map_or(lines.len(), |h| h.line))
 }
 
 struct Heading {
@@ -351,10 +353,7 @@ pub fn section_content(md: &str, name: &str) -> Option<(String, String)> {
     // The reserved intro name can never match a heading text, so it is
     // special-cased before the heading search.
     if target == normalize(INTRO_SECTION) {
-        let (intro_start, first_section) = title_split(&lines, &headings);
-        let end = headings
-            .get(first_section)
-            .map_or(lines.len(), |h| h.line);
+        let (intro_start, end) = intro_bounds(&lines, &headings);
         let content = lines[intro_start..end].join("\n");
         return Some((INTRO_SECTION.to_string(), content.trim().to_string()));
     }
