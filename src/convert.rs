@@ -1341,21 +1341,18 @@ pub fn convert(
 
         // Embedded index blobs first (the content order libzim's finish
         // produces: fulltext, title, then counter and listing at finish_write).
+        // From here on finalize is single-threaded (the walk workers and the
+        // indexer are joined), so ONE lock guard serves it through finish_write.
+        let mut zc = creator.lock().unwrap();
         if let Some(path) = ft_file {
-            creator
-                .lock()
-                .unwrap()
-                .add_xapian_index("fulltext/xapian", path)
+            zc.add_xapian_index("fulltext/xapian", path)
                 .map_err(|e| format!("fulltext index: {e}"))?;
         }
         if let Some(path) = ti_file {
-            creator
-                .lock()
-                .unwrap()
-                .add_xapian_index("title/xapian", path)
+            zc.add_xapian_index("title/xapian", path)
                 .map_err(|e| format!("title index: {e}"))?;
         }
-        creator.lock().unwrap().begin_write().map_err(|e| format!("finalizing: {e}"))?;
+        zc.begin_write().map_err(|e| format!("finalizing: {e}"))?;
 
         // Member dirents in SOURCE order (the archive's entry order); the
         // terminal of a member redirect rides in its record — no re-resolution,
@@ -1375,7 +1372,8 @@ pub fn convert(
                 .map_err(|e| format!("reading entry {idx}: {e}"))?;
             let title = entry_title(&entry.title, &entry.url);
             let out_idx = rank.rank(idx as usize);
-            let article = rec.flags.load(Ordering::Relaxed) & REC_ARTICLE != 0;
+            let f = rec.flags.load(Ordering::Relaxed);
+            let article = f & REC_ARTICLE != 0;
             if article || index_redirect_titles {
                 if arena.len() + title.len() + 1 > u32::MAX as usize {
                     return Err("listing title arena exceeds 4 GiB".to_string());
@@ -1386,13 +1384,13 @@ pub fn convert(
                 rows.push((off << 32) | out_idx as u64);
             }
             if article {
-                creator.lock().unwrap().emit_dirent(DirentOut::Item {
+                zc.emit_dirent(DirentOut::Item {
                     ns: b'C',
                     path: entry.url.clone(),
                     title,
                     mime: "text/markdown".to_string(),
                     blob: BlobRef {
-                        compress: rec.flags.load(Ordering::Relaxed) & REC_COMPRESS != 0,
+                        compress: f & REC_COMPRESS != 0,
                         generation: rec.a.load(Ordering::Relaxed),
                         blob: rec.b.load(Ordering::Relaxed),
                     },
@@ -1403,7 +1401,7 @@ pub fn convert(
                 }
                 converted += 1;
             } else {
-                creator.lock().unwrap().emit_dirent(DirentOut::Redirect {
+                zc.emit_dirent(DirentOut::Redirect {
                     ns: b'C',
                     path: entry.url.clone(),
                     title,
@@ -1427,7 +1425,7 @@ pub fn convert(
         }
         drop(rows);
         drop(arena);
-        creator.lock().unwrap().set_listing_bytes(listing_blob);
+        zc.set_listing_bytes(listing_blob);
 
         // Main path: the source main page if its article was written, else the
         // first written article - as a RESOLVED target entry index.
@@ -1437,14 +1435,8 @@ pub fn convert(
             })
             .map(|i| rank.rank(i as usize))
             .or(first_member_article);
-        creator
-            .lock()
-            .unwrap()
-            .set_main_page_target(main_target);
-        creator
-            .lock()
-            .unwrap()
-            .finish_write()
+        zc.set_main_page_target(main_target);
+        zc.finish_write()
             .map_err(|e| format!("finalizing {}: {e}", outfile.display()))?;
 
         // Summary (stderr, like all human output of this subcommand).
