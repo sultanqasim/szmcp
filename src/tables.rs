@@ -415,9 +415,7 @@ pub(crate) fn render_table(tbl: NodeRef) -> String {
         .unzip();
     if rows.is_empty()
         || (as_html
-            && texts
-                .iter()
-                .all(|row| row.iter().all(|t| t.replace("<br>", "").trim().is_empty())))
+            && texts.iter().flatten().all(|t| t.split("<br>").all(|p| p.trim().is_empty())))
     {
         return nested_md;
     }
