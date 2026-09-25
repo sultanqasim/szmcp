@@ -1143,15 +1143,14 @@ fn render_hatnote(el: NodeRef, keep_category_links: bool) -> String {
 /// (level, markdown heading text) for a bare hN or a mw-heading wrapper.
 fn heading_of(el: NodeRef) -> Option<(u32, String)> {
     let tag = el.tag()?;
-    let h = if heading_level(tag).is_some() {
-        el
+    let (h, mut level) = if let Some(level) = heading_level(tag) {
+        (el, level)
     } else if tag == "div" && el.class_tokens().any(|c| c.starts_with("mw-heading")) {
         el.element_children()
-            .find(|ch| ch.tag().and_then(heading_level).is_some())?
+            .find_map(|ch| Some((ch, heading_level(ch.tag()?)?)))?
     } else {
         return None;
     };
-    let mut level = heading_level(h.tag()?).unwrap();
     if level == 1 {
         level = 2; // in-body h1 is not expected; treat defensively as h2
     }
