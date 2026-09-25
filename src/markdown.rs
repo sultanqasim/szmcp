@@ -298,10 +298,9 @@ struct Heading {
 /// `_r`).
 fn heading_key(s: &str) -> String {
     let no_markers: String = s.chars().filter(|&c| c != '*' && c != '`').collect();
-    let parts: Vec<&str> = no_markers.split('_').collect();
     // An even number of `_` markers reads as paired emphasis (`_like this_`)
     // and is dropped; a lone one is subscript math and stays.
-    let text = if parts.len() % 2 == 1 { parts.concat() } else { no_markers.clone() };
+    let text = if no_markers.matches('_').count() % 2 == 0 { no_markers.replace('_', "") } else { no_markers };
     normalize(&text)
 }
 
