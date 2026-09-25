@@ -1264,15 +1264,8 @@ pub(crate) fn block_children_md(
 fn get_parser_output(root: NodeRef) -> Option<NodeRef> {
     for ct in root.descendants() {
         if ct.attr("id") == Some("mw-content-text") {
-            for ch in ct.element_children() {
-                if ch.has_class("mw-parser-output") {
-                    return Some(ch);
-                }
-            }
-            for el in ct.descendants() {
-                if el.is_element() && el.has_class("mw-parser-output") {
-                    return Some(el);
-                }
+            if let Some(el) = ct.descendants().find(|el| el.has_class("mw-parser-output")) {
+                return Some(el);
             }
         }
     }
