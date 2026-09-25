@@ -1235,10 +1235,8 @@ pub(crate) fn block_children_md(
         if tables::is_infobox_container(ch) {
             continue; // infoboxes are rendered separately (key_facts_of)
         }
-        let tag = ch.tag().unwrap_or("");
         // one heading lookup for the Key facts placement test
-        let heading =
-            if tag == "div" || heading_level(tag).is_some() { heading_of(ch) } else { None };
+        let heading = heading_of(ch);
         if let (Some(kf), Some(_)) = (key_facts_pending, heading) {
             out.push(kf.to_string());
             key_facts_pending = None;
