@@ -177,17 +177,11 @@ fn cell_html_text(cell: NodeRef) -> String {
 /// as `* item` / `1. item` lines instead of being flattened to
 /// space-separated text in a pipe table.
 fn is_complex_table(rows: &[NodeRef]) -> bool {
-    for tr in rows {
-        for c in row_cells(*tr) {
-            if span_attr(c, "rowspan").unwrap_or(1) > 1 || span_attr(c, "colspan").unwrap_or(1) > 1 {
-                return true;
-            }
-            if has_list_descendant(c) {
-                return true;
-            }
-        }
-    }
-    false
+    rows.iter().flat_map(|&tr| row_cells(tr)).any(|c| {
+        span_attr(c, "rowspan").unwrap_or(1) > 1
+            || span_attr(c, "colspan").unwrap_or(1) > 1
+            || has_list_descendant(c)
+    })
 }
 
 /// Render parsed rows as an HTML table: spans preserved as rowspan=/
