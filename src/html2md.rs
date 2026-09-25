@@ -20,14 +20,16 @@ use crate::util::{
 // Section headings whose entire section is dropped live in cleanup.rs.
 
 /// Link namespaces dropped entirely (files/media/categories): the whole
-/// link vanishes while its surroundings stay.
-const DROP_LINK_NS: &[&str] = &["file:", "image:", "media:", "category:"];
+/// link vanishes while its surroundings stay. Heads, without the colon.
+const DROP_LINK_NS: &[&str] = &["file", "image", "media", "category"];
+
+/// The namespace head of a wiki target: before the first ':' past leading colons.
+fn ns_head(target: &str) -> Option<&str> {
+    target.trim_start_matches(':').split_once(':').map(|(head, _)| head)
+}
 
 fn in_dropped_ns(target: &str) -> bool {
-    let Some((head, _)) = target.trim_start_matches(':').split_once(':') else {
-        return false;
-    };
-    DROP_LINK_NS.contains(&format!("{}:", head.to_lowercase()).as_str())
+    ns_head(target).is_some_and(|head| DROP_LINK_NS.iter().any(|ns| ns.eq_ignore_ascii_case(head)))
 }
 
 /// Wiki language name -> markdown fence language.
@@ -1308,10 +1310,7 @@ fn find_id<'a>(el: NodeRef<'a>, id: &str) -> Option<NodeRef<'a>> {
 /// True for a `[[Category:…]]` target (leading colons tolerated, like
 /// `in_dropped_ns`'s head match).
 fn is_category_target(target: &str) -> bool {
-    target
-        .trim_start_matches(':')
-        .split_once(':')
-        .is_some_and(|(head, _)| head.to_lowercase() == "category")
+    ns_head(target).is_some_and(|head| head.eq_ignore_ascii_case("category"))
 }
 
 /// The category page's member/subcategory section: div.mw-category-generated,
