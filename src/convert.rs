@@ -604,6 +604,25 @@ type QueuedDoc = (Option<Document>, Option<Document>, String);
 /// the caller. The first add/commit error stops it: returning drops `rx`,
 /// disconnecting the channel, so every worker's `send` fails instead of
 /// hanging; on error the final commits are skipped.
+/// One indexed document (`None` = that database does not index the
+/// article): add, count, and commit every [`COMMIT_EVERY`]-th add; the add
+/// error keeps `"{add} {path:?}: {e}"`, commit errors `"{what} index commit: {e}"`.
+fn add_and_pace(
+    db: &mut WritableDatabase,
+    doc: Option<&Document>,
+    docs: &AtomicU64,
+    what: &str,
+    add: &str,
+    path: &str,
+) -> Result<(), String> {
+    let Some(doc) = doc else { return Ok(()) };
+    db.add_document(doc).map_err(|e| format!("{add} {path:?}: {e}"))?;
+    if (docs.fetch_add(1, Ordering::Relaxed) + 1) % COMMIT_EVERY == 0 {
+        db.commit().map_err(|e| format!("{what} index commit: {e}"))?;
+    }
+    Ok(())
+}
+
 fn run_indexer(
     mut ft: WritableDatabase,
     mut ti: WritableDatabase,
@@ -611,37 +630,16 @@ fn run_indexer(
     ft_docs: &AtomicU64,
     ti_docs: &AtomicU64,
 ) -> (WritableDatabase, WritableDatabase, Result<(), String>) {
-    while let Ok((ft_doc, ti_doc, path)) = rx.recv() {
-        if let Some(ft_doc) = ft_doc {
-            if let Err(e) = ft.add_document(&ft_doc) {
-                return (ft, ti, Err(format!("indexing {path:?}: {e}")));
-            }
-            let d = ft_docs.fetch_add(1, Ordering::Relaxed) + 1;
-            if d % COMMIT_EVERY == 0 {
-                if let Err(e) = ft.commit() {
-                    return (ft, ti, Err(format!("fulltext index commit: {e}")));
-                }
-            }
+    let result = (|| -> Result<(), String> {
+        while let Ok((ft_doc, ti_doc, path)) = rx.recv() {
+            add_and_pace(&mut ft, ft_doc.as_ref(), ft_docs, "fulltext", "indexing", &path)?;
+            add_and_pace(&mut ti, ti_doc.as_ref(), ti_docs, "title", "title indexing", &path)?;
         }
-        if let Some(ti_doc) = ti_doc {
-            if let Err(e) = ti.add_document(&ti_doc) {
-                return (ft, ti, Err(format!("title indexing {path:?}: {e}")));
-            }
-            let d = ti_docs.fetch_add(1, Ordering::Relaxed) + 1;
-            if d % COMMIT_EVERY == 0 {
-                if let Err(e) = ti.commit() {
-                    return (ft, ti, Err(format!("title index commit: {e}")));
-                }
-            }
-        }
-    }
-    if let Err(e) = ft.commit() {
-        return (ft, ti, Err(format!("fulltext index commit: {e}")));
-    }
-    if let Err(e) = ti.commit() {
-        return (ft, ti, Err(format!("title index commit: {e}")));
-    }
-    (ft, ti, Ok(()))
+        ft.commit().map_err(|e| format!("fulltext index commit: {e}"))?;
+        ti.commit().map_err(|e| format!("title index commit: {e}"))?;
+        Ok(())
+    })();
+    (ft, ti, result)
 }
 
 /// True for a MediaWiki category page: the `<body …>` tag's class attribute
