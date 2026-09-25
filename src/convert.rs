@@ -1579,6 +1579,9 @@ mod e2e {
     const CSS: &[u8] = b"body{color:red}";
     const FAKE_PNG: &[u8] = b"\x89PNG\r\n\x1a\n-fake-48x48-illustration-";
 
+    /// The archive MIME list of the main fixture (and its variants).
+    const FIXTURE_MIMES: [&str; 4] = ["text/html", "text/css", "text/plain;charset=UTF-8", "image/png"];
+
     /// The synthetic source: three HTML articles (one accented), one CSS
     /// asset, two redirects (one to Apple, one to Banana), core metadata
     /// with Language=fra, and a 48x48 illustration. The main page is Apple.
@@ -1598,13 +1601,8 @@ mod e2e {
             TestRedirect { namespace: b'C', url: "Apple_fruit", title: "", target_content: 0 },
             TestRedirect { namespace: b'C', url: "Alt_Banana", title: "Alternate Banana", target_content: 1 },
         ];
-        build_archive(
-            &["text/html", "text/css", "text/plain;charset=UTF-8", "image/png"],
-            &content,
-            &redirects,
-            0, // main page: Apple
-            None,
-        )
+        // main page: Apple
+        build_archive(&FIXTURE_MIMES, &content, &redirects, 0, None)
     }
 
     struct Converted {
@@ -1612,13 +1610,20 @@ mod e2e {
         zim: Zim,
     }
 
-    fn convert_fixture(limit: i64, intro_only: bool, redirect_titles: bool, exclude_categories: bool) -> Converted {
+    /// The shared convert-and-open boilerplate: write `bytes` as the source
+    /// ZIM into a fresh temp dir, convert it with the given arguments, and
+    /// open the output. The returned TempDir must outlive the opened Zim.
+    fn convert_in_dir(bytes: &[u8], limit: i64, intro_only: bool, redirect_titles: bool, exclude_categories: bool) -> (tempfile::TempDir, Zim) {
         let dir = tempfile::tempdir().unwrap();
         let src = dir.path().join("src.zim");
-        std::fs::write(&src, fixture()).unwrap();
+        std::fs::write(&src, bytes).unwrap();
         let out = dir.path().join("out.zim");
         convert(&src, &out, limit, intro_only, redirect_titles, exclude_categories).unwrap();
-        let zim = Zim::open(&out).unwrap();
+        (dir, Zim::open(&out).unwrap())
+    }
+
+    fn convert_fixture(limit: i64, intro_only: bool, redirect_titles: bool, exclude_categories: bool) -> Converted {
+        let (dir, zim) = convert_in_dir(&fixture(), limit, intro_only, redirect_titles, exclude_categories);
         Converted { _dir: dir, zim }
     }
 
@@ -1643,6 +1648,19 @@ mod e2e {
             }
         }
         None
+    }
+
+    /// The (value 0, value 1) pair of the title-index document whose data is
+    /// `data` (docids race with worker completion, so the value checks key
+    /// by data, like every other racing docid comparison).
+    fn title_doc_by_data(db: &xapian2::Database, data: &str) -> (Vec<u8>, Vec<u8>) {
+        for d in 1..=db.doc_count() {
+            let mut doc = db.get_document(d).unwrap();
+            if doc.data_str().unwrap() == data {
+                return (doc.value(0).unwrap(), doc.value(1).unwrap());
+            }
+        }
+        panic!("title doc {data} missing");
     }
 
     /// One regular article with a one-category catlinks bar (wiki body, the
@@ -1720,12 +1738,7 @@ mod e2e {
     /// category page and the pagination fragment like articles (the page
     /// title-indexed, the fragment unindexed).
     fn convert_category_fixture(exclude_categories: bool) -> Converted {
-        let dir = tempfile::tempdir().unwrap();
-        let src = dir.path().join("src.zim");
-        std::fs::write(&src, category_fixture()).unwrap();
-        let out = dir.path().join("out.zim");
-        convert(&src, &out, -1, false, false, exclude_categories).unwrap();
-        let zim = Zim::open(&out).unwrap();
+        let (dir, zim) = convert_in_dir(&category_fixture(), -1, false, false, exclude_categories);
         Converted { _dir: dir, zim }
     }
 
@@ -1772,16 +1785,13 @@ mod e2e {
                 });
             }
         }
-        let dir = tempfile::tempdir().unwrap();
-        let src = dir.path().join("src.zim");
-        std::fs::write(
-            &src,
-            build_archive(&["text/html", "image/png"], &content, &redirects, 0, None),
-        )
-        .unwrap();
-        let out = dir.path().join("out.zim");
-        convert(&src, &out, -1, false, false, false).unwrap();
-        let z = Zim::open(&out).unwrap();
+        let (_dir, z) = convert_in_dir(
+            &build_archive(&["text/html", "image/png"], &content, &redirects, 0, None),
+            -1,
+            false,
+            false,
+            false,
+        );
 
         // Every article is present as text/markdown, in SOURCE member
         // order: the source holds all 1200 articles first (media skipped
@@ -1853,12 +1863,11 @@ mod e2e {
 
         // The redirect was recreated against the new path space, its empty
         // dirent title replaced by the URL-derived fallback.
-        let (target_idx, target) = terminal(z, b'C', "Apple_fruit").unwrap();
+        let (_, target) = terminal(z, b'C', "Apple_fruit").unwrap();
         assert_eq!(target.url, "Apple");
         let redirect_idx = z.find_entry(b'C', "Apple_fruit").unwrap().unwrap();
         let redirect = z.get_entry(redirect_idx).unwrap();
         assert_eq!(redirect.title, "Apple fruit");
-        let _ = target_idx;
 
         // Non-HTML assets are skipped entirely.
         assert!(z.resolve_path("C/style.css").unwrap().is_none());
@@ -1946,19 +1955,10 @@ mod e2e {
         // walk, redirect titles after the join), so the value checks key by
         // data, like every other racing docid comparison.
         assert_eq!(title.doc_count(), 5);
-        let doc_by_data = |data: &str| -> (Vec<u8>, Vec<u8>) {
-            for d in 1..=title.doc_count() {
-                let mut doc = title.get_document(d).unwrap();
-                if doc.data_str().unwrap() == data {
-                    return (doc.value(0).unwrap(), doc.value(1).unwrap());
-                }
-            }
-            panic!("title doc {data} missing");
-        };
-        let (v0, v1) = doc_by_data("C/Alt_Banana");
+        let (v0, v1) = title_doc_by_data(&title, "C/Alt_Banana");
         assert_eq!(v0, b"Alternate Banana".to_vec());
         assert_eq!(v1, b"Banana".to_vec());
-        let (v0, v1) = doc_by_data("C/Apple_fruit");
+        let (v0, v1) = title_doc_by_data(&title, "C/Apple_fruit");
         assert_eq!(v0, b"Apple fruit".to_vec());
         assert_eq!(v1, b"Apple".to_vec());
 
@@ -2013,24 +2013,13 @@ mod e2e {
     fn language_metadata_verbatim_and_fallback() {
         // The Language metadata is copied VERBATIM even when it is a
         // multi-code value; the indexing language is its first code.
-        let dir = tempfile::tempdir().unwrap();
-        let src = dir.path().join("src.zim");
         let mut content = vec![
             TestEntry { namespace: b'C', url: "Apple", title: "Apple", mime: 0, body: APPLE_HTML.as_bytes() },
             TestEntry { namespace: b'M', url: "Language", title: "", mime: 2, body: b"fra,eng" },
         ];
         let redirects: Vec<TestRedirect> = vec![];
-        let bytes = build_archive(
-            &["text/html", "text/css", "text/plain;charset=UTF-8", "image/png"],
-            &content,
-            &redirects,
-            0,
-            None,
-        );
-        std::fs::write(&src, bytes).unwrap();
-        let out = dir.path().join("out.zim");
-        convert(&src, &out, -1, false, false, false).unwrap();
-        let z = Zim::open(&out).unwrap();
+        let bytes = build_archive(&FIXTURE_MIMES, &content, &redirects, 0, None);
+        let (_dir, z) = convert_in_dir(&bytes, -1, false, false, false);
         assert_eq!(blob_of(&z, b'M', "Language"), Some(b"fra,eng".to_vec()));
         let ft = z.open_fulltext_xapian().unwrap().unwrap();
         // The raw (first) code, not the ICU-mapped one, is stored.
@@ -2038,17 +2027,8 @@ mod e2e {
 
         // Without any Language metadata the normalized default is written.
         content.pop();
-        let bytes = build_archive(
-            &["text/html", "text/css", "text/plain;charset=UTF-8", "image/png"],
-            &content,
-            &redirects,
-            0,
-            None,
-        );
-        std::fs::write(&src, bytes).unwrap();
-        let out = dir.path().join("out2.zim");
-        convert(&src, &out, -1, false, false, false).unwrap();
-        let z = Zim::open(&out).unwrap();
+        let bytes = build_archive(&FIXTURE_MIMES, &content, &redirects, 0, None);
+        let (_dir, z) = convert_in_dir(&bytes, -1, false, false, false);
         assert_eq!(blob_of(&z, b'M', "Language"), Some(b"eng".to_vec()));
         let ft = z.open_fulltext_xapian().unwrap().unwrap();
         assert_eq!(ft.get_metadata("language").unwrap(), "eng");
@@ -2097,22 +2077,11 @@ mod e2e {
             TestEntry { namespace: b'C', url: "Stub", title: "Stub", mime: 0, body: STUB_HTML.as_bytes() },
             TestEntry { namespace: b'M', url: "Language", title: "", mime: 2, body: b"eng" },
         ];
-        build_archive(
-            &["text/html", "text/css", "text/plain;charset=UTF-8", "image/png"],
-            &content,
-            &[],
-            0,
-            None,
-        )
+        build_archive(&FIXTURE_MIMES, &content, &[], 0, None)
     }
 
     fn convert_stub_fixture(redirect_titles: bool) -> Converted {
-        let dir = tempfile::tempdir().unwrap();
-        let src = dir.path().join("src.zim");
-        std::fs::write(&src, stub_fixture()).unwrap();
-        let out = dir.path().join("out.zim");
-        convert(&src, &out, -1, false, redirect_titles, false).unwrap();
-        let zim = Zim::open(&out).unwrap();
+        let (dir, zim) = convert_in_dir(&stub_fixture(), -1, false, redirect_titles, false);
         Converted { _dir: dir, zim }
     }
 
@@ -2149,17 +2118,14 @@ mod e2e {
         assert_eq!(z.open_fulltext_xapian().unwrap().unwrap().doc_count(), 1);
         let ti = z.open_title_xapian().unwrap().unwrap();
         assert_eq!(ti.doc_count(), 2);
-        let doc_by_data = |data: &str| -> (Vec<u8>, Vec<u8>) {
-            for d in 1..=ti.doc_count() {
-                let mut doc = ti.get_document(d).unwrap();
-                if doc.data_str().unwrap() == data {
-                    return (doc.value(0).unwrap(), doc.value(1).unwrap());
-                }
-            }
-            panic!("title doc {data} missing");
-        };
-        assert_eq!(doc_by_data("C/Stub"), (b"Stub".to_vec(), b"Stub".to_vec()));
-        assert_eq!(doc_by_data("C/Apple"), (b"Apple".to_vec(), b"Apple".to_vec()));
+        assert_eq!(
+            title_doc_by_data(&ti, "C/Stub"),
+            (b"Stub".to_vec(), b"Stub".to_vec())
+        );
+        assert_eq!(
+            title_doc_by_data(&ti, "C/Apple"),
+            (b"Apple".to_vec(), b"Apple".to_vec())
+        );
     }
 
     #[test]
