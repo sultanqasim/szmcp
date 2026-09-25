@@ -205,15 +205,18 @@ fn md_link_url(url: &str) -> String {
     url.to_string()
 }
 
+/// (lead, core, trail) of `s`: the edge whitespace `s.trim()` cuts off.
+fn split_sides(s: &str) -> (&str, &str, &str) {
+    (&s[..s.len() - s.trim_start().len()], s.trim(), &s[s.trim_end().len()..])
+}
+
 /// Wrap contents in Markdown emphasis markers; edge whitespace moves
 /// outside the markers so `* vis *` never breaks the run.
 fn wrap_md_emphasis(inner: &str, mark: &str) -> String {
-    let core = inner.trim();
+    let (lead, core, trail) = split_sides(inner);
     if core.is_empty() {
         return inner.to_string();
     }
-    let lead = &inner[..inner.len() - inner.trim_start().len()];
-    let trail = &inner[inner.trim_end().len()..];
     format!("{}{}{}{}{}", lead, mark, core, mark, trail)
 }
 
@@ -671,11 +674,7 @@ fn render_inline(node: NodeRef, ctx: InlineCtx) -> String {
                 format!("${}$", alt)
             }
         }
-        "pre" => {
-            let content = node.text_content();
-            let code = content.trim_matches('\n');
-            format!("\n\n```\n{}\n```\n\n", code)
-        }
+        "pre" => format!("\n\n```\n{}\n```\n\n", pre_code(node)),
         "table" => String::new(),
         _ => render_children(node, ctx),
     }
@@ -744,7 +743,7 @@ fn anchor_md(
     in_link: bool,
     keep_category_links: bool,
 ) -> String {
-    let label_stripped = label.trim();
+    let (lead, label_stripped, trail) = split_sides(label);
     let scheme = href_scheme(href);
     if el.has_class("external") || el.attr("rel") == Some("nofollow") || scheme.is_some() {
         if scheme.as_deref() == Some("geo") {
@@ -755,8 +754,6 @@ fn anchor_md(
         if label_stripped.is_empty() || label_stripped == href {
             return format!("<{}>", href);
         }
-        let lead = &label[..label.len() - label.trim_start().len()];
-        let trail = &label[label.trim_end().len()..];
         return format!("{}[{}]({}){}", lead, label_stripped, md_link_url(href), trail);
     }
 
@@ -950,6 +947,12 @@ pub(crate) fn render_dl_ctx(el: NodeRef, depth: usize, keep_category_links: bool
     let mut out: Vec<String> = Vec::new();
     let indent = "  ".repeat(depth);
     let mut open_term: Option<usize> = None;
+    // A rendered sub-block joins the output only when it drew anything.
+    let push_sub = |out: &mut Vec<String>, sub_md: String| {
+        if !sub_md.is_empty() {
+            out.push(sub_md);
+        }
+    };
     for ch in el.children() {
         if !ch.is_element() || is_dropped(ch) {
             continue;
@@ -991,24 +994,15 @@ pub(crate) fn render_dl_ctx(el: NodeRef, depth: usize, keep_category_links: bool
                 }
                 for sub in ch.element_children() {
                     if matches!(sub.tag(), Some("ul") | Some("ol")) && !is_dropped(sub) {
-                        let sub_md = render_list_ctx(sub, depth + 1, keep_category_links);
-                        if !sub_md.is_empty() {
-                            out.push(sub_md);
-                        }
+                        push_sub(&mut out, render_list_ctx(sub, depth + 1, keep_category_links));
                     }
                 }
             }
             Some("ul") | Some("ol") => {
-                let sub_md = render_list_ctx(ch, depth + 1, keep_category_links);
-                if !sub_md.is_empty() {
-                    out.push(sub_md);
-                }
+                push_sub(&mut out, render_list_ctx(ch, depth + 1, keep_category_links));
             }
             Some("dl") => {
-                let sub_md = render_dl_ctx(ch, depth + 1, keep_category_links);
-                if !sub_md.is_empty() {
-                    out.push(sub_md);
-                }
+                push_sub(&mut out, render_dl_ctx(ch, depth + 1, keep_category_links));
             }
             _ => {}
         }
@@ -1066,15 +1060,18 @@ fn render_paragraph(p: NodeRef, in_blockquote: bool, keep_category_links: bool) 
     out
 }
 
+/// A <pre>'s code text: its text content without edge newlines.
+fn pre_code(el: NodeRef) -> String {
+    el.text_content().trim_matches('\n').to_string()
+}
+
 /// Fenced code block; language from a `lang-xxx` class via LANG_MAP.
 fn render_pre(pre: NodeRef) -> String {
     let lang = pre
         .class_tokens()
         .find_map(|c| c.strip_prefix("lang-").map(fence_lang))
         .unwrap_or_default();
-    let content = pre.text_content();
-    let code = content.trim_matches('\n');
-    format!("```{}\n{}\n```", lang, code)
+    format!("```{}\n{}\n```", lang, pre_code(pre))
 }
 
 /// `> ` line-per-line blockquote; empty lines inside become `>`.
