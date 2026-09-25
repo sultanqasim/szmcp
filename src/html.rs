@@ -168,6 +168,15 @@ fn skip_end(html: &str, open_i: usize, tag_name: &str) -> usize {
     }
 }
 
+/// Whether an open tag is skipped whole by the article scans: it names an
+/// `INTRO_SKIP_TAG` or carries hatnote attributes (`is_hatnote_attrs`). Only
+/// real open tags qualify (a comment could quote `class="hatnote"`).
+fn is_skip_tag(tag_name: &str, attrs: &str, opens: bool) -> bool {
+    opens
+        && (INTRO_SKIP_TAGS.iter().any(|t| tag_name.eq_ignore_ascii_case(t))
+            || is_hatnote_attrs(attrs))
+}
+
 /// The region of a MediaWiki page that holds the article: cut the page at
 /// the content div (`id="mw-content-text"`) so browser chrome (title bar,
 /// navigation menus) stays out. The article preview is only a prefix of the
@@ -231,14 +240,7 @@ pub fn intro_from_html(html: &str) -> String {
                 let Some((tag_name, attrs, opens, after)) = tag_at(html, i) else {
                     break;
                 };
-                // Skipped elements: INTRO_SKIP_TAGS plus hatnotes. Only a
-                // real open tag qualifies (a comment could quote
-                // `class="hatnote"` in its text). Jump to the element's
-                // close tag; failing that, drop just the open tag.
-                let skip = opens
-                    && (INTRO_SKIP_TAGS.iter().any(|t| tag_name.eq_ignore_ascii_case(t))
-                        || is_hatnote_attrs(attrs));
-                if skip {
+                if is_skip_tag(tag_name, attrs, opens) {
                     i = skip_end(html, i, tag_name);
                     sep = true;
                     continue;
@@ -320,10 +322,7 @@ fn paragraphs(html: &str) -> Vec<String> {
                 let Some((tag_name, attrs, opens, after)) = tag_at(html, i) else {
                     break;
                 };
-                let skip = opens
-                    && (INTRO_SKIP_TAGS.iter().any(|t| tag_name.eq_ignore_ascii_case(t))
-                        || is_hatnote_attrs(attrs));
-                if skip {
+                if is_skip_tag(tag_name, attrs, opens) {
                     i = skip_end(html, i, tag_name);
                     continue;
                 }
