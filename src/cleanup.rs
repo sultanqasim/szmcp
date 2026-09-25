@@ -128,6 +128,15 @@ fn has_close_table(ln: &str) -> bool {
     })
 }
 
+/// Step the shared ```-fence state machine (``` only); true for fence lines.
+fn fence_step(in_fence: &mut bool, ln: &str) -> bool {
+    if ln.trim_start().starts_with("```") {
+        *in_fence = !*in_fence;
+        return true;
+    }
+    *in_fence
+}
+
 /// Boolean per-line flags: fenced code blocks and HTML table blocks are
 /// protected from the whitespace/punctuation repairs.
 fn protected_lines(md: &str) -> Vec<bool> {
@@ -135,12 +144,7 @@ fn protected_lines(md: &str) -> Vec<bool> {
     let mut in_fence = false;
     let mut in_table = false;
     for ln in md.split('\n') {
-        if ln.trim_start().starts_with("```") {
-            prot.push(true);
-            in_fence = !in_fence;
-            continue;
-        }
-        if in_fence {
+        if fence_step(&mut in_fence, ln) {
             prot.push(true);
             continue;
         }
@@ -570,12 +574,7 @@ fn unescape_residue(md: &str) -> String {
     let mut out: Vec<String> = Vec::new();
     let mut in_fence = false;
     for ln in md.split('\n') {
-        if ln.trim_start().starts_with("```") {
-            in_fence = !in_fence;
-            out.push(ln.to_string());
-            continue;
-        }
-        if in_fence {
+        if fence_step(&mut in_fence, ln) {
             out.push(ln.to_string());
             continue;
         }
