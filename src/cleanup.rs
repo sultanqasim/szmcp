@@ -74,26 +74,7 @@ pub(crate) fn assemble(body_md: &str, lang: Option<&str>) -> String {
     let (intro, sections) = drop_section_blocks(body_md, lang);
     let mut alive: Vec<bool> = sections.iter().map(|_| false).collect();
 
-    // Bottom-up empty-section pruning: a section with content marks its
-    // nearest open ancestor alive.
-    let mut stack: Vec<usize> = Vec::new();
-    for i in 0..sections.len() {
-        while let Some(&top) = stack.last() {
-            if sections[top].0 >= sections[i].0 {
-                let popped = stack.pop().unwrap();
-                if alive[popped] {
-                    if let Some(&parent) = stack.last() {
-                        alive[parent] = true;
-                    }
-                }
-            } else {
-                break;
-            }
-        }
-        alive[i] = !sections[i].2.join("\n\n").trim().is_empty();
-        stack.push(i);
-    }
-    while let Some(popped) = stack.pop() {
+    fn propagate_alive(alive: &mut [bool], stack: &[usize], popped: usize) {
         if alive[popped] {
             if let Some(&parent) = stack.last() {
                 alive[parent] = true;
@@ -101,19 +82,36 @@ pub(crate) fn assemble(body_md: &str, lang: Option<&str>) -> String {
         }
     }
 
+    // Bottom-up empty-section pruning: a section with content marks its
+    // nearest open ancestor alive.
+    let mut stack: Vec<usize> = Vec::new();
+    for i in 0..sections.len() {
+        while let Some(&top) = stack.last() {
+            if sections[top].0 >= sections[i].0 {
+                let popped = stack.pop().unwrap();
+                propagate_alive(&mut alive, &stack, popped);
+            } else {
+                break;
+            }
+        }
+        alive[i] = sections[i].2.iter().any(|b| !b.trim().is_empty());
+        stack.push(i);
+    }
+    while let Some(popped) = stack.pop() {
+        propagate_alive(&mut alive, &stack, popped);
+    }
+
     let mut parts: Vec<String> = Vec::new();
-    let intro_md = intro.join("\n\n");
-    if !intro_md.trim().is_empty() {
-        parts.push(intro_md);
+    if intro.iter().any(|b| !b.trim().is_empty()) {
+        parts.push(intro.join("\n\n"));
     }
     for ((level, heading, body), alive) in sections.iter().zip(alive.iter()) {
         if !alive {
             continue;
         }
         parts.push(format!("{} {}", "#".repeat(*level as usize), heading));
-        let rendered = body.join("\n\n");
-        if !rendered.trim().is_empty() {
-            parts.push(rendered);
+        if body.iter().any(|b| !b.trim().is_empty()) {
+            parts.push(body.join("\n\n"));
         }
     }
     parts.join("\n\n")
