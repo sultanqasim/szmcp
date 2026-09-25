@@ -461,10 +461,7 @@ impl SinkInner {
     }
 
     fn push_text(&mut self, text: StrTendril) -> NodeId {
-        let id = self.nodes.len();
-        self.nodes.push(Node { kind: NodeKind::Text(text.to_string()), parent: None, children: Vec::new() });
-        self.names.push(QualName::new(None, html5ever::ns!(), html5ever::local_name!("")));
-        id
+        self.push_node(NodeKind::Text(text.to_string()))
     }
 }
 
