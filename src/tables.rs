@@ -235,11 +235,9 @@ fn table_to_pipe(rows: &[NodeRef], caption: &str, texts: &[Vec<String>]) -> Stri
         lines.push(pad(r));
     }
     let mut md = lines.join("\n");
-    let mut caption = caption.to_string();
     if !caption.is_empty() && !caption.contains('*') {
-        caption = format!("*{}*", caption); // plain caption -> italic
-    }
-    if !caption.is_empty() {
+        md = format!("*{}*\n\n{}", caption, md); // plain caption -> italic
+    } else if !caption.is_empty() {
         md = format!("{}\n\n{}", caption, md);
     }
     md
