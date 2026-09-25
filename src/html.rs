@@ -527,18 +527,16 @@ pub(crate) fn strip_style_script(html: &str) -> String {
         let name_end = after
             .find(|c: char| !c.is_ascii_alphanumeric())
             .unwrap_or(after.len());
-        let name = after[..name_end].to_ascii_lowercase();
-        let opens_element = !after.starts_with('/') && !after.starts_with('!');
-        if opens_element && matches!(name.as_str(), "style" | "script") {
+        let name = &after[..name_end];
+        let style_script = name.eq_ignore_ascii_case("style") || name.eq_ignore_ascii_case("script");
+        if style_script && !after.starts_with('/') && !after.starts_with('!') {
             // Skip to the matching close tag, or drop the rest if unclosed.
             let close = format!("</{}", name);
-            match find_ci(after.as_bytes(), name_end, close.as_bytes()) {
-                Some(cp) => {
-                    let end = after[cp..].find('>').map_or(after.len(), |g| cp + g + 1);
-                    rest = &after[end..];
-                }
-                None => return out,
-            }
+            let Some(cp) = find_ci(after.as_bytes(), name_end, close.as_bytes()) else {
+                return out;
+            };
+            let end = after[cp..].find('>').map_or(after.len(), |g| cp + g + 1);
+            rest = &after[end..];
         } else {
             out.push('<');
             rest = after;
