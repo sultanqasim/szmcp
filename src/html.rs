@@ -326,12 +326,9 @@ fn paragraphs(html: &str) -> Vec<String> {
                     i = skip_end(html, i, tag_name);
                     continue;
                 }
-                if opens && tag_name.eq_ignore_ascii_case("p") {
+                if tag_name.eq_ignore_ascii_case("p") {
                     push_para(&mut paras, &mut cur);
-                    in_p = true;
-                } else if !opens && tag_name.eq_ignore_ascii_case("p") {
-                    push_para(&mut paras, &mut cur);
-                    in_p = false;
+                    in_p = opens;
                 } else if opens && P_CLOSERS.iter().any(|t| tag_name.eq_ignore_ascii_case(t)) {
                     push_para(&mut paras, &mut cur);
                     in_p = false;
