@@ -58,12 +58,9 @@ pub(crate) fn row_cells(tr: NodeRef) -> Vec<NodeRef> {
 /// Integer value of a rowspan/colspan attribute, or None.
 pub(crate) fn span_attr(el: NodeRef, name: &str) -> Option<u32> {
     let v = el.attr(name)?;
-    let start = v.find(|c: char| c.is_ascii_digit())?;
-    let digits: &str = &v[start..];
-    let end = digits
-        .find(|c: char| !c.is_ascii_digit())
-        .unwrap_or(digits.len());
-    digits[..end].parse().ok()
+    let s = v.trim_start_matches(|c: char| !c.is_ascii_digit());
+    let end = s.find(|c: char| !c.is_ascii_digit()).unwrap_or(s.len());
+    s[..end].parse().ok()
 }
 
 /// Top-level nested tables of `tbl` that survive the drop rules (a
