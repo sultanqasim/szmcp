@@ -276,7 +276,8 @@ fn link_target_parts(path: &str, frag: &str) -> Option<String> {
         return None;
     }
     let path = path.strip_prefix(':').unwrap_or(path);
-    let decoded = if path.contains('%') { percent_decode(path) } else { path.to_string() };
+    // percent_decode is the identity on %-free paths (its own fast path).
+    let decoded = percent_decode(path);
     let mut target = decoded.replace('_', " ");
     if !frag.is_empty() && !frag.starts_with("cite_note") {
         target.push('#');
@@ -332,15 +333,9 @@ fn is_media_href(href: &str) -> bool {
     // triggering characters present, urlsplit's cleaning is the identity —
     // except that it would trim trailing C0/space, which this path (like
     // the Python original's identical fast path) deliberately keeps.
-    let plain = !href.contains(':')
-        && !href.contains('%')
-        && !href.contains('#')
-        && !href.contains('?')
-        && !href.contains('\t')
-        && !href.contains('\r')
-        && !href.contains('\n')
+    let plain = !href.contains([':', '%', '#', '?', '\t', '\r', '\n'])
         && !href.starts_with("//")
-        && href.as_bytes()[0] > b' ';
+        && href.as_bytes().first().is_some_and(|&b| b > b' ');
     if plain {
         return seg_is_media(href.rsplit('/').next().unwrap_or(""));
     }
