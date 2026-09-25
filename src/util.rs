@@ -120,13 +120,10 @@ pub(crate) fn urlsplit(url: &str) -> SplitUrl {
     if let Some(i) = rest.find(':') {
         if i > 0 {
             let head = &rest[..i];
-            let mut ok = head
-                .chars()
-                .next()
-                .map_or(false, |c| c.is_ascii_alphanumeric());
-            ok &= head
-                .chars()
-                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.'));
+            let ok = head.starts_with(|c: char| c.is_ascii_alphanumeric())
+                && head
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.'));
             if ok {
                 rest = &rest[i + 1..];
             }
