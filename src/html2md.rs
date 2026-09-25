@@ -180,8 +180,9 @@ fn is_wikidata_badge(el: NodeRef) -> bool {
     if !parts.path.starts_with("/wiki/") {
         return false;
     }
-    let label = collapse_ws(&el.text_content()).trim().to_string();
-    label.chars().count() == 1 && label.chars().next().map_or(false, |c| c.is_alphabetic())
+    let label = collapse_ws(&el.text_content());
+    let mut chars = label.trim().chars();
+    matches!((chars.next(), chars.next()), (Some(c), None) if c.is_alphabetic())
 }
 
 /// Direct children of `el` that are rendered at all.
@@ -620,7 +621,8 @@ fn render_inline(node: NodeRef, ctx: InlineCtx) -> String {
             // empty slots emit nothing (orphan ~~ / ^^ pairs would render
             // as GFM strikethrough).
             let mark = if tag == "sup" { "^" } else { "~" };
-            let inner = render_children(node, ctx).trim().to_string();
+            let inner = render_children(node, ctx);
+            let inner = inner.trim();
             if tag == "sup" && inner.starts_with('[') && inner.ends_with(']') {
                 return String::new();
             }
@@ -1133,8 +1135,7 @@ fn render_hatnote(el: NodeRef, keep_category_links: bool) -> String {
         .find_all("a")
         .iter()
         .any(|a| wiki_edit_target(a.attr("href").unwrap_or("")).is_some());
-    let txt = if has_edit { absorb_hatnote_mentions(&txt) } else { txt };
-    let txt = txt.trim().to_string();
+    let txt = if has_edit { absorb_hatnote_mentions(&txt).trim().to_string() } else { txt };
     if txt.is_empty() {
         return String::new();
     }
@@ -1379,12 +1380,8 @@ fn render_article(
     lang: Option<&str>,
 ) -> String {
     flatten_parsoid_sections(&mut dom, body);
-    let body_md = block_children_md(
-        dom.ref_(body),
-        if key_facts.is_empty() { None } else { Some(&key_facts) },
-        false,
-        keep_category_links,
-    );
+    let body_md =
+        block_children_md(dom.ref_(body), Some(&key_facts), false, keep_category_links);
     let content = cleanup::assemble(&body_md, lang);
     // The category page's member/subcategory section renders through the
     // same block walker as the body: its own <h2>Subcategories</h2> /
