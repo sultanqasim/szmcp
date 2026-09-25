@@ -890,7 +890,6 @@ pub fn convert(
             let mut arena: Vec<u8> = Vec::new();
             let mut found: Vec<ArticleCoord> = Vec::new();
             for idx in start..stop {
-                shared.processed.fetch_add(1, Ordering::Relaxed);
                 let (mime, target) = z
                     .entry_head(idx)
                     .map_err(|e| format!("reading entry {idx}: {e}"))?;
@@ -966,6 +965,7 @@ pub fn convert(
                     title: (title_off, entry.title.len() as u32),
                 });
             }
+            shared.processed.fetch_add((stop - start) as u64, Ordering::Relaxed);
             // One lock acquisition per 512-entry chunk, not per entry:
             // rebase the chunk-local offsets onto the shared arena, then
             // extend both under the same lock so coordinates and strings
@@ -981,7 +981,6 @@ pub fn convert(
             }
             pre.arena.extend_from_slice(&arena);
             pre.coords.append(&mut found);
-            drop(pre);
             Ok(())
         })?;
 
