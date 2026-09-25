@@ -146,15 +146,13 @@ impl Dom {
     /// lxml's `drop_tag`: replace the element with its children, merging
     /// its own text into the surrounding text (no-op when detached).
     pub fn drop_tag(&mut self, id: NodeId) {
-        let parent = self.parent_of(id);
+        let Some(parent) = self.parent_of(id) else { return };
         if self.nodes[id].children.is_empty() {
             // Nothing inside: the element vanishes, its tail stays.
             self.detach(id);
-        } else {
-            self.replace_with_children(id);
-        }
-        if let Some(parent) = parent {
             self.merge_text(parent);
+        } else {
+            self.replace_with_children(id); // ends with the merge itself
         }
     }
 
