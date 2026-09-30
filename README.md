@@ -62,7 +62,7 @@ path for non-wiki pages. The HTML to Markdown and ZIM rewriting code is
 horrendously complicated and far from beautiful, but it works.
 
 This project is unashamedly almost entirely vibe coded. I made it with GLM 5.3
-Flash mostly. Even this README was all LLM generated, aside from this one section.
+Flash mostly. Even this README was mostly LLM generated, aside from this section.
 I won't pretend this is some masterpiece, but it does the job and seems solid.
 You can connect it to the [llama.cpp](https://github.com/ggml-org/llama.cpp)
 llama-server web UI's built in agentic loop, or connect it to your own agent
@@ -108,18 +108,23 @@ and absolute paths are refused; symlinks are fine.
 
 Both classic HTML Wikipedia ZIMs and Markdown ZIMs (as produced by
 `szmcp convert`) are supported. `zim_get`/`zim_get_section` convert HTML
-wiki articles to Markdown on the fly (infoboxes render as a `## Key facts`
-section, boilerplate sections are dropped), so both kinds read the same way;
-the CLI's `--raw` flag returns the unconverted HTML. Search text and section
-extraction follow the article's MIME type.
+articles to Markdown on the fly. Wiki infoboxes render as a `## Key facts`
+section, and boilerplate sections and references are dropped. The conversion
+logic is tailored to give good quality Markdown conversion of Wikipedia
+articles, but can also convert non-wiki pages. The CLI's `--raw` flag on
+the `get` and `get_sections` subcommands returns the unconverted HTML.
 
 ## Converting an HTML ZIM to Markdown (`convert`)
 
-`szmcp convert` is a Rust port of `wikizim_parser/zim2zim.py`. It converts
-every `text/html` article to Markdown (same paths, infoboxes on), recreates
-redirects, copies the core metadata and illustration, and rebuilds the
-fulltext and title indexes. The output is a ZIM 6.x archive readable by
-libzim/Kiwix and this tool.
+The `convert` subcommand of `szmcp` converts every HTML article in a ZIM file
+to Markdown. It maintains the same article paths, and uses the same conversion
+logic as the `zim_get`/`zim_get_section` tools. It recreates redirects, copies
+the core metadata, and rebuilds the full-text and title search indexes. Images
+are excluded from the generated ZIM file. The output is a ZIM 6.x archive
+readable by libzim/Kiwix and this tool. The converter is multi-threaded and
+designed to be fairly memory efficient. Nonetheless, buulding a Xapian full-text
+search index for the full English Wikipedia is memory intensive, so 24+ GB of
+RAM is recommended if you are converting a `wikipedia_en_all` Kiwix archive.
 
 ```
 szmcp convert <input.zim> <output.zim> [--limit N] [--index-intro-only] [--index-redirect-titles]
