@@ -5,7 +5,9 @@ from [Kiwix ZIM files](https://www.kiwix.org/). The ZIM articles are exposed
 through a small set of tools, either as an MCP server over the streamable
 HTTP transport (with CORS headers so it can be used from browsers) or as
 one-shot CLI subcommands. There is also functionality to convert ZIM archives
-from HTML to Markdown for space efficiency and readability.
+from HTML to Markdown for space efficiency and readability, with special
+handling of MediaWiki features like infoboxes and formulas for clean,
+well-formatted, and information-preserving wiki page conversion.
 
 ## Why I made this
 
