@@ -855,11 +855,53 @@ pub(crate) fn render_inline_default(el: NodeRef) -> String {
 // Block-level rendering
 // ---------------------------------------------------------------------------
 
+/// The ordered-list marker (with its trailing space) for item number `n`:
+/// browsers render '1' decimal (the default), 'a'/'A' alpha, 'i'/'I'
+/// roman; anything else decimal.
+fn ol_marker(ol_type: Option<&str>, n: u64) -> String {
+    match ol_type {
+        Some("a") => format!("{}. ", alpha_label(n)),
+        Some("A") => format!("{}. ", alpha_label(n).to_uppercase()),
+        Some("i") => format!("{}. ", roman_label(n)),
+        Some("I") => format!("{}. ", roman_label(n).to_uppercase()),
+        _ => format!("{}. ", n),
+    }
+}
+
+/// 1 -> a, 26 -> z, 27 -> aa (bijective base 26, as browsers render).
+fn alpha_label(n: u64) -> String {
+    let mut n = n.max(1);
+    let mut out = Vec::new();
+    while n > 0 {
+        out.push((b'a' + ((n - 1) % 26) as u8) as char);
+        n = (n - 1) / 26;
+    }
+    out.into_iter().rev().collect()
+}
+
+/// 1 -> i, 4 -> iv, 9 -> ix, 14 -> xiv, 1994 -> mcmxciv, ...
+fn roman_label(n: u64) -> String {
+    let table = [
+        (1000, "m"), (900, "cm"), (500, "d"), (400, "cd"), (100, "c"), (90, "xc"),
+        (50, "l"), (40, "xl"), (10, "x"), (9, "ix"), (5, "v"), (4, "iv"), (1, "i"),
+    ];
+    let mut n = n.max(1);
+    let mut out = String::new();
+    for &(v, sym) in &table {
+        while n >= v {
+            out.push_str(sym);
+            n -= v;
+        }
+    }
+    out
+}
+
 /// One recursive pass over a <ul>/<ol>: the Markdown lines of its items,
-/// two-space indent per nesting level. A <ul>/<ol> child directly inside
-/// the list (loose nesting) nests under the preceding item. raw=True
-/// selects the HTML-table-cell variant (`* item` markers, `<br>` kept,
-/// text verbatim).
+/// two-space indent per nesting level, ordered items numbered like
+/// browsers do (counter honoring start/type/value). A <ul>/<ol> child
+/// directly inside the list (loose nesting) nests under the preceding
+/// item. raw=True selects the HTML-table-cell variant (`* item` markers,
+/// `<br>` kept, text verbatim).
 pub(crate) fn list_item_lines(list_el: NodeRef, depth: usize, raw: bool) -> Vec<String> {
     list_item_lines_ctx(list_el, depth, raw, false)
 }
@@ -872,13 +914,16 @@ pub(crate) fn list_item_lines_ctx(
     raw: bool,
     keep_category_links: bool,
 ) -> Vec<String> {
-    let marker = if list_el.tag() == Some("ol") {
-        "1. "
-    } else if raw {
-        "* "
-    } else {
-        "- "
-    };
+    let ordered = list_el.tag() == Some("ol");
+    let ol_type = list_el.attr("type");
+    let mut n: u64 = 1;
+    if ordered {
+        if let Some(s) = list_el.attr("start") {
+            if let Ok(v) = s.trim().parse::<i64>() {
+                n = v.max(0) as u64;
+            }
+        }
+    }
     let indent = "  ".repeat(depth);
     let br_mode = if raw { BrMode::Keep } else { BrMode::Space };
     let ctx = InlineCtx { no_escape: raw, br_mode, keep_category_links, ..Default::default() };
@@ -895,6 +940,20 @@ pub(crate) fn list_item_lines_ctx(
         if li.tag() != Some("li") || is_dropped(li) {
             continue;
         }
+        let marker = if ordered {
+            if let Some(s) = li.attr("value") {
+                if let Ok(v) = s.trim().parse::<i64>() {
+                    n = v.max(0) as u64;
+                }
+            }
+            let m = ol_marker(ol_type, n);
+            n += 1;
+            m
+        } else if raw {
+            "* ".to_string()
+        } else {
+            "- ".to_string()
+        };
         let mut parts: Vec<String> = Vec::new();
         let mut subs: Vec<NodeRef> = Vec::new();
         for ch in li.children() {
@@ -1961,6 +2020,42 @@ mod tests {
              - gestational risk if you:\n  - after the 28th week\n"
         );
         assert_eq!(body_doc("<ul><ul><li>orphan</li></ul></ul>"), "# T\n\n- orphan\n");
+    }
+
+    /// <ol> items number with a real counter honoring start/type/value the
+    /// way browsers render them; nested lists keep their own counters.
+    #[test]
+    fn ordered_lists_number_like_browsers() {
+        assert_eq!(
+            body_doc("<ol><li>First</li><li>Second</li></ol>"),
+            "# T\n\n1. First\n2. Second\n"
+        );
+        assert_eq!(body_doc("<ol start=\"3\"><li>Third</li></ol>"), "# T\n\n3. Third\n");
+        assert_eq!(
+            body_doc("<ol type=\"a\"><li>x</li><li>y</li></ol>"),
+            "# T\n\na. x\nb. y\n"
+        );
+        assert_eq!(
+            body_doc("<ol type=\"i\" start=\"4\"><li>x</li><li>y</li></ol>"),
+            "# T\n\niv. x\nv. y\n"
+        );
+        assert_eq!(body_doc("<ol type=\"I\"><li>x</li></ol>"), "# T\n\nI. x\n");
+        // <li value> repositions the counter
+        assert_eq!(
+            body_doc("<ol><li>a</li><li value=\"5\">b</li><li>c</li></ol>"),
+            "# T\n\n1. a\n5. b\n6. c\n"
+        );
+        // unknown type falls back to decimal; alpha wraps past z
+        assert_eq!(body_doc("<ol type=\"?\" start=\"27\"><li>x</li></ol>"), "# T\n\n27. x\n");
+        assert_eq!(
+            body_doc("<ol type=\"a\" start=\"26\"><li>x</li><li>y</li></ol>"),
+            "# T\n\nz. x\naa. y\n"
+        );
+        // nested ordered lists keep their own counters and types
+        assert_eq!(
+            body_doc("<ol><li>a<ol type=\"a\"><li>x</li></ol></li><li>b</li></ol>"),
+            "# T\n\n1. a\n  a. x\n2. b\n"
+        );
     }
 
     /// An inline-only container renders whole as one <p>-shaped
