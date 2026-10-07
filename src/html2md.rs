@@ -856,8 +856,10 @@ pub(crate) fn render_inline_default(el: NodeRef) -> String {
 // ---------------------------------------------------------------------------
 
 /// One recursive pass over a <ul>/<ol>: the Markdown lines of its items,
-/// two-space indent per nesting level. raw=True selects the HTML-table-
-/// cell variant (`* item` markers, `<br>` kept, text verbatim).
+/// two-space indent per nesting level. A <ul>/<ol> child directly inside
+/// the list (loose nesting) nests under the preceding item. raw=True
+/// selects the HTML-table-cell variant (`* item` markers, `<br>` kept,
+/// text verbatim).
 pub(crate) fn list_item_lines(list_el: NodeRef, depth: usize, raw: bool) -> Vec<String> {
     list_item_lines_ctx(list_el, depth, raw, false)
 }
@@ -882,6 +884,14 @@ pub(crate) fn list_item_lines_ctx(
     let ctx = InlineCtx { no_escape: raw, br_mode, keep_category_links, ..Default::default() };
     let mut out: Vec<String> = Vec::new();
     for li in list_el.children() {
+        // Loose nesting (invalid HTML browsers still render as a nested
+        // list): a <ul>/<ol> directly inside a list renders under the
+        // preceding item — at the list's own level when no item precedes.
+        if matches!(li.tag(), Some("ul") | Some("ol")) && !is_dropped(li) {
+            let sub_depth = if out.is_empty() { depth } else { depth + 1 };
+            out.extend(list_item_lines_ctx(li, sub_depth, raw, keep_category_links));
+            continue;
+        }
         if li.tag() != Some("li") || is_dropped(li) {
             continue;
         }
@@ -1933,6 +1943,24 @@ mod tests {
             wiki_doc("<p>A</p>stray unwrapped text<p>B</p>"),
             "# T\n\nA\n\nstray unwrapped text\n\nB\n"
         );
+    }
+
+    /// A <ul>/<ol> directly inside a list (sibling of the <li>s — the loose
+    /// nesting scraped HTML produces) nests under the preceding item; a
+    /// leading one stays at the list's own level.
+    #[test]
+    fn loose_nested_sublist_nests_under_preceding_item() {
+        assert_eq!(
+            body_doc(
+                "<ul><li>higher risk if you:</li>\
+                 <ul><li>overweight</li><li>over 35</li></ul>\
+                 <li>gestational risk if you:</li>\
+                 <ul><li>after the 28th week</li></ul></ul>"
+            ),
+            "# T\n\n- higher risk if you:\n  - overweight\n  - over 35\n\
+             - gestational risk if you:\n  - after the 28th week\n"
+        );
+        assert_eq!(body_doc("<ul><ul><li>orphan</li></ul></ul>"), "# T\n\n- orphan\n");
     }
 
     /// An inline-only container renders whole as one <p>-shaped
