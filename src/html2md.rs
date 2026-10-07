@@ -1405,7 +1405,7 @@ fn render_article(
     if !categories.is_empty() {
         parts.push(categories);
     }
-    cleanup::cleanup(&parts.join("\n\n"))
+    cleanup::cleanup(&parts.join("\n\n"), lang)
 }
 
 /// Convert HTML to Markdown.
@@ -1420,8 +1420,9 @@ fn render_article(
 /// whose text equals the output title is removed from the body before
 /// rendering (the title line replaces it); a differing `<h1>` stays and
 /// renders as a `## ` heading. `lang` (a ZIM/BCP-47 code; 'fra'/'fre'/'fr'
-/// select French) localizes the '## Key facts' heading and the dropped
-/// boilerplate sections. `include_categories` opt-in appends a localized
+/// select French, 'spa'/'esp'/'es' Spanish) localizes the '## Key facts'
+/// heading and the dropped boilerplate sections. `include_categories`
+/// opt-in appends a localized
 /// '## Categories' section listing the page's normal categories after the
 /// body content, and — for ordinary article text — lets `[[Category:…]]`
 /// links through the dropped-namespace rule (a hatnote's "See also:

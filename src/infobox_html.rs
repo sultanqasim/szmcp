@@ -1009,5 +1009,5 @@ pub(crate) fn infoboxes_to_markdown(dom: &Dom, boxes: &[Infobox], lang: Option<&
             lines.extend(b_lines.iter().cloned());
         }
     }
-    cleanup::cleanup(&lines.join("\n"))
+    cleanup::cleanup(&lines.join("\n"), lang)
 }

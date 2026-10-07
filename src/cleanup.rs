@@ -602,14 +602,23 @@ fn strip_invisibles(md: &str) -> String {
 /// The final cleanup pass: entity decode (leaving fenced code blocks,
 /// inline code spans and link destinations literal — see
 /// [`unescape_residue`]), nbsp/feff collapse, edit-link
-/// residue removal, blank normalization, per-line repairs and list
+/// residue removal (the per-language markers of [`crate::wikil10n`]),
+/// blank normalization, per-line repairs and list
 /// rejoining, then one last `end.He` -> `end. He` sentence-period repair
 /// on the joined text — with URLs masked off for that repair, since a
 /// period inside a URL (`example.NET`, `Page.Us`) is not a sentence end.
-pub(crate) fn cleanup(md: &str) -> String {
+pub(crate) fn cleanup(md: &str, lang: Option<&str>) -> String {
     let md = unescape_residue(md);
     let md = strip_invisibles(&md);
-    let md = md.replace("[edit]", "").replace("[modifier]", "");
+    // Edit-link residue: the section-edit widgets are class-dropped
+    // upstream, but some edit links carry no widget markup — a table
+    // caption's edit link renders as literal `[modifier]` text
+    // (fr.wikipedia) and empty sections leave stray `[edit]` paragraphs
+    // (wikivoyage). wikil10n supplies the per-language markers.
+    let mut md = md;
+    for marker in crate::wikil10n::edit_markers(lang) {
+        md = md.replace(marker, "");
+    }
 
     // No doubled blank lines; rstrip line ends.
     let mut lines: Vec<String> = Vec::new();
@@ -671,7 +680,7 @@ mod tests {
     fn period_upper_repair_skips_urls() {
         let md = "See [x](https://example.com/About) now end.He said.";
         assert_eq!(
-            cleanup(md),
+            cleanup(md, None),
             "See [x](https://example.com/About) now end. He said.\n"
         );
     }
@@ -683,7 +692,7 @@ mod tests {
     fn period_upper_repair_keeps_url_dots() {
         let md = "See [x](https://example.com/Page.Us) and <https://example.NET>. Then end.He said.";
         assert_eq!(
-            cleanup(md),
+            cleanup(md, None),
             "See [x](https://example.com/Page.Us) and <https://example.NET>. Then end. He said.\n"
         );
     }
@@ -696,7 +705,7 @@ mod tests {
     fn fenced_code_keeps_entities() {
         let md = "Prose &notit; here.\n\n```html\n&lt;?php\n$a = &amp;lt;b&gt;;\n```\n\nAfter &notit;.";
         assert_eq!(
-            cleanup(md),
+            cleanup(md, None),
             "Prose ¬it; here.\n\n```html\n&lt;?php\n$a = &amp;lt;b&gt;;\n```\n\nAfter ¬it;.\n"
         );
     }
@@ -707,9 +716,23 @@ mod tests {
     fn inline_code_span_keeps_entities() {
         let md = "Use `&lt;` for < and `&amp;lt;` here, not `&gt;`-shaped.";
         assert_eq!(
-            cleanup(md),
+            cleanup(md, None),
             "Use `&lt;` for < and `&amp;lt;` here, not `&gt;`-shaped.\n"
         );
+    }
+
+    /// The bracketed edit-link residue markers are per-language
+    /// ([`crate::wikil10n`]): the archive language selects which markers
+    /// are stripped.
+    #[test]
+    fn edit_marker_removal_is_localized() {
+        assert_eq!(cleanup("Prose [edit] more.", None), "Prose more.\n");
+        assert_eq!(cleanup("Prose [modifier] more.", Some("fra")), "Prose more.\n");
+        assert_eq!(cleanup("Prose [editar] more.", Some("spa")), "Prose more.\n");
+        // The English marker stays a safety net for every language; a
+        // marker of another language is content and survives.
+        assert_eq!(cleanup("Prose [edit] [editar] more.", None), "Prose [editar] more.\n");
+        assert_eq!(cleanup("Prose [edit] [modifier] more.", Some("spa")), "Prose [modifier] more.\n");
     }
 
     /// A link destination keeps its literal `&...;` query text while the
@@ -718,7 +741,7 @@ mod tests {
     fn link_destination_keeps_entities() {
         let md = "See [l](https://x.example/a?x=&notit&amp;y=2) now.\n\nElsewhere &notit; ends.";
         assert_eq!(
-            cleanup(md),
+            cleanup(md, None),
             "See [l](https://x.example/a?x=&notit&amp;y=2) now.\n\nElsewhere ¬it; ends.\n"
         );
     }
@@ -729,7 +752,7 @@ mod tests {
     fn link_destination_with_parens_keeps_entities() {
         let md = "[l](https://x.example/a_(b)&amp;c) tail &notit;.";
         assert_eq!(
-            cleanup(md),
+            cleanup(md, None),
             "[l](https://x.example/a_(b)&amp;c) tail ¬it;.\n"
         );
     }
