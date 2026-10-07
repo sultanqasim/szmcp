@@ -1094,8 +1094,14 @@ fn render_blockquote(bq: NodeRef, keep_category_links: bool) -> String {
         .join("\n")
 }
 
-/// A generic block container: recurse into its children; hatnote
-/// containers render as standalone fully-italic paragraphs.
+/// A generic block container: hatnote containers render as standalone
+/// fully-italic paragraphs; an inline-only container (no block-starting
+/// element anywhere in its subtree) renders whole as one <p>-shaped
+/// paragraph — scraped HTML leaves unwrapped text and loose inline markup
+/// in divs/sections, which used to be dropped wholesale (and empty-section
+/// pruning then deleted the section's heading with it); rendering the nodes
+/// as separate blocks would instead mangle one sentence into one block per
+/// inline element. Everything else recurses into its children as blocks.
 fn render_block_container(
     el: NodeRef,
     in_blockquote: bool,
@@ -1104,7 +1110,18 @@ fn render_block_container(
     if el.attr("role") == Some("note") || el.has_class("hatnote") {
         return render_hatnote(el, keep_category_links);
     }
+    if !contains_block(el) {
+        let p_lines = render_paragraph(el, in_blockquote, keep_category_links);
+        return if in_blockquote { p_lines.join("\n") } else { p_lines.join("\n\n") };
+    }
     block_children_md(el, None, in_blockquote, keep_category_links)
+}
+
+/// True when any element in `el`'s subtree would start a new block
+/// ([`starts_block`], at any depth).
+fn contains_block(el: NodeRef) -> bool {
+    el.children()
+        .any(|ch| ch.is_element() && (starts_block(ch) || contains_block(ch)))
 }
 
 /// Render a hatnote container as a standalone fully-italic paragraph; only
@@ -1224,7 +1241,20 @@ pub(crate) fn block_children_md(
 ) -> String {
     let mut out: Vec<String> = Vec::new();
     let mut key_facts_pending = key_facts.filter(|k| !k.is_empty());
-    for ch in renderable_children(el) {
+    for ch in el.children() {
+        // Bare text between blocks renders as its own paragraph block;
+        // unwrapped text inside scraped-HTML containers used to be
+        // dropped wholesale (old element-only walk).
+        if let NodeKind::Text(t) = ch.kind() {
+            let md = collapse_ws(&escape_plain_asterisks(t)).trim().to_string();
+            if !md.is_empty() {
+                out.push(md);
+            }
+            continue;
+        }
+        if !ch.is_element() || is_dropped(ch) {
+            continue;
+        }
         if tables::is_infobox_container(ch) {
             continue; // infoboxes are rendered separately (key_facts_of)
         }
@@ -1835,6 +1865,128 @@ mod tests {
         assert_eq!(md, "# T\n\n[[Page/Sub page]]\n");
         let md = wiki_doc("<a href=\"./Page/Sub_page\">Sub page</a>");
         assert_eq!(md, "# T\n\n[[Page/Sub page|Sub page]]\n");
+    }
+
+    // Bare text between blocks (the block walker's text-node arm).
+
+    /// A non-wiki page renders from <body>; the text goes through the same
+    /// block_children_md walk.
+    fn body_doc(inner: &str) -> String {
+        html_to_md(&format!("<html><body>{inner}</body></html>"), Some("T"), None, false)
+    }
+
+    /// Bare text directly inside a block container renders as its own
+    /// paragraph block (unwrapped text in scraped-HTML containers used to
+    /// be dropped wholesale).
+    #[test]
+    fn bare_text_in_block_containers_renders() {
+        assert_eq!(
+            body_doc("<div>NAC comes from the amino acid L-cysteine.</div>"),
+            "# T\n\nNAC comes from the amino acid L-cysteine.\n"
+        );
+        // nested containers: the text renders wherever it sits
+        assert_eq!(
+            body_doc("<aside><section><div class=\"side-section\"><div>The primary NIH organization for research is NHLBI</div></div></section></aside>"),
+            "# T\n\nThe primary NIH organization for research is NHLBI\n"
+        );
+        // a bare-text blockquote keeps its quote markers
+        assert_eq!(
+            body_doc("<blockquote>Quoted without any p wrapper.</blockquote>"),
+            "# T\n\n> Quoted without any p wrapper.\n"
+        );
+        // literal asterisks in unwrapped text still escape
+        assert_eq!(
+            body_doc("<div>2 * 3 = 6</div>"),
+            "# T\n\n2 \\* 3 = 6\n"
+        );
+    }
+
+    /// A heading's section body of bare `<br>`-separated text survives:
+    /// one paragraph per text run.
+    #[test]
+    fn section_with_bare_text_body_keeps_heading_and_text() {
+        assert_eq!(
+            body_doc(
+                "<h2>What is it?</h2>\
+                 <div class=\"section-body\">NAC comes from the amino acid \
+                 L-cysteine.<br /><br />NAC is an antioxidant.</div>"
+            ),
+            "# T\n\n## What is it?\n\nNAC comes from the amino acid L-cysteine.\n\nNAC is an antioxidant.\n"
+        );
+        // bare text after a list inside the same container renders too
+        assert_eq!(
+            body_doc(
+                "<div>Uses:</div><ul><li>one</li></ul><div>There is interest in other uses.</div>"
+            ),
+            "# T\n\nUses:\n\n- one\n\nThere is interest in other uses.\n"
+        );
+    }
+
+    /// Whitespace-only text stays invisible; wiki pages share the arm.
+    #[test]
+    fn whitespace_text_stays_invisible_and_wiki_path_shares_the_arm() {
+        assert_eq!(
+            body_doc("<div>   </div><p>A</p>  <p>B</p>"),
+            "# T\n\nA\n\nB\n"
+        );
+        assert_eq!(
+            wiki_doc("<p>A</p>stray unwrapped text<p>B</p>"),
+            "# T\n\nA\n\nstray unwrapped text\n\nB\n"
+        );
+    }
+
+    /// An inline-only container renders whole as one <p>-shaped
+    /// paragraph instead of one block per text node / inline element.
+    #[test]
+    fn inline_only_container_renders_as_one_paragraph() {
+        // text interleaved with inline elements (a table-note shape:
+        // <center><small><i>Actualizado … el <b>…</b>.</i></small></center>)
+        assert_eq!(
+            body_doc(
+                "<center><small><i>Actualizado de acuerdo al último partido \
+                 dirigido el <b>9 de mayo de 2026</b>.</i></small></center>"
+            ),
+            "# T\n\n*Actualizado de acuerdo al último partido dirigido el \
+             **9 de mayo de 2026**.*\n"
+        );
+        // a quote box: text, a link, more text — one flowing paragraph
+        assert_eq!(
+            body_doc(
+                "<div class=\"quote\">«Cuántas bandas más puedes soportar?» \
+                 —<a href=\"https://example.com/x\">Pearl Jam</a> seguirá existiendo.</div>"
+            ),
+            "# T\n\n«Cuántas bandas más puedes soportar?» \
+             —[Pearl Jam](https://example.com/x) seguirá existiendo.\n"
+        );
+        // a hatnote-like rellink div: span + italic runs merge into one line
+        assert_eq!(
+            body_doc(
+                "<div class=\"VT rellink\"><span style=\"font-size:88%\">Véanse también:</span> \
+                 <i>Anexo:Países donde el inglés es el idioma oficial</i></div>"
+            ),
+            "# T\n\nVéanse también: *Anexo:Países donde el inglés es el idioma oficial*\n"
+        );
+        // <br> inside the container still splits paragraphs
+        assert_eq!(
+            body_doc(
+                "<div class=\"quote\">Soy un artista que es cristiano.<br>--<i>Scott Stapp</i>.</div>"
+            ),
+            "# T\n\nSoy un artista que es cristiano.\n\n--*Scott Stapp*.\n"
+        );
+    }
+
+    /// Blocks nested inside inline containers stay blocks: the paragraph
+    /// rule applies only to inline-only containers.
+    #[test]
+    fn block_inside_inline_container_stays_a_block() {
+        assert_eq!(
+            body_doc("<div><small><ul><li>a</li></ul></small></div>"),
+            "# T\n\n- a\n"
+        );
+        assert_eq!(
+            body_doc("<div><i>before</i><table><tr><td>cell</td></tr></table><i>after</i></div>"),
+            "# T\n\nbefore\n\n| cell |\n| --- |\n\nafter\n"
+        );
     }
 
     // The opt-in '## Categories' section (html_to_md's include_categories).
