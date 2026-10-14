@@ -21,15 +21,25 @@ use crate::search::{search, DEFAULT_SEARCH_LIMIT};
 pub use crate::search::SearchResults;
 use crate::zim::{Mode, ZimLibrary};
 use rmcp::handler::server::router::tool::{AsyncTool, ToolBase, ToolRouter};
+use rmcp::handler::server::wrapper::Parameters;
 use rmcp::handler::server::ServerHandler;
-use rmcp::model::{Implementation, ServerConfig};
+use rmcp::model::{CallToolResult, ContentBlock, Implementation, ServerConfig, Tool};
 use rmcp::{tool_handler, ErrorData};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use std::borrow::Cow;
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::Arc;
 use thiserror::Error;
 
+/// Domain errors reported by the tool pipelines.
+///
+/// Over MCP these surface as *tool results* with `isError: true` (see
+/// [`error_result_wrapper`]) - the `message` below is the text the caller
+/// sees. The JSON-RPC codes only apply to the residual protocol-level
+/// failures the tool layer cannot intercept: malformed arguments, unknown
+/// tool names, and (rarely) serialization failures.
 #[derive(Error, Debug)]
 pub enum ToolError {
     #[error("IO error: {0}")]
@@ -74,20 +84,97 @@ impl ZimMcpServer {
         // contents: one ZIM file means the tools need no `zim` argument.
         let tool_router = match library.mode {
             Mode::Single => ToolRouter::new()
-                .with_async_tool::<ZimSearchTool>()
-                .with_async_tool::<ZimGetTool>()
-                .with_async_tool::<ZimGetSectionTool>(),
+                .with_error_result_tool::<ZimSearchTool>()
+                .with_error_result_tool::<ZimGetTool>()
+                .with_error_result_tool::<ZimGetSectionTool>(),
             Mode::Directory => ToolRouter::new()
-                .with_async_tool::<ZimSearchDirTool>()
-                .with_async_tool::<ZimGetDirTool>()
-                .with_async_tool::<ZimGetSectionDirTool>()
-                .with_async_tool::<ZimListTool>(),
+                .with_error_result_tool::<ZimSearchDirTool>()
+                .with_error_result_tool::<ZimGetDirTool>()
+                .with_error_result_tool::<ZimGetSectionDirTool>()
+                .with_error_result_tool::<ZimListTool>(),
         };
         Self {
             info,
             library,
             tool_router,
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tool registration: domain errors as isError results
+// ---------------------------------------------------------------------------
+
+/// The tool attributes for a [`ToolBase`] impl, mirroring rmcp's own
+/// registration (name/title/description, input and output schemas).
+fn tool_attribute<T: ToolBase>() -> Tool {
+    let input_schema = T::input_schema().unwrap_or_else(|| {
+        Arc::new(
+            serde_json::json!({ "type": "object", "properties": {} })
+                .as_object()
+                .unwrap()
+                .clone(),
+        )
+    });
+    let mut attr = Tool::new_with_raw(T::name(), T::description(), input_schema);
+    attr.title = T::title();
+    attr.output_schema = T::output_schema();
+    attr.annotations = T::annotations();
+    attr.icons = T::icons();
+    attr.meta = T::meta();
+    attr
+}
+
+/// Run an [`AsyncTool`], reporting its domain errors as normal tool results
+/// (`isError: true` with the message as text content) instead of JSON-RPC
+/// protocol errors.
+///
+/// rmcp's `with_async_tool` converts `Err` through `Into<ErrorData>` into a
+/// protocol error, which MCP clients often render opaquely - the caller never
+/// sees why the call failed. Returning the error as a result (the
+/// `CallToolResult::error` idiom) puts the message in front of the LLM; the
+/// spec recommends exactly this for failures of a valid, routed call. The
+/// success envelope is unchanged: `CallToolResult::structured`, the same
+/// result rmcp's `Json` wrapper produces for `with_async_tool`.
+fn error_result_wrapper<T: AsyncTool<ZimMcpServer> + 'static>(
+    service: &ZimMcpServer,
+    Parameters(params): Parameters<T::Parameter>,
+) -> Pin<Box<dyn Future<Output = Result<CallToolResult, ErrorData>> + Send + '_>> {
+    Box::pin(async move {
+        match T::invoke(service, params).await {
+            Ok(output) => {
+                let value = serde_json::to_value(&output).map_err(|e| {
+                    ErrorData::internal_error(
+                        format!("Failed to serialize structured content: {e}"),
+                        None,
+                    )
+                })?;
+                Ok(CallToolResult::structured(value))
+            }
+            Err(error) => {
+                // The ErrorData mapping carries the exact message text the
+                // protocol error used to report.
+                let error_data: ErrorData = error.into();
+                Ok(CallToolResult::error(vec![ContentBlock::text(error_data.message)]))
+            }
+        }
+    })
+}
+
+/// [`ToolRouter`] registration of an [`AsyncTool`] whose domain errors are
+/// surfaced as `isError` tool results (see [`error_result_wrapper`]).
+trait ErrorResultToolRouter {
+    fn with_error_result_tool<T>(self) -> Self
+    where
+        T: AsyncTool<ZimMcpServer> + 'static;
+}
+
+impl ErrorResultToolRouter for ToolRouter<ZimMcpServer> {
+    fn with_error_result_tool<T>(self) -> Self
+    where
+        T: AsyncTool<ZimMcpServer> + 'static,
+    {
+        self.with_route((tool_attribute::<T>(), error_result_wrapper::<T>))
     }
 }
 
@@ -429,6 +516,7 @@ mod tests {
     use super::*;
     use crate::search::tests::{test_server, test_single_server, two_archive_library};
     use rmcp::handler::server::router::tool::AsyncTool;
+    use rmcp::model::ContentBlock;
     use std::future::Future;
 
     /// Await an async tool invocation (each hops to a blocking thread) from
@@ -520,5 +608,96 @@ mod tests {
         let (server, _keep) = test_server();
         let listing = block_on(ZimListTool::invoke(&server, ZimListParams {})).unwrap();
         assert_eq!(listing.files, vec!["test.zim".to_string()]);
+    }
+
+    /// Domain errors reach the caller as normal results with `isError: true`
+    /// and the message as text content - not as JSON-RPC protocol errors.
+    #[test]
+    fn tool_domain_errors_are_iserror_results() {
+        let (server, _keep) = test_server();
+
+        // Article lookup misses: the converted path is in the message.
+        let params =
+            serde_json::from_value::<ZimGetDirParams>(serde_json::json!({ "zim": "test.zim", "path": "banana" }))
+                .unwrap();
+        let result =
+            block_on(error_result_wrapper::<ZimGetDirTool>(&server, Parameters(params))).unwrap();
+        assert_eq!(result.is_error, Some(true));
+        assert!(result.structured_content.is_none());
+        assert_eq!(result.content.len(), 1);
+        match &result.content[0] {
+            ContentBlock::Text(text) => {
+                assert_eq!(text.text, "article not found: C/banana")
+            }
+            other => panic!("expected a text content block, got {other:?}"),
+        }
+
+        // Unknown ZIM file.
+        let params = serde_json::from_value::<ZimGetDirParams>(
+            serde_json::json!({ "zim": "nope.zim", "path": "C/Apple" }),
+        )
+        .unwrap();
+        let result =
+            block_on(error_result_wrapper::<ZimGetDirTool>(&server, Parameters(params))).unwrap();
+        assert_eq!(result.is_error, Some(true));
+        match &result.content[0] {
+            ContentBlock::Text(text) => {
+                assert!(text.text.starts_with("ZIM file not found: nope.zim"))
+            }
+            other => panic!("expected a text content block, got {other:?}"),
+        }
+
+        // Missing section.
+        let params = serde_json::from_value::<ZimGetSectionDirParams>(
+            serde_json::json!({ "zim": "test.zim", "path": "C/Banana", "section": "Nope" }),
+        )
+        .unwrap();
+        let result =
+            block_on(error_result_wrapper::<ZimGetSectionDirTool>(&server, Parameters(params)))
+                .unwrap();
+        assert_eq!(result.is_error, Some(true));
+        match &result.content[0] {
+            ContentBlock::Text(text) => {
+                assert!(text.text.starts_with("section 'Nope' not found in C/Banana"))
+            }
+            other => panic!("expected a text content block, got {other:?}"),
+        }
+    }
+
+    /// Success responses keep the exact envelope rmcp's `Json` wrapper used
+    /// to produce: `isError: false`, the JSON text plus structured content.
+    #[test]
+    fn tool_success_keeps_structured_envelope() {
+        let (server, _keep) = test_server();
+
+        let params = serde_json::from_value::<ZimGetDirParams>(
+            serde_json::json!({ "zim": "test.zim", "path": "C/Apple" }),
+        )
+        .unwrap();
+        let result =
+            block_on(error_result_wrapper::<ZimGetDirTool>(&server, Parameters(params))).unwrap();
+        assert_eq!(result.is_error, Some(false));
+        let ContentBlock::Text(text) = &result.content[0] else {
+            panic!("expected a text content block");
+        };
+        let structured = result.structured_content.as_ref().expect("structured content");
+        // The text block is exactly the JSON of the structured content.
+        assert_eq!(text.text, structured.to_string());
+        assert_eq!(structured.get("path").and_then(|v| v.as_str()), Some("C/Apple"));
+    }
+
+    /// The registered routes keep the attributes `with_async_tool` produced,
+    /// so `tools/list` output is unchanged.
+    #[test]
+    fn tool_routes_keep_full_attributes() {
+        let (server, _keep) = test_server();
+
+        let attr = server.tool_router.get("zim_get").expect("zim_get registered");
+        assert_eq!(attr.name, "zim_get");
+        assert_eq!(attr.description, ZimGetDirTool::description());
+        assert_eq!(attr.input_schema, ZimGetDirTool::input_schema().unwrap());
+        assert_eq!(attr.output_schema, ZimGetDirTool::output_schema());
+        assert!(server.tool_router.get("zim_search").is_some());
+        assert!(server.tool_router.get("zim_get_section").is_some());
     }
 }

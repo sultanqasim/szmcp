@@ -12,7 +12,9 @@ use schemars::JsonSchema;
 use serde::Serialize;
 use std::sync::Arc;
 
-/// Map a "article not found" I/O error to a proper MCP invalid-params error.
+/// Map an "article not found" I/O error to `ToolError::NotFound`, which the
+/// MCP layer reports as a tool result with `isError: true` (see
+/// `tools::error_result_wrapper`).
 fn not_found_if_missing(
     result: std::result::Result<crate::zim::Article, std::io::Error>,
 ) -> Result<crate::zim::Article, ToolError> {
