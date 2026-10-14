@@ -17,8 +17,8 @@
 
 use crate::get::{get_article, get_section};
 pub use crate::get::{ZimGetResult, ZimGetSectionResult};
-use crate::search::{search, DEFAULT_SEARCH_LIMIT};
 pub use crate::search::SearchResults;
+use crate::search::{search, DEFAULT_SEARCH_LIMIT};
 use crate::zim::{Mode, ZimLibrary};
 use rmcp::handler::server::router::tool::{AsyncTool, ToolBase, ToolRouter};
 use rmcp::handler::server::wrapper::Parameters;
@@ -155,7 +155,9 @@ fn error_result_wrapper<T: AsyncTool<ZimMcpServer> + 'static>(
                 // The ErrorData mapping carries the exact message text the
                 // protocol error used to report.
                 let error_data: ErrorData = error.into();
-                Ok(CallToolResult::error(vec![ContentBlock::text(error_data.message)]))
+                Ok(CallToolResult::error(vec![ContentBlock::text(
+                    error_data.message,
+                )]))
             }
         }
     })
@@ -223,13 +225,21 @@ impl ToolBase for ZimSearchTool {
 }
 
 impl AsyncTool<ZimMcpServer> for ZimSearchTool {
-    async fn invoke(server: &ZimMcpServer, params: Self::Parameter) -> Result<Self::Output, Self::Error> {
+    async fn invoke(
+        server: &ZimMcpServer,
+        params: Self::Parameter,
+    ) -> Result<Self::Output, Self::Error> {
         let library = server.library.clone();
         tokio::task::spawn_blocking(move || {
-            search(&library, None, &params.query, params.limit.unwrap_or(DEFAULT_SEARCH_LIMIT))
+            search(
+                &library,
+                None,
+                &params.query,
+                params.limit.unwrap_or(DEFAULT_SEARCH_LIMIT),
+            )
         })
-            .await
-            .map_err(|e| ToolError::Internal(format!("zim_search task failed: {e}")))?
+        .await
+        .map_err(|e| ToolError::Internal(format!("zim_search task failed: {e}")))?
     }
 }
 
@@ -271,7 +281,10 @@ impl ToolBase for ZimSearchDirTool {
 }
 
 impl AsyncTool<ZimMcpServer> for ZimSearchDirTool {
-    async fn invoke(server: &ZimMcpServer, params: Self::Parameter) -> Result<Self::Output, Self::Error> {
+    async fn invoke(
+        server: &ZimMcpServer,
+        params: Self::Parameter,
+    ) -> Result<Self::Output, Self::Error> {
         let library = server.library.clone();
         // The pipeline validates the filter name (unknown, or one that
         // leaves the ZIM directory) and reports NotFound.
@@ -283,8 +296,8 @@ impl AsyncTool<ZimMcpServer> for ZimSearchDirTool {
                 params.limit.unwrap_or(DEFAULT_SEARCH_LIMIT),
             )
         })
-            .await
-            .map_err(|e| ToolError::Internal(format!("zim_search task failed: {e}")))?
+        .await
+        .map_err(|e| ToolError::Internal(format!("zim_search task failed: {e}")))?
     }
 }
 
@@ -312,13 +325,17 @@ impl ToolBase for ZimGetTool {
         Some(
             "Get the full content of an article or page from the ZIM file. HTML \
              pages are converted to Markdown (wiki infoboxes rendered as a \
-             '## Key facts' section).".into(),
+             '## Key facts' section)."
+                .into(),
         )
     }
 }
 
 impl AsyncTool<ZimMcpServer> for ZimGetTool {
-    async fn invoke(server: &ZimMcpServer, params: Self::Parameter) -> Result<Self::Output, Self::Error> {
+    async fn invoke(
+        server: &ZimMcpServer,
+        params: Self::Parameter,
+    ) -> Result<Self::Output, Self::Error> {
         let library = server.library.clone();
         tokio::task::spawn_blocking(move || {
             // Single mode holds exactly one archive (single() opens one
@@ -359,13 +376,17 @@ impl ToolBase for ZimGetDirTool {
         Some(
             "Get the full content of an article or page from a ZIM file. HTML \
              pages are converted to Markdown (wiki infoboxes rendered as a \
-             '## Key facts' section).".into(),
+             '## Key facts' section)."
+                .into(),
         )
     }
 }
 
 impl AsyncTool<ZimMcpServer> for ZimGetDirTool {
-    async fn invoke(server: &ZimMcpServer, params: Self::Parameter) -> Result<Self::Output, Self::Error> {
+    async fn invoke(
+        server: &ZimMcpServer,
+        params: Self::Parameter,
+    ) -> Result<Self::Output, Self::Error> {
         let library = server.library.clone();
         tokio::task::spawn_blocking(move || get_article(&library, &params.zim, &params.path, false))
             .await
@@ -406,7 +427,10 @@ impl ToolBase for ZimGetSectionTool {
 }
 
 impl AsyncTool<ZimMcpServer> for ZimGetSectionTool {
-    async fn invoke(server: &ZimMcpServer, params: Self::Parameter) -> Result<Self::Output, Self::Error> {
+    async fn invoke(
+        server: &ZimMcpServer,
+        params: Self::Parameter,
+    ) -> Result<Self::Output, Self::Error> {
         let library = server.library.clone();
         tokio::task::spawn_blocking(move || {
             // Single mode holds exactly one archive (single() opens one
@@ -456,7 +480,10 @@ impl ToolBase for ZimGetSectionDirTool {
 }
 
 impl AsyncTool<ZimMcpServer> for ZimGetSectionDirTool {
-    async fn invoke(server: &ZimMcpServer, params: Self::Parameter) -> Result<Self::Output, Self::Error> {
+    async fn invoke(
+        server: &ZimMcpServer,
+        params: Self::Parameter,
+    ) -> Result<Self::Output, Self::Error> {
         let library = server.library.clone();
         tokio::task::spawn_blocking(move || {
             get_section(&library, &params.zim, &params.path, &params.section, false)
@@ -499,7 +526,10 @@ impl ToolBase for ZimListTool {
 }
 
 impl AsyncTool<ZimMcpServer> for ZimListTool {
-    async fn invoke(server: &ZimMcpServer, _params: Self::Parameter) -> Result<Self::Output, Self::Error> {
+    async fn invoke(
+        server: &ZimMcpServer,
+        _params: Self::Parameter,
+    ) -> Result<Self::Output, Self::Error> {
         let library = server.library.clone();
         // Same shape as the real work tools (the listing itself is a
         // trivial clone of the loaded archive names).
@@ -533,10 +563,9 @@ mod tests {
     fn e2e_single_mode_tools_take_no_zim_argument() {
         let (server, _keep) = test_single_server();
 
-        let params = serde_json::from_value::<ZimGetParams>(
-            serde_json::json!({ "path": "C/Apple" }),
-        )
-        .unwrap();
+        let params =
+            serde_json::from_value::<ZimGetParams>(serde_json::json!({ "path": "C/Apple" }))
+                .unwrap();
         let result = block_on(ZimGetTool::invoke(&server, params)).unwrap();
         // Dirent title "Apple" == path (omitted by the writer) -> full path.
         assert_eq!(result.title, "C/Apple");
@@ -544,10 +573,9 @@ mod tests {
         assert!(result.content.contains("10,000 years"));
 
         // A bare title path works too.
-        let params = serde_json::from_value::<ZimGetParams>(
-            serde_json::json!({ "path": "Banana" }),
-        )
-        .unwrap();
+        let params =
+            serde_json::from_value::<ZimGetParams>(serde_json::json!({ "path": "Banana" }))
+                .unwrap();
         let result = block_on(ZimGetTool::invoke(&server, params)).unwrap();
         assert!(result.content.contains("herbaceous plants"));
 
@@ -557,13 +585,20 @@ mod tests {
         .unwrap();
         let result = block_on(ZimGetSectionTool::invoke(&server, params)).unwrap();
         assert_eq!(result.section, "History");
-        assert!(result.content.contains("10,000 years"), "{:?}", result.content);
+        assert!(
+            result.content.contains("10,000 years"),
+            "{:?}",
+            result.content
+        );
 
         // Search runs without any zim argument, yet every hit still names
         // the file - SearchHit is mode-independent.
         let results = block_on(ZimSearchTool::invoke(
             &server,
-            ZimSearchParams { query: "apple".into(), limit: None },
+            ZimSearchParams {
+                query: "apple".into(),
+                limit: None,
+            },
         ))
         .unwrap();
         assert!(!results.results.is_empty());
@@ -588,18 +623,25 @@ mod tests {
         // the named file is searched.
         let all = block_on(ZimSearchDirTool::invoke(
             &server,
-            ZimSearchDirParams { query: "banana cherry".into(), zim: None, limit: None },
+            ZimSearchDirParams {
+                query: "banana cherry".into(),
+                zim: None,
+                limit: None,
+            },
         ))
         .unwrap();
         assert_eq!(all.results.len(), 2, "{:?}", all.results);
         let one = block_on(ZimSearchDirTool::invoke(
             &server,
-            ZimSearchDirParams { query: "banana cherry".into(), zim: Some("a.zim".into()), limit: None },
+            ZimSearchDirParams {
+                query: "banana cherry".into(),
+                zim: Some("a.zim".into()),
+                limit: None,
+            },
         ))
         .unwrap();
         assert_eq!(one.results.len(), 1, "{:?}", one.results);
         assert_eq!(one.results[0].zim, "a.zim");
-
     }
 
     #[test]
@@ -617,11 +659,15 @@ mod tests {
         let (server, _keep) = test_server();
 
         // Article lookup misses: the converted path is in the message.
-        let params =
-            serde_json::from_value::<ZimGetDirParams>(serde_json::json!({ "zim": "test.zim", "path": "banana" }))
-                .unwrap();
-        let result =
-            block_on(error_result_wrapper::<ZimGetDirTool>(&server, Parameters(params))).unwrap();
+        let params = serde_json::from_value::<ZimGetDirParams>(
+            serde_json::json!({ "zim": "test.zim", "path": "banana" }),
+        )
+        .unwrap();
+        let result = block_on(error_result_wrapper::<ZimGetDirTool>(
+            &server,
+            Parameters(params),
+        ))
+        .unwrap();
         assert_eq!(result.is_error, Some(true));
         assert!(result.structured_content.is_none());
         assert_eq!(result.content.len(), 1);
@@ -637,8 +683,11 @@ mod tests {
             serde_json::json!({ "zim": "nope.zim", "path": "C/Apple" }),
         )
         .unwrap();
-        let result =
-            block_on(error_result_wrapper::<ZimGetDirTool>(&server, Parameters(params))).unwrap();
+        let result = block_on(error_result_wrapper::<ZimGetDirTool>(
+            &server,
+            Parameters(params),
+        ))
+        .unwrap();
         assert_eq!(result.is_error, Some(true));
         match &result.content[0] {
             ContentBlock::Text(text) => {
@@ -652,13 +701,17 @@ mod tests {
             serde_json::json!({ "zim": "test.zim", "path": "C/Banana", "section": "Nope" }),
         )
         .unwrap();
-        let result =
-            block_on(error_result_wrapper::<ZimGetSectionDirTool>(&server, Parameters(params)))
-                .unwrap();
+        let result = block_on(error_result_wrapper::<ZimGetSectionDirTool>(
+            &server,
+            Parameters(params),
+        ))
+        .unwrap();
         assert_eq!(result.is_error, Some(true));
         match &result.content[0] {
             ContentBlock::Text(text) => {
-                assert!(text.text.starts_with("section 'Nope' not found in C/Banana"))
+                assert!(text
+                    .text
+                    .starts_with("section 'Nope' not found in C/Banana"))
             }
             other => panic!("expected a text content block, got {other:?}"),
         }
@@ -674,16 +727,25 @@ mod tests {
             serde_json::json!({ "zim": "test.zim", "path": "C/Apple" }),
         )
         .unwrap();
-        let result =
-            block_on(error_result_wrapper::<ZimGetDirTool>(&server, Parameters(params))).unwrap();
+        let result = block_on(error_result_wrapper::<ZimGetDirTool>(
+            &server,
+            Parameters(params),
+        ))
+        .unwrap();
         assert_eq!(result.is_error, Some(false));
         let ContentBlock::Text(text) = &result.content[0] else {
             panic!("expected a text content block");
         };
-        let structured = result.structured_content.as_ref().expect("structured content");
+        let structured = result
+            .structured_content
+            .as_ref()
+            .expect("structured content");
         // The text block is exactly the JSON of the structured content.
         assert_eq!(text.text, structured.to_string());
-        assert_eq!(structured.get("path").and_then(|v| v.as_str()), Some("C/Apple"));
+        assert_eq!(
+            structured.get("path").and_then(|v| v.as_str()),
+            Some("C/Apple")
+        );
     }
 
     /// The registered routes keep the attributes `with_async_tool` produced,
@@ -692,7 +754,10 @@ mod tests {
     fn tool_routes_keep_full_attributes() {
         let (server, _keep) = test_server();
 
-        let attr = server.tool_router.get("zim_get").expect("zim_get registered");
+        let attr = server
+            .tool_router
+            .get("zim_get")
+            .expect("zim_get registered");
         assert_eq!(attr.name, "zim_get");
         assert_eq!(attr.description, ZimGetDirTool::description());
         assert_eq!(attr.input_schema, ZimGetDirTool::input_schema().unwrap());

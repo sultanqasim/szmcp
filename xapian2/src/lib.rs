@@ -96,12 +96,26 @@ mod ffi {
         // Document
         pub fn xapian2_doc_new() -> *mut c_void;
         pub fn xapian2_doc_set_data(d: *mut c_void, data: *const c_char, len: u32) -> c_int;
-        pub fn xapian2_doc_add_term(d: *mut c_void, term: *const c_char, len: u32, increment: u32) -> c_int;
+        pub fn xapian2_doc_add_term(
+            d: *mut c_void,
+            term: *const c_char,
+            len: u32,
+            increment: u32,
+        ) -> c_int;
         pub fn xapian2_doc_remove_term(d: *mut c_void, term: *const c_char, len: u32) -> c_int;
-        pub fn xapian2_doc_set_value(d: *mut c_void, slot: u32, value: *const c_char, len: u32) -> c_int;
+        pub fn xapian2_doc_set_value(
+            d: *mut c_void,
+            slot: u32,
+            value: *const c_char,
+            len: u32,
+        ) -> c_int;
         pub fn xapian2_doc_id(d: *mut c_void) -> u32;
         pub fn xapian2_doc_termlist_count(d: *mut c_void) -> u32;
-        pub fn xapian2_doc_first_term(d: *mut c_void, out_len: *mut u32, ok: *mut c_int) -> *const c_char;
+        pub fn xapian2_doc_first_term(
+            d: *mut c_void,
+            out_len: *mut u32,
+            ok: *mut c_int,
+        ) -> *const c_char;
         pub fn xapian2_doc_indexed_text_size(d: *mut c_void, ok: *mut c_int) -> u64;
         pub fn xapian2_doc_data(d: *mut c_void, out_len: *mut u32) -> *const c_char;
         pub fn xapian2_doc_value(d: *mut c_void, slot: u32, out_len: *mut u32) -> *const c_char;
@@ -119,7 +133,10 @@ mod ffi {
             value: *const c_char,
             value_len: u32,
         ) -> c_int;
-        pub fn xapian2_wdb_compact_single_file_full(db: *mut c_void, output: *const c_char) -> c_int;
+        pub fn xapian2_wdb_compact_single_file_full(
+            db: *mut c_void,
+            output: *const c_char,
+        ) -> c_int;
         pub fn xapian2_wdb_free(db: *mut c_void);
 
         // TermGenerator
@@ -157,8 +174,16 @@ mod ffi {
         // QueryParser
         pub fn xapian2_qp_new() -> *mut c_void;
         pub fn xapian2_qp_set_default_op(qp: *mut c_void, op: c_int) -> c_int;
-        pub fn xapian2_qp_add_prefix(qp: *mut c_void, field: *const c_char, prefix: *const c_char) -> c_int;
-        pub fn xapian2_qp_add_boolean_prefix(qp: *mut c_void, field: *const c_char, prefix: *const c_char) -> c_int;
+        pub fn xapian2_qp_add_prefix(
+            qp: *mut c_void,
+            field: *const c_char,
+            prefix: *const c_char,
+        ) -> c_int;
+        pub fn xapian2_qp_add_boolean_prefix(
+            qp: *mut c_void,
+            field: *const c_char,
+            prefix: *const c_char,
+        ) -> c_int;
         pub fn xapian2_qp_set_stemmer(qp: *mut c_void, language: *const c_char) -> c_int;
         pub fn xapian2_qp_set_stemming_strategy(qp: *mut c_void, strategy: c_int) -> c_int;
         pub fn xapian2_qp_set_database(qp: *mut c_void, db: *mut c_void) -> c_int;
@@ -181,7 +206,11 @@ mod ffi {
         // Enquire
         pub fn xapian2_enquire_new(db: *mut c_void) -> *mut c_void;
         pub fn xapian2_enquire_new_writable(db: *mut c_void) -> *mut c_void;
-        pub fn xapian2_enquire_set_query(e: *mut c_void, q: *mut c_void, query_length: u32) -> c_int;
+        pub fn xapian2_enquire_set_query(
+            e: *mut c_void,
+            q: *mut c_void,
+            query_length: u32,
+        ) -> c_int;
         pub fn xapian2_enquire_set_sort_by_relevance(e: *mut c_void);
         pub fn xapian2_enquire_set_weighting(
             e: *mut c_void,
@@ -303,7 +332,17 @@ macro_rules! handle_debug {
     };
 }
 
-handle_debug!(Database, Document, WritableDatabase, Query, QueryParser, Enquire, MSet, Stem, TermGenerator);
+handle_debug!(
+    Database,
+    Document,
+    WritableDatabase,
+    Query,
+    QueryParser,
+    Enquire,
+    MSet,
+    Stem,
+    TermGenerator
+);
 
 // ---------------------------------------------------------------------------
 // Flags / operators
@@ -489,7 +528,8 @@ impl Database {
         use std::os::windows::io::IntoRawHandle;
 
         let mut file = std::fs::File::open(path.as_ref()).map_err(|e| Error::new(e.to_string()))?;
-        file.seek(SeekFrom::Start(offset)).map_err(|e| Error::new(e.to_string()))?;
+        file.seek(SeekFrom::Start(offset))
+            .map_err(|e| Error::new(e.to_string()))?;
 
         // SAFETY: Xapian takes ownership of the fd (closes it on success
         // and failure) and only ever reads through it.
@@ -517,7 +557,11 @@ impl Database {
         let bytes = term.as_bytes();
         // SAFETY: `bytes` is a valid byte slice; the shim copies it.
         unsafe {
-            ffi::xapian2_db_termfreq(self.handle(), bytes.as_ptr() as *const _, bytes.len() as u32)
+            ffi::xapian2_db_termfreq(
+                self.handle(),
+                bytes.as_ptr() as *const _,
+                bytes.len() as u32,
+            )
         }
     }
 
@@ -553,7 +597,12 @@ impl Database {
         let bytes = term.as_bytes();
         // SAFETY: `bytes` is a valid byte slice; the shim copies it.
         unsafe {
-            ffi::xapian2_db_wdf(self.handle(), id, bytes.as_ptr() as *const _, bytes.len() as u32)
+            ffi::xapian2_db_wdf(
+                self.handle(),
+                id,
+                bytes.as_ptr() as *const _,
+                bytes.len() as u32,
+            )
         }
     }
 
@@ -580,7 +629,12 @@ impl Database {
         // shim guarantees `len` bytes at the returned pointer, valid until
         // the next call on this thread.
         let ptr = unsafe {
-            ffi::xapian2_db_get_metadata(self.handle(), key.as_ptr(), key.as_bytes().len() as u32, &mut len)
+            ffi::xapian2_db_get_metadata(
+                self.handle(),
+                key.as_ptr(),
+                key.as_bytes().len() as u32,
+                &mut len,
+            )
         };
         if ptr.is_null() {
             return Err(Error::last_error("failed to read database metadata"));
@@ -715,7 +769,9 @@ impl Document {
         // SAFETY: the handle is valid; `len`/`ok` are written before return.
         let ptr = unsafe { ffi::xapian2_doc_first_term(self.handle(), &mut len, &mut ok) };
         if ok == 0 || ptr.is_null() {
-            return Err(Error::last_error("failed to read the document's first term"));
+            return Err(Error::last_error(
+                "failed to read the document's first term",
+            ));
         }
         // SAFETY: the shim guarantees `len` bytes at `ptr`, valid until the
         // next call on this document.
@@ -751,7 +807,12 @@ impl Document {
         let bytes = term.as_bytes();
         // SAFETY: `bytes` is a valid byte slice; the shim copies it.
         let status = unsafe {
-            ffi::xapian2_doc_add_term(self.handle(), bytes.as_ptr() as *const _, bytes.len() as u32, increment)
+            ffi::xapian2_doc_add_term(
+                self.handle(),
+                bytes.as_ptr() as *const _,
+                bytes.len() as u32,
+                increment,
+            )
         };
         Error::from_status(status)
     }
@@ -765,7 +826,11 @@ impl Document {
         let bytes = term.as_bytes();
         // SAFETY: `bytes` is a valid byte slice; the shim copies it.
         let status = unsafe {
-            ffi::xapian2_doc_remove_term(self.handle(), bytes.as_ptr() as *const _, bytes.len() as u32)
+            ffi::xapian2_doc_remove_term(
+                self.handle(),
+                bytes.as_ptr() as *const _,
+                bytes.len() as u32,
+            )
         };
         Error::from_status(status)
     }
@@ -775,7 +840,12 @@ impl Document {
         let value = value.as_ref();
         // SAFETY: `value` is a valid byte slice; the shim copies it.
         let status = unsafe {
-            ffi::xapian2_doc_set_value(self.handle(), slot, value.as_ptr() as *const _, value.len() as u32)
+            ffi::xapian2_doc_set_value(
+                self.handle(),
+                slot,
+                value.as_ptr() as *const _,
+                value.len() as u32,
+            )
         };
         Error::from_status(status)
     }
@@ -1110,8 +1180,7 @@ impl WritableDatabase {
     pub fn in_memory() -> Result<Self> {
         // SAFETY: no arguments.
         let ptr = unsafe { ffi::xapian2_wdb_open_inmemory() };
-        Error::from_ptr(ptr, "failed to create in-memory writable database")
-            .map(|ptr| Self { ptr })
+        Error::from_ptr(ptr, "failed to create in-memory writable database").map(|ptr| Self { ptr })
     }
 
     /// Add a document; returns the assigned document id.
@@ -1168,7 +1237,8 @@ impl WritableDatabase {
         let c_out = cstr(&output.as_ref().to_string_lossy())?;
         // SAFETY: c_out is a valid NUL-terminated string for the duration of
         // the call; Xapian copies it.
-        let status = unsafe { ffi::xapian2_wdb_compact_single_file_full(self.handle(), c_out.as_ptr()) };
+        let status =
+            unsafe { ffi::xapian2_wdb_compact_single_file_full(self.handle(), c_out.as_ptr()) };
         Error::from_status(status)
     }
 
@@ -1330,9 +1400,8 @@ impl QueryParser {
     /// Set how query terms are stemmed (default: [`StemStrategy::Some`]).
     pub fn set_stemming_strategy(&mut self, strategy: StemStrategy) -> Result<()> {
         // SAFETY: the handle is valid for the lifetime of the call.
-        let status = unsafe {
-            ffi::xapian2_qp_set_stemming_strategy(self.handle(), strategy as c_int)
-        };
+        let status =
+            unsafe { ffi::xapian2_qp_set_stemming_strategy(self.handle(), strategy as c_int) };
         Error::from_status(status)
     }
 
@@ -1355,12 +1424,22 @@ impl QueryParser {
 
     /// Parse `query` with explicit feature `flags` and `default_prefix`
     /// (the prefix prepended to terms when no field is given).
-    pub fn parse_query_with(&mut self, query: &str, flags: u32, default_prefix: &str) -> Result<Query> {
+    pub fn parse_query_with(
+        &mut self,
+        query: &str,
+        flags: u32,
+        default_prefix: &str,
+    ) -> Result<Query> {
         let query = cstr(query)?;
         let default_prefix = cstr(default_prefix)?;
         // SAFETY: both are valid NUL-terminated strings for the call.
         let ptr = unsafe {
-            ffi::xapian2_qp_parse_query(self.handle(), query.as_ptr(), flags, default_prefix.as_ptr())
+            ffi::xapian2_qp_parse_query(
+                self.handle(),
+                query.as_ptr(),
+                flags,
+                default_prefix.as_ptr(),
+            )
         };
         Error::from_ptr(ptr, "failed to parse query").map(|ptr| Query { ptr })
     }
@@ -1422,8 +1501,7 @@ impl Enquire {
     /// determine it).
     pub fn set_query(&mut self, query: &Query) -> Result<()> {
         // SAFETY: both handles are valid for the duration of the call.
-        let status =
-            unsafe { ffi::xapian2_enquire_set_query(self.handle(), query.handle(), 0) };
+        let status = unsafe { ffi::xapian2_enquire_set_query(self.handle(), query.handle(), 0) };
         Error::from_status(status)
     }
 
@@ -1492,8 +1570,7 @@ impl Enquire {
     pub fn get_mset(&self, first: u32, maxitems: u32, atleast: u32) -> Result<MSet> {
         // SAFETY: the handle is valid for the lifetime of `self`;
         // `get_mset` is a const C++ method.
-        let ptr =
-            unsafe { ffi::xapian2_enquire_get_mset(self.handle(), first, maxitems, atleast) };
+        let ptr = unsafe { ffi::xapian2_enquire_get_mset(self.handle(), first, maxitems, atleast) };
         Error::from_ptr(ptr, "failed to run query").map(|ptr| MSet { ptr })
     }
 
@@ -1573,7 +1650,11 @@ impl MSet {
         let bytes = term.as_bytes();
         // SAFETY: `bytes` is a valid byte slice; the shim copies it.
         unsafe {
-            ffi::xapian2_mset_termfreq(self.handle(), bytes.as_ptr() as *const _, bytes.len() as u32)
+            ffi::xapian2_mset_termfreq(
+                self.handle(),
+                bytes.as_ptr() as *const _,
+                bytes.len() as u32,
+            )
         }
     }
 
@@ -1693,7 +1774,11 @@ pub fn bm25_weight(
     const MIN_NORMLEN: f64 = 0.5;
     // avlen == 0 (an empty or all-empty-documents collection) sets Xapian's
     // len_factor to 0, flooring every normlen at min_normlen.
-    let normlen = if avlen > 0.0 { (doclen / avlen).max(MIN_NORMLEN) } else { MIN_NORMLEN };
+    let normlen = if avlen > 0.0 {
+        (doclen / avlen).max(MIN_NORMLEN)
+    } else {
+        MIN_NORMLEN
+    };
     let mut score = 0.0;
     for ((df, wqf), wdf) in dfs.iter().zip(wqfs).zip(wdfs) {
         // A wdf of 0 (the document does not index the term) contributes
@@ -1702,7 +1787,11 @@ pub fn bm25_weight(
             continue;
         }
         let tw_raw = (docs as f64 - *df as f64 + 0.5) / (*df as f64 + 0.5);
-        let tw_raw = if tw_raw < 2.0 { tw_raw * 0.5 + 1.0 } else { tw_raw };
+        let tw_raw = if tw_raw < 2.0 {
+            tw_raw * 0.5 + 1.0
+        } else {
+            tw_raw
+        };
         score += tw_raw.ln()
             * *wqf as f64
             * (K1 + 1.0)
@@ -1800,9 +1889,10 @@ mod tests {
                 (doclen, matched)
             })
             .collect();
-        let padded_len: u32 = stats.iter().map(|(doclen, matched)| {
-            doclen - matched.iter().map(|(_, wdf)| wdf).sum::<u32>()
-        }).sum();
+        let padded_len: u32 = stats
+            .iter()
+            .map(|(doclen, matched)| doclen - matched.iter().map(|(_, wdf)| wdf).sum::<u32>())
+            .sum();
         assert!(padded_len > 0, "fixture must need padding");
 
         let mut qp = QueryParser::new().unwrap();
@@ -1827,9 +1917,15 @@ mod tests {
             let mut enquire = Enquire::new_writable(&wdb).unwrap();
             enquire.set_query(&query).unwrap();
             let mset = enquire.get_mset(0, 10, 0).unwrap();
-            (0..mset.size()).map(|i| (mset.docid(i), mset.weight(i))).collect()
+            (0..mset.size())
+                .map(|i| (mset.docid(i), mset.weight(i)))
+                .collect()
         };
-        assert_eq!(full_weights.len(), 2, "only the two salt/mining regions match");
+        assert_eq!(
+            full_weights.len(),
+            2,
+            "only the two salt/mining regions match"
+        );
         assert_eq!(full_weights[0].0, 2, "the term-dense region ranks first");
 
         // (b) The padded hand-built documents: same match set, same weights.
@@ -1851,8 +1947,9 @@ mod tests {
         let mut enquire = Enquire::new_writable(&wdb).unwrap();
         enquire.set_query(&query).unwrap();
         let mset = enquire.get_mset(0, 10, 0).unwrap();
-        let padded: Vec<(u32, f64)> =
-            (0..mset.size()).map(|i| (mset.docid(i), mset.weight(i))).collect();
+        let padded: Vec<(u32, f64)> = (0..mset.size())
+            .map(|i| (mset.docid(i), mset.weight(i)))
+            .collect();
         assert_eq!(padded, full_weights);
     }
 
@@ -1897,10 +1994,10 @@ mod tests {
         let db = build_db(
             &dir,
             &[
-                "foo foo bar",      // wdf(foo)=2, wdf(bar)=1, len 3
-                "foo",              // wdf(foo)=1, len 1
-                "foo bar baz",      // wdf(foo)=1, wdf(bar)=1, len 3
-                "baz qux zap",      // no foo/bar; the only zap
+                "foo foo bar", // wdf(foo)=2, wdf(bar)=1, len 3
+                "foo",         // wdf(foo)=1, len 1
+                "foo bar baz", // wdf(foo)=1, wdf(bar)=1, len 3
+                "baz qux zap", // no foo/bar; the only zap
             ],
         );
 
@@ -1929,8 +2026,11 @@ mod tests {
         let wqfs = [2u32, 1, 1];
 
         for m in mset.iter() {
-            let wdfs =
-                [db.wdf(m.docid, "foo"), db.wdf(m.docid, "bar"), db.wdf(m.docid, "zap")];
+            let wdfs = [
+                db.wdf(m.docid, "foo"),
+                db.wdf(m.docid, "bar"),
+                db.wdf(m.docid, "zap"),
+            ];
             let doclen = db.doc_length(m.docid).unwrap();
             let score = bm25_weight(docs, avlen, &dfs, &wqfs, doclen, &wdfs);
             assert!(
@@ -1990,13 +2090,17 @@ mod tests {
         let default_mset = enquire.get_mset(0, 10, 0).unwrap();
         assert_eq!(default_mset.size(), 3);
         assert_eq!(
-            (0..default_mset.size()).map(|i| default_mset.docid(i)).collect::<Vec<_>>(),
+            (0..default_mset.size())
+                .map(|i| default_mset.docid(i))
+                .collect::<Vec<_>>(),
             [2, 1, 3]
         );
 
         // (a) "bm25" with the documented defaults reproduces the unset
         // default exactly - same ordering, same weights.
-        enquire.set_weighting("bm25", &[1.0, 0.0, 1.0, 0.5, 0.5]).unwrap();
+        enquire
+            .set_weighting("bm25", &[1.0, 0.0, 1.0, 0.5, 0.5])
+            .unwrap();
         let bm25 = enquire.get_mset(0, 10, 0).unwrap();
         for i in 0..3 {
             assert_eq!(bm25.docid(i), default_mset.docid(i));
@@ -2012,7 +2116,9 @@ mod tests {
         let boolean = enquire.get_mset(0, 10, 0).unwrap();
         assert_eq!(boolean.size(), 3);
         assert_eq!(
-            (0..boolean.size()).map(|i| boolean.docid(i)).collect::<Vec<_>>(),
+            (0..boolean.size())
+                .map(|i| boolean.docid(i))
+                .collect::<Vec<_>>(),
             [1, 2, 3]
         );
         assert!(boolean.iter().all(|m| m.weight == 0.0));
@@ -2034,7 +2140,9 @@ mod tests {
         assert!(trad.weight(0) > bm25.weight(1));
 
         // Scheme matching is case-insensitive.
-        enquire.set_weighting("BM25", &[1.0, 0.0, 1.0, 0.5, 0.5]).unwrap();
+        enquire
+            .set_weighting("BM25", &[1.0, 0.0, 1.0, 0.5, 0.5])
+            .unwrap();
         let upper = enquire.get_mset(0, 10, 0).unwrap();
         for i in 0..3 {
             assert_eq!(upper.docid(i), bm25.docid(i));
@@ -2057,10 +2165,14 @@ mod tests {
             let err = enquire.set_weighting(scheme, params).unwrap_err();
             assert!(err.msg().contains("valid schemes"));
         }
-        enquire.set_weighting("bm25", &[1.0, 0.0, 1.0, 0.5, 0.5]).unwrap();
+        enquire
+            .set_weighting("bm25", &[1.0, 0.0, 1.0, 0.5, 0.5])
+            .unwrap();
         let after = enquire.get_mset(0, 10, 0).unwrap();
         assert_eq!(
-            (0..after.size()).map(|i| after.docid(i)).collect::<Vec<_>>(),
+            (0..after.size())
+                .map(|i| after.docid(i))
+                .collect::<Vec<_>>(),
             [2, 1, 3]
         );
 

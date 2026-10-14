@@ -16,7 +16,10 @@ fn find_ci(hay: &[u8], from: usize, needle: &[u8]) -> Option<usize> {
         // byte per position instead of comparing the whole needle, which
         // keeps the long close-tag scans (a heading's `</hN>` can lie tens
         // of kilobytes away) cheap.
-        let Some(step) = hay[i..=limit].iter().position(|&c| c.eq_ignore_ascii_case(&first)) else {
+        let Some(step) = hay[i..=limit]
+            .iter()
+            .position(|&c| c.eq_ignore_ascii_case(&first))
+        else {
             return None;
         };
         i += step;
@@ -100,7 +103,8 @@ fn attr_value<'a>(attrs: &'a str, name: &str) -> Option<&'a str> {
 /// `<div role="note" class="hatnote navigation-not-searchable">`).
 fn is_hatnote_attrs(attrs: &str) -> bool {
     attr_value(attrs, "class").is_some_and(|v| {
-        v.split_ascii_whitespace().any(|t| t.eq_ignore_ascii_case("hatnote"))
+        v.split_ascii_whitespace()
+            .any(|t| t.eq_ignore_ascii_case("hatnote"))
     }) || attr_value(attrs, "role").is_some_and(|v| v.trim().eq_ignore_ascii_case("note"))
 }
 
@@ -119,7 +123,9 @@ fn element_end(html: &str, open_i: usize, tag_name: &str) -> usize {
             Some(r) => (true, r),
             None => (false, rest),
         };
-        let name_end = name.find(|c: char| !c.is_ascii_alphanumeric()).unwrap_or(name.len());
+        let name_end = name
+            .find(|c: char| !c.is_ascii_alphanumeric())
+            .unwrap_or(name.len());
         if name_end == tag_name.len() && name[..name_end].eq_ignore_ascii_case(tag_name) {
             if is_close {
                 depth -= 1;
@@ -147,7 +153,10 @@ fn tag_at(html: &str, i: usize) -> Option<(&str, &str, bool, usize)> {
         .find(|c: char| c.is_whitespace() || c == '/')
         .unwrap_or(tag.len());
     let (name, attrs) = tag.split_at(name_end);
-    let opens = name.as_bytes().first().is_some_and(|&c| c.is_ascii_alphabetic());
+    let opens = name
+        .as_bytes()
+        .first()
+        .is_some_and(|&c| c.is_ascii_alphabetic());
     Some((name, attrs, opens, gt + 1))
 }
 
@@ -173,7 +182,9 @@ fn skip_end(html: &str, open_i: usize, tag_name: &str) -> usize {
 /// real open tags qualify (a comment could quote `class="hatnote"`).
 fn is_skip_tag(tag_name: &str, attrs: &str, opens: bool) -> bool {
     opens
-        && (INTRO_SKIP_TAGS.iter().any(|t| tag_name.eq_ignore_ascii_case(t))
+        && (INTRO_SKIP_TAGS
+            .iter()
+            .any(|t| tag_name.eq_ignore_ascii_case(t))
             || is_hatnote_attrs(attrs))
 }
 
@@ -188,7 +199,9 @@ fn is_skip_tag(tag_name: &str, attrs: &str, opens: bool) -> bool {
 /// and the body is empty.
 fn article_body(html: &str) -> &str {
     const MARKER: &str = "id=\"mw-content-text\"";
-    let Some(i) = html.find(MARKER) else { return html };
+    let Some(i) = html.find(MARKER) else {
+        return html;
+    };
     let after = &html[i + MARKER.len()..];
     // Skip the rest of the content div's own open tag, then find its close
     // by counting nested <div>/</div> tags.
@@ -290,7 +303,19 @@ pub(crate) const INTRO_SECTION: &str = "_intro";
 /// any block-level element. Well-formed wiki HTML closes it explicitly;
 /// this only guards the odd page that leaves it open.
 const P_CLOSERS: [&str; 14] = [
-    "div", "ul", "ol", "dl", "li", "table", "blockquote", "pre", "hr", "h2", "h3", "h4", "h5",
+    "div",
+    "ul",
+    "ol",
+    "dl",
+    "li",
+    "table",
+    "blockquote",
+    "pre",
+    "hr",
+    "h2",
+    "h3",
+    "h4",
+    "h5",
     "h6",
 ];
 
@@ -438,7 +463,10 @@ fn strip_tags(s: &str) -> String {
 /// Normalize a heading name/title for matching: trim, lowercase, collapse
 /// whitespace.
 pub(crate) fn normalize(s: &str) -> String {
-    s.split_whitespace().collect::<Vec<_>>().join(" ").to_lowercase()
+    s.split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_lowercase()
 }
 
 /// Find all `<h1>`..`<h6>` headings and the text range each one governs
@@ -528,7 +556,8 @@ pub(crate) fn strip_style_script(html: &str) -> String {
             .find(|c: char| !c.is_ascii_alphanumeric())
             .unwrap_or(after.len());
         let name = &after[..name_end];
-        let style_script = name.eq_ignore_ascii_case("style") || name.eq_ignore_ascii_case("script");
+        let style_script =
+            name.eq_ignore_ascii_case("style") || name.eq_ignore_ascii_case("script");
         if style_script && !after.starts_with('/') && !after.starts_with('!') {
             // Skip to the matching close tag, or drop the rest if unclosed.
             let close = format!("</{}", name);
@@ -554,9 +583,7 @@ fn trim_trailing_open_tag(s: &str) -> &str {
     let mut s = s.trim_end();
     while let Some(lt) = s.rfind('<') {
         let tail = &s[lt..];
-        let single_tag = tail.len() > 1
-            && tail[1..].ends_with('>')
-            && !tail[1..].contains('<');
+        let single_tag = tail.len() > 1 && tail[1..].ends_with('>') && !tail[1..].contains('<');
         if single_tag && tail.as_bytes()[1].is_ascii_alphabetic() {
             s = s[..lt].trim_end();
         } else {
@@ -627,7 +654,10 @@ mod tests {
         // The <title> and <h1> carry the page title, which every search hit
         // already reports as its own field: their text must not open the
         // intro, so it starts at the lead paragraph.
-        assert!(intro.starts_with("An apple is the fruit of <rosaceae> trees"), "{intro:?}");
+        assert!(
+            intro.starts_with("An apple is the fruit of <rosaceae> trees"),
+            "{intro:?}"
+        );
         assert!(!intro.starts_with("Apple"), "{intro:?}");
         assert!(!intro.contains("var x"), "{intro:?}");
         assert!(!intro.contains("p{}"), "{intro:?}");
@@ -640,7 +670,10 @@ mod tests {
         // Skipped markup between two texts neither leaks into the intro nor
         // disturbs the join: hundreds of empty spans leave both texts,
         // separated by one space.
-        let page = format!("<p>x</p>{}<p>real text here</p>", "<span></span>".repeat(400));
+        let page = format!(
+            "<p>x</p>{}<p>real text here</p>",
+            "<span></span>".repeat(400)
+        );
         let intro = intro_from_html(&page);
         assert_eq!(intro, "x real text here", "{intro:?}");
     }
@@ -656,7 +689,10 @@ mod tests {
             <p><b>Chemistry</b> is the study of &amp; matter.</p>\
             </div></div><footer>Navigation menu</footer></body></html>";
         let intro = intro_from_html(page);
-        assert!(intro.starts_with("Chemistry is the study of & matter"), "{intro:?}");
+        assert!(
+            intro.starts_with("Chemistry is the study of & matter"),
+            "{intro:?}"
+        );
         assert!(!intro.contains("atomic weight"), "{intro:?}");
         assert!(!intro.contains("hydrocarbon"), "{intro:?}");
         assert!(!intro.contains("Navigation"), "{intro:?}");
@@ -722,9 +758,7 @@ mod tests {
             "<div role=note>Not to be confused with X.</div>",
         ];
         for el in hatnotes {
-            let page = format!(
-                "<div id=\"mw-content-text\">{el}<p>Lead text here.</p></div>"
-            );
+            let page = format!("<div id=\"mw-content-text\">{el}<p>Lead text here.</p></div>");
             let intro = intro_from_html(&page);
             assert_eq!(intro, "Lead text here.", "{el}");
         }
@@ -743,9 +777,7 @@ mod tests {
             "<div title=\"hatnote\">For other uses, see X.</div>",
         ];
         for el in keepers {
-            let page = format!(
-                "<div id=\"mw-content-text\">{el}<p>Lead text here.</p></div>"
-            );
+            let page = format!("<div id=\"mw-content-text\">{el}<p>Lead text here.</p></div>");
             let intro = intro_from_html(&page);
             assert_eq!(intro, "For other uses, see X. Lead text here.", "{el}");
         }
@@ -774,8 +806,7 @@ mod tests {
     fn malformed_h_prefixes_are_not_headings() {
         // A non-digit byte after `<h` (in `c - b'0'`) once underflowed and
         // panicked the heading scan in debug builds.
-        let headings =
-            collect_headings("<p><h/ junk <h x><h- <H8></p><h2>Title</h2><p>Body.</p>");
+        let headings = collect_headings("<p><h/ junk <h x><h- <H8></p><h2>Title</h2><p>Body.</p>");
         assert_eq!(headings.len(), 1);
         assert_eq!(headings[0].level, 2);
         assert_eq!(headings[0].name, "Title");
@@ -821,8 +852,14 @@ mod tests {
         // region's HTML), with style/script stripped like any section.
         let (name, intro) = section_content(WIKI, "_intro").unwrap();
         assert_eq!(name, "_intro");
-        assert!(intro.contains("An <b>apple</b> is the fruit of &lt;rosaceae&gt; trees."), "{intro:?}");
-        assert!(intro.contains("This article is about the fruit"), "{intro:?}");
+        assert!(
+            intro.contains("An <b>apple</b> is the fruit of &lt;rosaceae&gt; trees."),
+            "{intro:?}"
+        );
+        assert!(
+            intro.contains("This article is about the fruit"),
+            "{intro:?}"
+        );
         assert!(!intro.contains("var x"), "{intro:?}");
         assert!(!intro.contains("p{}"), "{intro:?}");
         // Bounded by the first heading, and the next section's heading
@@ -879,7 +916,10 @@ mod tests {
         assert_eq!(secs[1].0, "History");
         assert_eq!(
             secs[1].1,
-            vec!["Salt has been mined for millennia.", "Salt roads crossed continents."]
+            vec![
+                "Salt has been mined for millennia.",
+                "Salt roads crossed continents."
+            ]
         );
         assert_eq!(secs[2].0, "Trade");
         assert_eq!(secs[2].1, vec!["Salt roads crossed continents."]);
@@ -888,16 +928,37 @@ mod tests {
         assert_eq!(secs.len(), 4);
         // Infobox, hatnote and title text never becomes a paragraph.
         for (name, paras) in &secs {
-            assert!(!paras.iter().any(|p| p.contains("Halite")), "{name}: {paras:?}");
-            assert!(!paras.iter().any(|p| p.contains("seasoning, see")), "{name}: {paras:?}");
-            assert!(!paras.iter().any(|p| p.contains("Salt Salt")), "{name}: {paras:?}");
-            assert!(!paras.iter().any(|p| p.contains("Navigation")), "{name}: {paras:?}");
+            assert!(
+                !paras.iter().any(|p| p.contains("Halite")),
+                "{name}: {paras:?}"
+            );
+            assert!(
+                !paras.iter().any(|p| p.contains("seasoning, see")),
+                "{name}: {paras:?}"
+            );
+            assert!(
+                !paras.iter().any(|p| p.contains("Salt Salt")),
+                "{name}: {paras:?}"
+            );
+            assert!(
+                !paras.iter().any(|p| p.contains("Navigation")),
+                "{name}: {paras:?}"
+            );
         }
 
         // No headings: a single intro entry.
         let flat = "<p>Just a lead.</p><p>And more.</p>";
-        assert_eq!(sections(flat), vec![("_intro".to_string(), vec!["Just a lead.".to_string(), "And more.".to_string()])]);
+        assert_eq!(
+            sections(flat),
+            vec![(
+                "_intro".to_string(),
+                vec!["Just a lead.".to_string(), "And more.".to_string()]
+            )]
+        );
         // No <p> anywhere: empty regions (callers fall back gracefully).
-        assert_eq!(sections("<div>no paragraphs here</div>"), vec![("_intro".to_string(), Vec::<String>::new())]);
+        assert_eq!(
+            sections("<div>no paragraphs here</div>"),
+            vec![("_intro".to_string(), Vec::<String>::new())]
+        );
     }
 }

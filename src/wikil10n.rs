@@ -9,8 +9,13 @@
 /// the ISO 639-3 and 639-2/B codes of the supported languages fold to
 /// their 639-1 key, like lang_map.rs does for the stemmer).
 pub fn normalize_language(lang: Option<&str>) -> String {
-    let Some(lang) = lang else { return String::new() };
-    let first = lang.split([',', ';', ' ', '\t', '\n', '\r']).next().unwrap_or("");
+    let Some(lang) = lang else {
+        return String::new();
+    };
+    let first = lang
+        .split([',', ';', ' ', '\t', '\n', '\r'])
+        .next()
+        .unwrap_or("");
     let tok = first.split('-').next().unwrap_or("").to_lowercase();
     match tok.as_str() {
         "fra" | "fre" => "fr".into(),

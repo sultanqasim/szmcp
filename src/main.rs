@@ -17,16 +17,16 @@ mod zim;
 mod zimcommon;
 mod zimwrite;
 
-use clap::{Parser, Subcommand};
-use get::{get_article, get_section};
-use rmcp::transport::streamable_http_server::{
-    session::local::LocalSessionManager, StreamableHttpServerConfig, StreamableHttpService,
-};
 use axum::body::Body;
 use axum::extract::{Request, State};
 use axum::http::{header, HeaderValue, Method, StatusCode};
 use axum::middleware::Next;
 use axum::response::Response;
+use clap::{Parser, Subcommand};
+use get::{get_article, get_section};
+use rmcp::transport::streamable_http_server::{
+    session::local::LocalSessionManager, StreamableHttpServerConfig, StreamableHttpService,
+};
 use search::{search, DEFAULT_SEARCH_LIMIT};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -152,7 +152,10 @@ fn open_single_zim(zim_path: &Path) -> Result<Arc<zim::ZimLibrary>, String> {
     let path = std::fs::canonicalize(zim_path)
         .map_err(|e| format!("Invalid ZIM path {}: {e}", zim_path.display()))?;
     if path.is_dir() {
-        return Err(format!("expected a ZIM file, not a directory: {}", path.display()));
+        return Err(format!(
+            "expected a ZIM file, not a directory: {}",
+            path.display()
+        ));
     }
     if !path.is_file() {
         return Err(format!("{}: not a ZIM file", path.display()));
@@ -175,20 +178,36 @@ fn single_archive_name(library: &zim::ZimLibrary) -> Result<String, String> {
 /// Print one tool response to stdout as pretty JSON - the same JSON the MCP
 /// tool returns, without the MCP wrapper. Nothing else may reach stdout.
 fn print_result<T: serde::Serialize>(result: &T) -> Result<(), String> {
-    println!("{}", serde_json::to_string_pretty(result).map_err(|e| e.to_string())?);
+    println!(
+        "{}",
+        serde_json::to_string_pretty(result).map_err(|e| e.to_string())?
+    );
     Ok(())
 }
 
 async fn run(command: Command) -> Result<(), String> {
     match command {
-        Command::Serve { zim_path, bind, port } => serve(&zim_path, bind, port).await,
-        Command::Search { zim_path, query, limit } => {
+        Command::Serve {
+            zim_path,
+            bind,
+            port,
+        } => serve(&zim_path, bind, port).await,
+        Command::Search {
+            zim_path,
+            query,
+            limit,
+        } => {
             let library = open_library(&zim_path)?;
             let limit = limit.unwrap_or(DEFAULT_SEARCH_LIMIT);
             let results = search(&library, None, &query, limit).map_err(|e| e.to_string())?;
             print_result(&results)
         }
-        Command::Get { zim_path, path, content, raw } => {
+        Command::Get {
+            zim_path,
+            path,
+            content,
+            raw,
+        } => {
             let library = open_single_zim(&zim_path)?;
             let zim = single_archive_name(&library)?;
             let result = get_article(&library, &zim, &path, raw).map_err(|e| e.to_string())?;
@@ -199,7 +218,14 @@ async fn run(command: Command) -> Result<(), String> {
                 print_result(&result)
             }
         }
-        Command::Convert { input_zim, output_zim, limit, index_intro_only, index_redirect_titles, exclude_categories } => {
+        Command::Convert {
+            input_zim,
+            output_zim,
+            limit,
+            index_intro_only,
+            index_redirect_titles,
+            exclude_categories,
+        } => {
             // Synchronous, blocking: no await point is involved (the tokio
             // runtime simply hosts this call).
             convert::convert(
@@ -211,7 +237,13 @@ async fn run(command: Command) -> Result<(), String> {
                 exclude_categories,
             )
         }
-        Command::GetSection { zim_path, path, section, content, raw } => {
+        Command::GetSection {
+            zim_path,
+            path,
+            section,
+            content,
+            raw,
+        } => {
             let library = open_single_zim(&zim_path)?;
             let zim = single_archive_name(&library)?;
             let result =
@@ -248,7 +280,6 @@ async fn serve(zim_path: &Path, bind: String, port: u16) -> Result<(), String> {
 
     let session_manager = Arc::new(LocalSessionManager::default());
 
-
     let any_origin = bind == "0.0.0.0" || bind == "*" || bind == "::";
     let config = if any_origin {
         // External binding: accept any Host/Origin.
@@ -260,12 +291,9 @@ async fn serve(zim_path: &Path, bind: String, port: u16) -> Result<(), String> {
 
     let mcp_service = StreamableHttpService::new(service_factory, session_manager, config);
 
-    let app = axum::Router::new()
-        .fallback_service(mcp_service)
-        .layer(axum::middleware::from_fn_with_state(
-            any_origin,
-            cors_middleware,
-        ));
+    let app = axum::Router::new().fallback_service(mcp_service).layer(
+        axum::middleware::from_fn_with_state(any_origin, cors_middleware),
+    );
 
     eprintln!("szmcp - Sultan's ZIM MCP");
     eprintln!("ZIM path: {}", zim_path.display());
@@ -282,7 +310,9 @@ async fn serve(zim_path: &Path, bind: String, port: u16) -> Result<(), String> {
     let listener = tokio::net::TcpListener::bind(&addr)
         .await
         .map_err(|e| format!("Failed to bind {addr}: {e}"))?;
-    axum::serve(listener, app).await.map_err(|e| e.to_string())?;
+    axum::serve(listener, app)
+        .await
+        .map_err(|e| e.to_string())?;
 
     Ok(())
 }
@@ -376,8 +406,10 @@ mod tests {
         let Err(err) = open_single_zim(dir.path()) else {
             panic!("a directory must be rejected");
         };
-        assert!(err.contains("expected a ZIM file, not a directory"), "{err}");
+        assert!(
+            err.contains("expected a ZIM file, not a directory"),
+            "{err}"
+        );
         assert!(err.contains(&canonical.display().to_string()), "{err}");
     }
-
 }

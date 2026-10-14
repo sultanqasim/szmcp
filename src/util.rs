@@ -87,9 +87,7 @@ pub(crate) fn percent_decode(s: &str) -> String {
             && bytes[i + 1].is_ascii_hexdigit()
             && bytes[i + 2].is_ascii_hexdigit()
         {
-            let hex = |b: u8| -> u8 {
-                (b as char).to_digit(16).unwrap_or(0) as u8
-            };
+            let hex = |b: u8| -> u8 { (b as char).to_digit(16).unwrap_or(0) as u8 };
             out.push((hex(bytes[i + 1]) << 4) | hex(bytes[i + 2]));
             i += 3;
         } else {
@@ -168,7 +166,10 @@ pub(crate) fn parse_query(qs: &str) -> Vec<(String, String)> {
             Some((k, v)) => (k, v),
             None => (chunk, ""),
         };
-        out.push((percent_decode(&k.replace('+', " ")), percent_decode(&v.replace('+', " "))));
+        out.push((
+            percent_decode(&k.replace('+', " ")),
+            percent_decode(&v.replace('+', " ")),
+        ));
     }
     out
 }
@@ -271,7 +272,11 @@ fn parse_charref(after: &str) -> Option<(String, usize)> {
         let start = if hex { 2 } else { 1 };
         let mut j = start;
         while j < bytes.len()
-            && (if hex { bytes[j].is_ascii_hexdigit() } else { bytes[j].is_ascii_digit() })
+            && (if hex {
+                bytes[j].is_ascii_hexdigit()
+            } else {
+                bytes[j].is_ascii_digit()
+            })
         {
             j += 1;
         }
@@ -285,7 +290,8 @@ fn parse_charref(after: &str) -> Option<(String, usize)> {
         let digits = &after[start..j];
         let radix = if hex { 16 } else { 10 };
         let num = digits.bytes().fold(0u32, |acc, d| {
-            acc.saturating_mul(radix).saturating_add((d as char).to_digit(radix).unwrap_or(0))
+            acc.saturating_mul(radix)
+                .saturating_add((d as char).to_digit(radix).unwrap_or(0))
         });
         if let Some((_, v)) = INVALID_CHARREFS.iter().find(|(n, _)| *n == num) {
             return Some((v.to_string(), consumed));

@@ -138,7 +138,9 @@ impl Dom {
 
     /// Detach `id` from its parent (its tail text node stays in place).
     pub fn detach(&mut self, id: NodeId) {
-        let Some(parent) = self.parent_of(id) else { return };
+        let Some(parent) = self.parent_of(id) else {
+            return;
+        };
         self.nodes[parent].children.retain(|&c| c != id);
         self.nodes[id].parent = None;
     }
@@ -146,7 +148,9 @@ impl Dom {
     /// lxml's `drop_tag`: replace the element with its children, merging
     /// its own text into the surrounding text (no-op when detached).
     pub fn drop_tag(&mut self, id: NodeId) {
-        let Some(parent) = self.parent_of(id) else { return };
+        let Some(parent) = self.parent_of(id) else {
+            return;
+        };
         if self.nodes[id].children.is_empty() {
             // Nothing inside: the element vanishes, its tail stays.
             self.detach(id);
@@ -174,10 +178,14 @@ impl Dom {
     /// to flatten Parsoid <section> wrappers); the surrounding text nodes
     /// stay in place and are re-merged.
     pub fn replace_with_children(&mut self, id: NodeId) {
-        let Some(parent) = self.parent_of(id) else { return };
+        let Some(parent) = self.parent_of(id) else {
+            return;
+        };
         let children = std::mem::take(&mut self.nodes[id].children);
         if let Some(pos) = self.nodes[parent].children.iter().position(|&c| c == id) {
-            self.nodes[parent].children.splice(pos..pos + 1, children.iter().copied());
+            self.nodes[parent]
+                .children
+                .splice(pos..pos + 1, children.iter().copied());
             for &c in &children {
                 self.nodes[c].parent = Some(parent);
             }
@@ -201,7 +209,11 @@ fn lower_name(name: &str) -> String {
 
 fn push_node(nodes: &mut Vec<Node>, kind: NodeKind) -> NodeId {
     let id = nodes.len();
-    nodes.push(Node { kind, parent: None, children: Vec::new() });
+    nodes.push(Node {
+        kind,
+        parent: None,
+        children: Vec::new(),
+    });
     id
 }
 
@@ -212,7 +224,9 @@ fn merge_sibling_text(nodes: &mut Vec<Node>, parent: NodeId) {
     let mut merged: Vec<NodeId> = Vec::with_capacity(children.len());
     for child in children {
         let merges = matches!(&nodes[child].kind, NodeKind::Text(_))
-            && merged.last().is_some_and(|&last| matches!(&nodes[last].kind, NodeKind::Text(_)));
+            && merged
+                .last()
+                .is_some_and(|&last| matches!(&nodes[last].kind, NodeKind::Text(_)));
         if !merges {
             merged.push(child);
             continue;
@@ -224,7 +238,9 @@ fn merge_sibling_text(nodes: &mut Vec<Node>, parent: NodeId) {
             _ => unreachable!(),
         };
         let last = *merged.last().unwrap();
-        let NodeKind::Text(prev) = &mut nodes[last].kind else { unreachable!() };
+        let NodeKind::Text(prev) = &mut nodes[last].kind else {
+            unreachable!()
+        };
         prev.push_str(&text);
         nodes[child].parent = None; // folded away, unreachable
     }
@@ -310,7 +326,10 @@ impl<'a> NodeRef<'a> {
 
     /// The ancestor chain (immediate parent upwards), self excluded.
     pub fn ancestors(&self) -> Ancestors<'a> {
-        Ancestors { dom: self.dom, cur: self.dom.parent_of(self.id) }
+        Ancestors {
+            dom: self.dom,
+            cur: self.dom.parent_of(self.id),
+        }
     }
 
     /// The previous element/comment sibling (text nodes are tails).
@@ -362,7 +381,9 @@ impl<'a> NodeRef<'a> {
 
     /// All descendants (self excluded) with the given tag.
     pub fn find_all(&self, tag: &str) -> Vec<NodeRef<'a>> {
-        self.descendants().filter(|n| n.tag() == Some(tag)).collect()
+        self.descendants()
+            .filter(|n| n.tag() == Some(tag))
+            .collect()
     }
 }
 
@@ -423,8 +444,6 @@ fn collect_text(node: &NodeRef<'_>, out: &mut String) {
     }
 }
 
-
-
 // ---------------------------------------------------------------------------
 // html5ever TreeSink that builds the arena directly: no markup5ever_rcdom
 // tree, no copy pass. Semantics mirror RcDom exactly: text merged into a
@@ -453,8 +472,16 @@ struct SinkInner {
 impl SinkInner {
     fn push_node(&mut self, kind: NodeKind) -> NodeId {
         let id = self.nodes.len();
-        self.nodes.push(Node { kind, parent: None, children: Vec::new() });
-        self.names.push(QualName::new(None, html5ever::ns!(), html5ever::local_name!("")));
+        self.nodes.push(Node {
+            kind,
+            parent: None,
+            children: Vec::new(),
+        });
+        self.names.push(QualName::new(
+            None,
+            html5ever::ns!(),
+            html5ever::local_name!(""),
+        ));
         id
     }
 
@@ -477,9 +504,17 @@ struct ArenaSink {
 impl ArenaSink {
     fn with_capacity(cap: usize) -> ArenaSink {
         let mut nodes = Vec::with_capacity(cap);
-        nodes.push(Node { kind: NodeKind::Document, parent: None, children: Vec::new() });
+        nodes.push(Node {
+            kind: NodeKind::Document,
+            parent: None,
+            children: Vec::new(),
+        });
         let mut names = Vec::with_capacity(cap);
-        names.push(QualName::new(None, html5ever::ns!(), html5ever::local_name!("")));
+        names.push(QualName::new(
+            None,
+            html5ever::ns!(),
+            html5ever::local_name!(""),
+        ));
         ArenaSink {
             inner: UnsafeCell::new(SinkInner {
                 nodes,
@@ -594,8 +629,14 @@ impl TreeSink for ArenaSink {
         let inner = self.mut_inner();
         let sid = sibling.0;
         let (pid, i) = {
-            let p = inner.nodes[sid].parent.expect("append_before_sibling: no parent");
-            let idx = inner.nodes[p].children.iter().position(|&c| c == sid).expect("not a child");
+            let p = inner.nodes[sid]
+                .parent
+                .expect("append_before_sibling: no parent");
+            let idx = inner.nodes[p]
+                .children
+                .iter()
+                .position(|&c| c == sid)
+                .expect("not a child");
             (p, idx)
         };
         match child {
@@ -633,12 +674,19 @@ impl TreeSink for ArenaSink {
     }
 
     fn get_template_contents(&self, target: &H) -> H {
-        H(*self.inner().tcontents.get(&target.0).expect("not a template element!"))
+        H(*self
+            .inner()
+            .tcontents
+            .get(&target.0)
+            .expect("not a template element!"))
     }
 
     fn add_attrs_if_missing(&self, target: &H, attrs: Vec<Attribute>) {
         let inner = self.mut_inner();
-        let NodeKind::Element { attrs: existing, .. } = &mut inner.nodes[target.0].kind else {
+        let NodeKind::Element {
+            attrs: existing, ..
+        } = &mut inner.nodes[target.0].kind
+        else {
             panic!("not an element");
         };
         for a in attrs {
@@ -652,8 +700,14 @@ impl TreeSink for ArenaSink {
 
     fn remove_from_parent(&self, target: &H) {
         let inner = self.mut_inner();
-        let Some(oldp) = inner.nodes[target.0].parent.take() else { return };
-        if let Some(pos) = inner.nodes[oldp].children.iter().position(|&c| c == target.0) {
+        let Some(oldp) = inner.nodes[target.0].parent.take() else {
+            return;
+        };
+        if let Some(pos) = inner.nodes[oldp]
+            .children
+            .iter()
+            .position(|&c| c == target.0)
+        {
             inner.nodes[oldp].children.remove(pos);
         }
         merge_sibling_text(&mut inner.nodes, oldp);

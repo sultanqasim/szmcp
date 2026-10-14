@@ -48,7 +48,10 @@ fn strip_inline(s: &str) -> String {
         let text = if !label.is_empty() {
             label.to_string()
         } else {
-            target.split_once('#').map_or(target, |(t, _)| t).replace('_', " ")
+            target
+                .split_once('#')
+                .map_or(target, |(t, _)| t)
+                .replace('_', " ")
         };
         out.push_str(&text);
         rest = &rest[close + 2..];
@@ -69,7 +72,9 @@ fn is_fence(t: &str) -> bool {
 fn heading_level(t: &str) -> u8 {
     let hashes = t.bytes().take_while(|&b| b == b'#').count();
     if (1..=6).contains(&hashes)
-        && t.as_bytes().get(hashes).map_or(true, |b| b.is_ascii_whitespace())
+        && t.as_bytes()
+            .get(hashes)
+            .map_or(true, |b| b.is_ascii_whitespace())
     {
         hashes as u8
     } else {
@@ -237,16 +242,16 @@ pub fn sections(md: &str) -> Vec<(String, Vec<String>)> {
     let headings = collect_headings(&lines);
     let (intro_start, intro_end) = intro_bounds(&lines, &headings);
     let first_section = usize::from(intro_start > 0); // a leading title was dropped
-    let mut out = vec![(INTRO_SECTION.to_string(), md_paragraphs(&lines[intro_start..intro_end]))];
+    let mut out = vec![(
+        INTRO_SECTION.to_string(),
+        md_paragraphs(&lines[intro_start..intro_end]),
+    )];
     for (i, h) in headings.iter().enumerate().skip(first_section) {
         let end = headings[i + 1..]
             .iter()
             .find(|n| n.level <= h.level)
             .map_or(lines.len(), |n| n.line);
-        out.push((
-            h.name.clone(),
-            md_paragraphs(&lines[h.line + 1..end]),
-        ));
+        out.push((h.name.clone(), md_paragraphs(&lines[h.line + 1..end])));
     }
     out
 }
@@ -278,7 +283,10 @@ fn title_split(lines: &[&str], headings: &[Heading]) -> (usize, usize) {
 /// at the first section heading's line (the document's end if there is none).
 fn intro_bounds(lines: &[&str], headings: &[Heading]) -> (usize, usize) {
     let (intro_start, first_section) = title_split(lines, headings);
-    (intro_start, headings.get(first_section).map_or(lines.len(), |h| h.line))
+    (
+        intro_start,
+        headings.get(first_section).map_or(lines.len(), |h| h.line),
+    )
 }
 
 struct Heading {
@@ -299,7 +307,11 @@ fn heading_key(s: &str) -> String {
     let no_markers: String = s.chars().filter(|&c| c != '*' && c != '`').collect();
     // An even number of `_` markers reads as paired emphasis (`_like this_`)
     // and is dropped; a lone one is subscript math and stays.
-    let text = if no_markers.matches('_').count() % 2 == 0 { no_markers.replace('_', "") } else { no_markers };
+    let text = if no_markers.matches('_').count() % 2 == 0 {
+        no_markers.replace('_', "")
+    } else {
+        no_markers
+    };
     normalize(&text)
 }
 
@@ -322,7 +334,12 @@ fn collect_headings(lines: &[&str]) -> Vec<Heading> {
         if level > 0 {
             let name = t[level as usize..].trim().to_string();
             let name_norm = heading_key(&name);
-            out.push(Heading { level, name, name_norm, line: i });
+            out.push(Heading {
+                level,
+                name,
+                name_norm,
+                line: i,
+            });
         }
     }
     out
@@ -467,8 +484,7 @@ That is all.
 
         // Without a leading title heading, the intro starts at the first
         // line.
-        let (_, intro) =
-            section_content("Plain lead.\n\n## Section\n\nBody.\n", "_intro").unwrap();
+        let (_, intro) = section_content("Plain lead.\n\n## Section\n\nBody.\n", "_intro").unwrap();
         assert_eq!(intro, "Plain lead.");
 
         // The introduction always exists: nothing between the title line
@@ -557,10 +573,19 @@ That is all.
         assert_eq!(secs.len(), 4);
         for (name, paras) in &secs {
             // Hatnote, title line and fence content never become paragraphs.
-            assert!(!paras.iter().any(|p| p.contains("seasoning, see")), "{name}: {paras:?}");
-            assert!(!paras.iter().any(|p| p.contains("fenced code")), "{name}: {paras:?}");
+            assert!(
+                !paras.iter().any(|p| p.contains("seasoning, see")),
+                "{name}: {paras:?}"
+            );
+            assert!(
+                !paras.iter().any(|p| p.contains("fenced code")),
+                "{name}: {paras:?}"
+            );
             assert!(!paras.iter().any(|p| p.contains('#')), "{name}: {paras:?}");
-            assert!(!paras.iter().any(|p| p.contains("**") || p.contains("[[")), "{name}: {paras:?}");
+            assert!(
+                !paras.iter().any(|p| p.contains("**") || p.contains("[[")),
+                "{name}: {paras:?}"
+            );
         }
     }
 
@@ -575,7 +600,10 @@ That is all.
         let secs = sections(md);
         assert_eq!(
             secs[0].1,
-            vec!["See Earth's age, Mean anomaly, Chemical element, p-block and [He] atoms.".to_string()]
+            vec![
+                "See Earth's age, Mean anomaly, Chemical element, p-block and [He] atoms."
+                    .to_string()
+            ]
         );
     }
 
@@ -593,7 +621,10 @@ That is all.
         // No headings at all: a single intro entry.
         assert_eq!(
             sections("One.\n\nTwo.\n"),
-            vec![("_intro".to_string(), vec!["One.".to_string(), "Two.".to_string()])]
+            vec![(
+                "_intro".to_string(),
+                vec!["One.".to_string(), "Two.".to_string()]
+            )]
         );
     }
 }

@@ -232,7 +232,13 @@ impl ArchiveQuery {
                 }
             }
         }
-        Ok(Self { stemmer, terms, title_text, ft_query, ft_terms })
+        Ok(Self {
+            stemmer,
+            terms,
+            title_text,
+            ft_query,
+            ft_terms,
+        })
     }
 }
 
@@ -325,11 +331,20 @@ fn fetch_fulltext(
                 path,
                 title,
                 doclen: h.fulltext.doc_length(m.docid)?,
-                wdfs: terms.iter().map(|(t, _)| h.fulltext.wdf(m.docid, t)).collect(),
+                wdfs: terms
+                    .iter()
+                    .map(|(t, _)| h.fulltext.wdf(m.docid, t))
+                    .collect(),
             });
         }
     }
-    Ok(FtArchive { docs, avlen, terms, dfs, candidates })
+    Ok(FtArchive {
+        docs,
+        avlen,
+        terms,
+        dfs,
+        candidates,
+    })
 }
 
 /// The pooled full-text statistics of one search: Xapian's per-database
@@ -361,7 +376,11 @@ impl FtPool {
                 *df.entry(term.clone()).or_insert(0) += freq;
             }
         }
-        let avlen = if docs > 0 { total_len / docs as f64 } else { 0.0 };
+        let avlen = if docs > 0 {
+            total_len / docs as f64
+        } else {
+            0.0
+        };
         Self { docs, avlen, df }
     }
 
@@ -369,8 +388,11 @@ impl FtPool {
     /// Xapian uses, so on the pooled statistics it equals what Xapian would
     /// score the candidate with ([`bm25_weight`]).
     fn score(&self, ft: &FtArchive, cand: &FtCandidate) -> f64 {
-        let dfs: Vec<u32> =
-            ft.terms.iter().map(|(t, _)| self.df.get(t).copied().unwrap_or(0)).collect();
+        let dfs: Vec<u32> = ft
+            .terms
+            .iter()
+            .map(|(t, _)| self.df.get(t).copied().unwrap_or(0))
+            .collect();
         let wqfs: Vec<u32> = ft.terms.iter().map(|(_, wqf)| *wqf).collect();
         bm25_weight(self.docs, self.avlen, &dfs, &wqfs, cand.doclen, &cand.wdfs)
     }
@@ -386,7 +408,11 @@ fn pooled_fulltext(
     let pool = &FtPool::new(&per_archive);
     let mut scored: Vec<(&Arc<Archive>, &FtCandidate, f64)> = per_archive
         .iter()
-        .flat_map(|(arc, ft)| ft.candidates.iter().map(move |c| (*arc, c, pool.score(ft, c))))
+        .flat_map(|(arc, ft)| {
+            ft.candidates
+                .iter()
+                .map(move |c| (*arc, c, pool.score(ft, c)))
+        })
         .collect();
     scored.sort_by(|(arc_a, cand_a, score_a), (arc_b, cand_b, score_b)| {
         score_b
@@ -533,8 +559,7 @@ pub fn search(
                                     path = ftdoc.data_str()?;
                                 }
                                 if title.is_empty() {
-                                    title =
-                                        String::from_utf8_lossy(&ftdoc.value(0)?).into_owned();
+                                    title = String::from_utf8_lossy(&ftdoc.value(0)?).into_owned();
                                 }
                             }
                         }
@@ -614,8 +639,11 @@ pub fn search(
     merged = merged
         .into_iter()
         .filter_map(|(arc, path, idx_title, kind)| {
-            let (path, entry_title) =
-                arc.resolve_terminal(&path).ok().flatten().unwrap_or((path, String::new()));
+            let (path, entry_title) = arc
+                .resolve_terminal(&path)
+                .ok()
+                .flatten()
+                .unwrap_or((path, String::new()));
             let title = if !entry_title.is_empty() {
                 entry_title
             } else if !idx_title.is_empty() {
@@ -782,7 +810,8 @@ fn region_scores(
     }
     // commit() publishes the documents to search: without it the Enquire
     // below would see an empty index.
-    wdb.commit().map_err(|e| section_error(e, "commit the section index"))?;
+    wdb.commit()
+        .map_err(|e| section_error(e, "commit the section index"))?;
     let mut enquire =
         Enquire::new_writable(&wdb).map_err(|e| section_error(e, "create the enquire"))?;
     enquire
@@ -838,7 +867,10 @@ fn hit_preview(article: &str, is_markdown: bool) -> String {
     } else {
         html::intro_paragraphs(article)
     };
-    intro.first().map(|lead| preview_truncate(lead)).unwrap_or_default()
+    intro
+        .first()
+        .map(|lead| preview_truncate(lead))
+        .unwrap_or_default()
 }
 
 /// The `sections` of one full-text search hit (title matches report none -
@@ -876,7 +908,12 @@ fn hit_sections(
     }
     let scores = region_scores(&secs, terms, stem, query)?;
     let names: Vec<String> = secs.iter().map(|(name, _)| name.clone()).collect();
-    Ok(scored_sections(&names, &scores, SECTION_MIN_SCORE_FRAC, SECTION_MAX_COVERAGE))
+    Ok(scored_sections(
+        &names,
+        &scores,
+        SECTION_MIN_SCORE_FRAC,
+        SECTION_MAX_COVERAGE,
+    ))
 }
 
 // ---------------------------------------------------------------------------
@@ -991,12 +1028,16 @@ Scientists measure the flow from observatories.
     /// (`ZimSearchTool`) is exercised by the empty-query validation test
     /// below.
     fn search(server: &ZimMcpServer, query: &str) -> Vec<SearchHit> {
-        super::search(&server.library, None, query, DEFAULT_SEARCH_LIMIT).unwrap().results
+        super::search(&server.library, None, query, DEFAULT_SEARCH_LIMIT)
+            .unwrap()
+            .results
     }
 
     /// [`search`] with the optional single-archive filter filled in.
     fn search_one(server: &ZimMcpServer, only: &str, query: &str) -> Vec<SearchHit> {
-        super::search(&server.library, Some(only), query, DEFAULT_SEARCH_LIMIT).unwrap().results
+        super::search(&server.library, Some(only), query, DEFAULT_SEARCH_LIMIT)
+            .unwrap()
+            .results
     }
 
     /// Build a single-file glass Xapian index the way openZIM does: document
@@ -1047,15 +1088,33 @@ Scientists measure the flow from observatories.
     /// The bytes of the shared test archive: Apple and Banana with a real
     /// full-text index, one ZIM file named `test.zim`.
     fn test_zim_bytes() -> Vec<u8> {
-        let index = make_index(
-            &[
-                ("C/Apple", "appl histori 10 000 year domest wild kazakhstan comput devic nam", "Apple"),
-                ("C/Banana", "banana tree tall herbaceou plant growth", "Banana"),
-            ],
-        );
+        let index = make_index(&[
+            (
+                "C/Apple",
+                "appl histori 10 000 year domest wild kazakhstan comput devic nam",
+                "Apple",
+            ),
+            (
+                "C/Banana",
+                "banana tree tall herbaceou plant growth",
+                "Banana",
+            ),
+        ]);
         let content = [
-            TestEntry { namespace: b'C', url: "Apple", title: "Apple", mime: 0, body: APPLE_HTML.as_bytes() },
-            TestEntry { namespace: b'C', url: "Banana", title: "Banana", mime: 0, body: BANANA_HTML.as_bytes() },
+            TestEntry {
+                namespace: b'C',
+                url: "Apple",
+                title: "Apple",
+                mime: 0,
+                body: APPLE_HTML.as_bytes(),
+            },
+            TestEntry {
+                namespace: b'C',
+                url: "Banana",
+                title: "Banana",
+                mime: 0,
+                body: BANANA_HTML.as_bytes(),
+            },
         ];
         build_archive(&["text/html"], &content, &[], 0, Some(&index))
     }
@@ -1138,15 +1197,36 @@ Scientists measure the flow from observatories.
         );
         let election_html: &'static [u8] = "<html><body><h1>Élection</h1>\
             <p>Une élection est un scrutin. Les élections présidentielles \
-            ont lieu tous les cinq ans.</p></body></html>".as_bytes();
+            ont lieu tous les cinq ans.</p></body></html>"
+            .as_bytes();
         let geo_html: &'static [u8] = "<html><body><h1>Géographie</h1>\
-            <p>La géographie étudie les paysages.</p></body></html>".as_bytes();
+            <p>La géographie étudie les paysages.</p></body></html>"
+            .as_bytes();
         let school_html: &'static [u8] = "<html><body><h1>École</h1>\
-            <p>Une école primaire accueille les enfants du village.</p></body></html>".as_bytes();
+            <p>Une école primaire accueille les enfants du village.</p></body></html>"
+            .as_bytes();
         let content = [
-            TestEntry { namespace: b'C', url: "Élection", title: "Élection", mime: 0, body: election_html },
-            TestEntry { namespace: b'C', url: "Géographie", title: "Géographie", mime: 0, body: geo_html },
-            TestEntry { namespace: b'C', url: "École", title: "École", mime: 0, body: school_html },
+            TestEntry {
+                namespace: b'C',
+                url: "Élection",
+                title: "Élection",
+                mime: 0,
+                body: election_html,
+            },
+            TestEntry {
+                namespace: b'C',
+                url: "Géographie",
+                title: "Géographie",
+                mime: 0,
+                body: geo_html,
+            },
+            TestEntry {
+                namespace: b'C',
+                url: "École",
+                title: "École",
+                mime: 0,
+                body: school_html,
+            },
             language_metadata_entry("fra"),
         ];
         let bytes = build_archive(&["text/html"], &content, &[], 0, Some(&index));
@@ -1213,7 +1293,8 @@ Scientists measure the flow from observatories.
         );
         let html: &'static [u8] = "<html><body><h1>Révolution</h1>\
             <p>La Révolution française éclate en 1789. La monarchie est \
-            renversée et la république proclamée.</p></body></html>".as_bytes();
+            renversée et la république proclamée.</p></body></html>"
+            .as_bytes();
         let content = [
             TestEntry { namespace: b'C', url: "Révolution", title: "Révolution", mime: 0, body: html },
             TestEntry { namespace: b'C', url: "Géographie", title: "Géographie", mime: 0, body: "<html><body><h1>Géographie</h1><p>La géographie étudie les paysages.</p></body></html>".as_bytes() },
@@ -1279,12 +1360,18 @@ Scientists measure the flow from observatories.
         let (server, _keep) = test_server();
 
         // "banana apple" matches both fixture articles; limit 1 keeps one.
-        let params = ZimSearchParams { query: "banana apple".into(), limit: Some(1) };
+        let params = ZimSearchParams {
+            query: "banana apple".into(),
+            limit: Some(1),
+        };
         let results = block_on(ZimSearchTool::invoke(&server, params)).unwrap();
         assert_eq!(results.results.len(), 1);
 
         // The omitted limit keeps the default.
-        let params = ZimSearchParams { query: "banana apple".into(), limit: None };
+        let params = ZimSearchParams {
+            query: "banana apple".into(),
+            limit: None,
+        };
         let results = block_on(ZimSearchTool::invoke(&server, params)).unwrap();
         assert!(results.results.len() <= DEFAULT_SEARCH_LIMIT);
     }
@@ -1292,7 +1379,10 @@ Scientists measure the flow from observatories.
     #[test]
     fn e2e_search_empty_query_is_invalid() {
         let (server, _keep) = test_server();
-        let params = ZimSearchParams { query: "   ".into(), limit: None };
+        let params = ZimSearchParams {
+            query: "   ".into(),
+            limit: None,
+        };
         assert!(matches!(
             block_on(ZimSearchTool::invoke(&server, params)),
             Err(ToolError::InvalidArgument(_))
@@ -1309,7 +1399,14 @@ Scientists measure the flow from observatories.
         // state and crashed the process - Xapian does not support concurrent
         // calls on one Database object (see xapian2/README.md).
         let (server, _keep) = test_server();
-        let queries = ["apple", "apple", "computing", "banana apple", "apple", "computing"];
+        let queries = [
+            "apple",
+            "apple",
+            "computing",
+            "banana apple",
+            "apple",
+            "computing",
+        ];
         let barrier = Arc::new(std::sync::Barrier::new(queries.len()));
         std::thread::scope(|scope| {
             let mut handles = Vec::new();
@@ -1333,7 +1430,10 @@ Scientists measure the flow from observatories.
                         _ => {
                             assert_eq!(hits[0].path, "C/Apple", "{hits:?}");
                             assert_eq!(hits[0].title, "Apple");
-                            assert_eq!(hits[0].preview, "An apple is the fruit of <rosaceae> trees.");
+                            assert_eq!(
+                                hits[0].preview,
+                                "An apple is the fruit of <rosaceae> trees."
+                            );
                         }
                     }
                 }));
@@ -1347,16 +1447,30 @@ Scientists measure the flow from observatories.
     #[test]
     fn e2e_search_title_falls_back_to_index_title() {
         let dir = tempfile::tempdir().unwrap();
-        let index = make_index(
-            &[
-                ("C/Nitrogen", "nitrogen gas inert", "Nitrogen"),
-                ("C/Banana", "banana tree tall herbaceou plant growth", "Banana"),
-            ],
-        );
+        let index = make_index(&[
+            ("C/Nitrogen", "nitrogen gas inert", "Nitrogen"),
+            (
+                "C/Banana",
+                "banana tree tall herbaceou plant growth",
+                "Banana",
+            ),
+        ]);
         let content = [
             // Empty directory-entry title, as in modern openZIM archives.
-            TestEntry { namespace: b'C', url: "Nitrogen", title: "", mime: 0, body: NITROGEN_HTML.as_bytes() },
-            TestEntry { namespace: b'C', url: "Banana", title: "Banana", mime: 0, body: BANANA_HTML.as_bytes() },
+            TestEntry {
+                namespace: b'C',
+                url: "Nitrogen",
+                title: "",
+                mime: 0,
+                body: NITROGEN_HTML.as_bytes(),
+            },
+            TestEntry {
+                namespace: b'C',
+                url: "Banana",
+                title: "Banana",
+                mime: 0,
+                body: BANANA_HTML.as_bytes(),
+            },
         ];
         let bytes = build_archive(&["text/html"], &content, &[], 0, Some(&index));
         std::fs::write(dir.path().join("test.zim"), &bytes).unwrap();
@@ -1376,16 +1490,30 @@ Scientists measure the flow from observatories.
     /// words as terms and the title in value slot 0.
     fn title_index_test_server() -> (ZimMcpServer, tempfile::TempDir) {
         let dir = tempfile::tempdir().unwrap();
-        let index = make_index(
-            &[
-                ("C/Nitrogen_Gas_Effects", "nitrogen gas surround effect unavoid", "Nitrogen Gas Effects"),
-                ("C/Weather", "weather forecast describ effect air pressur gas law explan atmospher", "Weather"),
-                ("C/Banana", "banana tree tall herbaceou plant growth", "Banana"),
-                ("C/Glacier", "glacier ice dens movem weight flow", "Glacier"),
-            ],
-        );
+        let index = make_index(&[
+            (
+                "C/Nitrogen_Gas_Effects",
+                "nitrogen gas surround effect unavoid",
+                "Nitrogen Gas Effects",
+            ),
+            (
+                "C/Weather",
+                "weather forecast describ effect air pressur gas law explan atmospher",
+                "Weather",
+            ),
+            (
+                "C/Banana",
+                "banana tree tall herbaceou plant growth",
+                "Banana",
+            ),
+            ("C/Glacier", "glacier ice dens movem weight flow", "Glacier"),
+        ]);
         let titles = make_index(&[
-            ("C/Nitrogen_Gas_Effects", "effects of nitrogen gas", "Effects of Nitrogen Gas"),
+            (
+                "C/Nitrogen_Gas_Effects",
+                "effects of nitrogen gas",
+                "Effects of Nitrogen Gas",
+            ),
             ("C/Weather", "weather", "Weather"),
             // Real title indexes carry function words unstopped (measured on
             // md1m: df("of")=204037, df("on")=7658) - one such doc keeps the
@@ -1401,7 +1529,14 @@ Scientists measure the flow from observatories.
             TestEntry { namespace: b'C', url: "Banana", title: "Banana", mime: 0, body: BANANA_HTML.as_bytes() },
             TestEntry { namespace: b'C', url: "Glacier", title: "Glacier", mime: 0, body: b"<html><body><h1>Glacier</h1><p>A glacier is a body of dense ice.</p></body></html>" },
         ];
-        let bytes = build_archive_indexes(&["text/html"], &content, &[], 0, Some(&index), Some(&titles));
+        let bytes = build_archive_indexes(
+            &["text/html"],
+            &content,
+            &[],
+            0,
+            Some(&index),
+            Some(&titles),
+        );
         std::fs::write(dir.path().join("test.zim"), &bytes).unwrap();
         let library = Arc::new(ZimLibrary::scan(dir.path()).unwrap());
         assert!(library.archives[0].searchable());
@@ -1429,7 +1564,12 @@ Scientists measure the flow from observatories.
         assert!(!json.contains("sections"), "{json}");
         // The article also matched in the full-text tier (its body carries
         // the query words): reported exactly once, from the title tier.
-        assert_eq!(hits.iter().filter(|h| h.path == "C/Nitrogen_Gas_Effects").count(), 1);
+        assert_eq!(
+            hits.iter()
+                .filter(|h| h.path == "C/Nitrogen_Gas_Effects")
+                .count(),
+            1
+        );
 
         // The full-text-only matches follow, with full-text hit semantics.
         assert_eq!(hits[1].path, "C/Weather", "{hits:?}");
@@ -1458,18 +1598,20 @@ Scientists measure the flow from observatories.
             ("C/Mexico_City", "mexico city", "Mexico City"),
             ("C/Weather", "weather", "Weather"),
         ]);
-        let index = make_index(
-            &[
-                ("C/New_York_City", "new york citi largest unit state", "New York City"),
-                ("C/Quebec_City", "quebec citi capit provinc", "Quebec City"),
-                // "kansa", not "kansas": the index terms are the STEMS the
-                // query parser produces (Porter2 strips the s), as libzim
-                // indexes them.
-                ("C/Kansas_City", "kansa citi straddl state", "Kansas City"),
-                ("C/Mexico_City", "mexico citi capit", "Mexico City"),
-                ("C/Weather", "weather forecast effect atmospher", "Weather"),
-            ],
-        );
+        let index = make_index(&[
+            (
+                "C/New_York_City",
+                "new york citi largest unit state",
+                "New York City",
+            ),
+            ("C/Quebec_City", "quebec citi capit provinc", "Quebec City"),
+            // "kansa", not "kansas": the index terms are the STEMS the
+            // query parser produces (Porter2 strips the s), as libzim
+            // indexes them.
+            ("C/Kansas_City", "kansa citi straddl state", "Kansas City"),
+            ("C/Mexico_City", "mexico citi capit", "Mexico City"),
+            ("C/Weather", "weather forecast effect atmospher", "Weather"),
+        ]);
         let content = [
             // Empty directory-entry titles, as in modern openZIM archives:
             // the titles live in the indexes (value slot 0) only.
@@ -1479,7 +1621,14 @@ Scientists measure the flow from observatories.
             TestEntry { namespace: b'C', url: "Mexico_City", title: "", mime: 0, body: b"<html><body><h1>Mexico City</h1><p>Mexico City is the capital of Mexico.</p></body></html>" },
             TestEntry { namespace: b'C', url: "Weather", title: "", mime: 0, body: b"<html><body><h1>Weather</h1><p>Weather forecasts describe the atmosphere.</p></body></html>" },
         ];
-        let bytes = build_archive_indexes(&["text/html"], &content, &[], 0, Some(&index), Some(&titles));
+        let bytes = build_archive_indexes(
+            &["text/html"],
+            &content,
+            &[],
+            0,
+            Some(&index),
+            Some(&titles),
+        );
         std::fs::write(dir.path().join("test.zim"), &bytes).unwrap();
         let library = Arc::new(ZimLibrary::scan(dir.path()).unwrap());
         assert!(library.archives[0].searchable());
@@ -1518,7 +1667,10 @@ Scientists measure the flow from observatories.
         }
         // The city articles are still reachable - through full text.
         let pos = |t: &str| hits.iter().position(|h| h.title == t);
-        assert!(pos("Kansas City").is_some() && pos("New York City").is_some(), "{hits:?}");
+        assert!(
+            pos("Kansas City").is_some() && pos("New York City").is_some(),
+            "{hits:?}"
+        );
 
         // A single-word query is the one-word AND: title-tier hits first.
         let hits = search(&server, "city");
@@ -1542,16 +1694,18 @@ Scientists measure the flow from observatories.
             ("C/Movie2", "movi", "The Movie"),
         ]);
         // Full-text index: unprefixed stems, as libzim's STEM_ALL builds it.
-        let index = make_index(
-            &[
-                ("C/Physics1", "black hole graviti spacetime", "Black hole"),
-                ("C/Physics2", "black hole graviti spacetime", "Black holes"),
-                ("C/Movie1", "hole plot movi", "Holes"),
-                ("C/Movie2", "movi film", "The Movie"),
-                ("C/Banana", "banana tree tall herbaceou plant growth", "Banana"),
-                ("C/Glacier", "glacier ice dens movem weight flow", "Glacier"),
-            ],
-        );
+        let index = make_index(&[
+            ("C/Physics1", "black hole graviti spacetime", "Black hole"),
+            ("C/Physics2", "black hole graviti spacetime", "Black holes"),
+            ("C/Movie1", "hole plot movi", "Holes"),
+            ("C/Movie2", "movi film", "The Movie"),
+            (
+                "C/Banana",
+                "banana tree tall herbaceou plant growth",
+                "Banana",
+            ),
+            ("C/Glacier", "glacier ice dens movem weight flow", "Glacier"),
+        ]);
         let content = [
             TestEntry { namespace: b'C', url: "Physics1", title: "", mime: 0, body: b"<html><body><h1>Black hole</h1><p>A black hole bends spacetime.</p></body></html>" },
             TestEntry { namespace: b'C', url: "Physics2", title: "", mime: 0, body: b"<html><body><h1>Black holes</h1><p>Black holes bend spacetime.</p></body></html>" },
@@ -1560,7 +1714,14 @@ Scientists measure the flow from observatories.
             TestEntry { namespace: b'C', url: "Banana", title: "", mime: 0, body: BANANA_HTML.as_bytes() },
             TestEntry { namespace: b'C', url: "Glacier", title: "", mime: 0, body: b"<html><body><h1>Glacier</h1><p>A glacier is a body of dense ice.</p></body></html>" },
         ];
-        let bytes = build_archive_indexes(&["text/html"], &content, &[], 0, Some(&index), Some(&titles));
+        let bytes = build_archive_indexes(
+            &["text/html"],
+            &content,
+            &[],
+            0,
+            Some(&index),
+            Some(&titles),
+        );
         std::fs::write(dir.path().join("test.zim"), &bytes).unwrap();
         let library = Arc::new(ZimLibrary::scan(dir.path()).unwrap());
         assert!(library.archives[0].searchable());
@@ -1603,28 +1764,34 @@ Scientists measure the flow from observatories.
     /// retrieve the article.
     fn hyphen_title_test_server() -> (ZimMcpServer, tempfile::TempDir) {
         let dir = tempfile::tempdir().unwrap();
-        let titles = make_index(&[
-            (
-                "C/Notre_Dame_De_Paris",
-                "cathedrale notre dame de paris",
-                "Cathédrale Notre-Dame de Paris",
-            ),
-        ]);
-        let index = make_index(&[
-            ("C/Notre_Dame_De_Paris", "church gothic island french landmark", "Notre-Dame"),
-        ]);
+        let titles = make_index(&[(
+            "C/Notre_Dame_De_Paris",
+            "cathedrale notre dame de paris",
+            "Cathédrale Notre-Dame de Paris",
+        )]);
+        let index = make_index(&[(
+            "C/Notre_Dame_De_Paris",
+            "church gothic island french landmark",
+            "Notre-Dame",
+        )]);
         let notre_dame_html: &'static [u8] = "<html><body><h1>Cathédrale Notre-Dame de Paris</h1>\
-            <p>The cathedral stands on the Île de la Cité.</p></body></html>".as_bytes();
-        let content = [
-            TestEntry {
-                namespace: b'C',
-                url: "Notre_Dame_De_Paris",
-                title: "",
-                mime: 0,
-                body: notre_dame_html,
-            },
-        ];
-        let bytes = build_archive_indexes(&["text/html"], &content, &[], 0, Some(&index), Some(&titles));
+            <p>The cathedral stands on the Île de la Cité.</p></body></html>"
+            .as_bytes();
+        let content = [TestEntry {
+            namespace: b'C',
+            url: "Notre_Dame_De_Paris",
+            title: "",
+            mime: 0,
+            body: notre_dame_html,
+        }];
+        let bytes = build_archive_indexes(
+            &["text/html"],
+            &content,
+            &[],
+            0,
+            Some(&index),
+            Some(&titles),
+        );
         std::fs::write(dir.path().join("test.zim"), &bytes).unwrap();
         let library = Arc::new(ZimLibrary::scan(dir.path()).unwrap());
         assert!(library.archives[0].searchable());
@@ -1644,7 +1811,10 @@ Scientists measure the flow from observatories.
         assert_eq!(hits.len(), 1, "{hits:?}");
         assert_eq!(hits[0].path, "C/Notre_Dame_De_Paris", "{hits:?}");
         assert_eq!(hits[0].title, "Cathédrale Notre-Dame de Paris");
-        assert_eq!(hits[0].preview, "The cathedral stands on the Île de la Cité.");
+        assert_eq!(
+            hits[0].preview,
+            "The cathedral stands on the Île de la Cité."
+        );
         assert_eq!(hits[0].sections, None);
 
         // The fused form is nobody's term: not a URL/title, not in the
@@ -1676,9 +1846,19 @@ Scientists measure the flow from observatories.
             TestEntry { namespace: b'C', url: "Weather", title: "Weather", mime: 0, body: b"<html><body><h1>Weather</h1><p>Weather forecasts describe rain and snow.</p></body></html>" },
         ];
         let redirects = [
-            TestRedirect { namespace: b'C', url: "NACA", title: "NACA", target_content: 2 },
+            TestRedirect {
+                namespace: b'C',
+                url: "NACA",
+                title: "NACA",
+                target_content: 2,
+            },
             // Empty directory title, as in modern openZIM archives.
-            TestRedirect { namespace: b'C', url: "Usa", title: "", target_content: 2 },
+            TestRedirect {
+                namespace: b'C',
+                url: "Usa",
+                title: "",
+                target_content: 2,
+            },
         ];
         let bytes = build_archive(&["text/html"], &content, &redirects, 0, Some(&index));
         std::fs::write(dir.path().join("test.zim"), &bytes).unwrap();
@@ -1701,7 +1881,9 @@ Scientists measure the flow from observatories.
         // sentence here), no sections.
         assert_eq!(hits[0].preview, "Nitrogen is a colorless, odorless gas.");
         assert_eq!(hits[0].sections, None);
-        assert!(!serde_json::to_string(&hits[0]).unwrap().contains("sections"));
+        assert!(!serde_json::to_string(&hits[0])
+            .unwrap()
+            .contains("sections"));
         // The BM25 runner-up is still reported, behind the exact match.
         assert_eq!(hits[1].path, "C/Atmosphere", "{hits:?}");
     }
@@ -1740,23 +1922,37 @@ Scientists measure the flow from observatories.
     /// document), and full text (the target article).
     fn redirect_dedupe_test_server() -> (ZimMcpServer, tempfile::TempDir) {
         let dir = tempfile::tempdir().unwrap();
-        let index = make_index(
-            &[
-                ("C/Aeronautics", "aeronautics naca aviation flight", "Aeronautics"),
-            ],
-        );
+        let index = make_index(&[(
+            "C/Aeronautics",
+            "aeronautics naca aviation flight",
+            "Aeronautics",
+        )]);
         let titles = make_index(&[
             ("C/Aeronautics", "aeronautics", "Aeronautics"),
             // The redirect's own title-index document.
             ("C/NACA", "naca", "NACA"),
         ]);
-        let content = [
-            TestEntry { namespace: b'C', url: "Aeronautics", title: "Aeronautics", mime: 0, body: AERONAUTICS_HTML.as_bytes() },
-        ];
-        let redirects = [
-            TestRedirect { namespace: b'C', url: "NACA", title: "NACA", target_content: 0 },
-        ];
-        let bytes = build_archive_indexes(&["text/html"], &content, &redirects, 0, Some(&index), Some(&titles));
+        let content = [TestEntry {
+            namespace: b'C',
+            url: "Aeronautics",
+            title: "Aeronautics",
+            mime: 0,
+            body: AERONAUTICS_HTML.as_bytes(),
+        }];
+        let redirects = [TestRedirect {
+            namespace: b'C',
+            url: "NACA",
+            title: "NACA",
+            target_content: 0,
+        }];
+        let bytes = build_archive_indexes(
+            &["text/html"],
+            &content,
+            &redirects,
+            0,
+            Some(&index),
+            Some(&titles),
+        );
         std::fs::write(dir.path().join("test.zim"), &bytes).unwrap();
         let library = Arc::new(ZimLibrary::scan(dir.path()).unwrap());
         (ZimMcpServer::new(library), dir)
@@ -1806,24 +2002,29 @@ Scientists measure the flow from observatories.
         assert_eq!(hit.preview, "An apple is the fruit of <rosaceae> trees.");
         // The serialized JSON carries the section names.
         let json = serde_json::to_string(hit).unwrap();
-        assert!(json.contains(r#""sections":["History","Domestication"]"#), "{json}");
+        assert!(
+            json.contains(r#""sections":["History","Domestication"]"#),
+            "{json}"
+        );
     }
 
     /// An archive whose only article (`SALT_HTML`) has a two-paragraph
     /// intro, for the intro-matching search semantics.
     fn intro_test_server() -> (ZimMcpServer, tempfile::TempDir) {
         let dir = tempfile::tempdir().unwrap();
-        let index = make_index(
-            &[
-                (
-                    "C/Salt",
-                    "salt mineral chlorid sodium himalaya deposit rock bed form sea season food",
-                    "Salt",
-                ),
-                ("C/Banana", "banana tree tall herbaceou plant growth", "Banana"),
-                ("C/Glacier", "glacier ice dens movem weight flow", "Glacier"),
-            ],
-        );
+        let index = make_index(&[
+            (
+                "C/Salt",
+                "salt mineral chlorid sodium himalaya deposit rock bed form sea season food",
+                "Salt",
+            ),
+            (
+                "C/Banana",
+                "banana tree tall herbaceou plant growth",
+                "Banana",
+            ),
+            ("C/Glacier", "glacier ice dens movem weight flow", "Glacier"),
+        ]);
         let content = [
             TestEntry {
                 namespace: b'C',
@@ -1926,7 +2127,8 @@ Scientists measure the flow from observatories.
             <p>Most of the population lives in coastal towns.</p>\
             <h2>References</h2>\
             <p>Printed surveys of the region appear every decade.</p>\
-            </body></html>".as_bytes();
+            </body></html>"
+            .as_bytes();
         let content = [TestEntry {
             namespace: b'C',
             url: "Salt_Mining_Industry",
@@ -1955,7 +2157,10 @@ Scientists measure the flow from observatories.
             "{hit:?}"
         );
         let json = serde_json::to_string(hit).unwrap();
-        assert!(json.contains(r#""sections":["_intro","Overview"]"#), "{json}");
+        assert!(
+            json.contains(r#""sections":["_intro","Overview"]"#),
+            "{json}"
+        );
         assert!(!json.contains("See also"), "{json}");
     }
 
@@ -1974,13 +2179,22 @@ Scientists measure the flow from observatories.
         // the 0.4 coverage cap, so the list is still reported.
         let scores = [0.674, 0.837, 0.153, 0.0, 0.1];
         assert_eq!(
-            scored_sections(&names, &scores, SECTION_MIN_SCORE_FRAC, SECTION_MAX_COVERAGE),
+            scored_sections(
+                &names,
+                &scores,
+                SECTION_MIN_SCORE_FRAC,
+                SECTION_MAX_COVERAGE
+            ),
             Some(vec!["_intro".to_string(), "History".to_string()])
         );
         // The same shape over three regions: two of three clear the bar -
         // 0.667 coverage, past the cap - so the article reads as wholly
         // relevant and no list is reported.
-        let names3 = ["_intro".to_string(), "History".to_string(), "Trivia".to_string()];
+        let names3 = [
+            "_intro".to_string(),
+            "History".to_string(),
+            "Trivia".to_string(),
+        ];
         assert_eq!(
             scored_sections(
                 &names3,
@@ -2007,7 +2221,12 @@ Scientists measure the flow from observatories.
         // min_frac > 1 could empty the set, but the constant is 0.4; the
         // best region always clears any bar at or below 1.0.
         assert_eq!(
-            scored_sections(&names, &[0.1, 0.9, 0.2, 0.3, 0.1], 1.0, SECTION_MAX_COVERAGE),
+            scored_sections(
+                &names,
+                &[0.1, 0.9, 0.2, 0.3, 0.1],
+                1.0,
+                SECTION_MAX_COVERAGE
+            ),
             Some(vec!["History".to_string()])
         );
         // Too many regions qualify: the whole article is relevant, so no
@@ -2034,7 +2253,11 @@ Scientists measure the flow from observatories.
         // last complete word before INTRO_CHARS, not mid-word. 29 repeats
         // of a 12-character unit put the cap 12 characters into the 15-char
         // word that follows, so the fixed cut this replaces chopped it.
-        let paragraph = format!("{}{}", "lorem ipsum ".repeat(29), "wordthatislong! now more text");
+        let paragraph = format!(
+            "{}{}",
+            "lorem ipsum ".repeat(29),
+            "wordthatislong! now more text"
+        );
         assert!(paragraph.chars().count() > INTRO_CHARS);
         let hard_cut: String = paragraph.chars().take(INTRO_CHARS).collect();
         // The word straddles the cap: the old fixed cut ended mid-word.
@@ -2064,7 +2287,10 @@ Scientists measure the flow from observatories.
         // No full-text query (an all-punctuation query skips the band):
         // no sections.
         let mut stem = Stemmer::new("en").unwrap();
-        assert_eq!(hit_sections(&article, &[], &mut stem, None, false).unwrap(), None);
+        assert_eq!(
+            hit_sections(&article, &[], &mut stem, None, false).unwrap(),
+            None
+        );
     }
 
     /// Two archives (a.zim, b.zim) that both carry an "Apple" article (the
@@ -2074,28 +2300,64 @@ Scientists measure the flow from observatories.
     /// scanned library.
     pub(crate) fn two_archive_library() -> (tempfile::TempDir, Arc<ZimLibrary>) {
         let dir = tempfile::tempdir().unwrap();
-        let index_a = make_index(
-            &[
-                ("C/Apple", "appl histori 10 000 year domest wild kazakhstan comput devic nam", "Apple"),
-                ("C/Banana", "banana tree tall herbaceou plant growth", "Banana"),
-            ],
-        );
-        let index_b = make_index(
-            &[
-                ("C/Apple", "appl comput devic nam", "Apple"),
-                ("C/Cherry", "cherri pie fruit tree", "Cherry"),
-            ],
-        );
+        let index_a = make_index(&[
+            (
+                "C/Apple",
+                "appl histori 10 000 year domest wild kazakhstan comput devic nam",
+                "Apple",
+            ),
+            (
+                "C/Banana",
+                "banana tree tall herbaceou plant growth",
+                "Banana",
+            ),
+        ]);
+        let index_b = make_index(&[
+            ("C/Apple", "appl comput devic nam", "Apple"),
+            ("C/Cherry", "cherri pie fruit tree", "Cherry"),
+        ]);
         let content_a = [
-            TestEntry { namespace: b'C', url: "Apple", title: "Apple", mime: 0, body: APPLE_HTML.as_bytes() },
-            TestEntry { namespace: b'C', url: "Banana", title: "Banana", mime: 0, body: BANANA_HTML.as_bytes() },
+            TestEntry {
+                namespace: b'C',
+                url: "Apple",
+                title: "Apple",
+                mime: 0,
+                body: APPLE_HTML.as_bytes(),
+            },
+            TestEntry {
+                namespace: b'C',
+                url: "Banana",
+                title: "Banana",
+                mime: 0,
+                body: BANANA_HTML.as_bytes(),
+            },
         ];
         let content_b = [
-            TestEntry { namespace: b'C', url: "Apple", title: "Apple", mime: 0, body: APPLE_HTML.as_bytes() },
-            TestEntry { namespace: b'C', url: "Cherry", title: "Cherry", mime: 0, body: CHERRY_HTML.as_bytes() },
+            TestEntry {
+                namespace: b'C',
+                url: "Apple",
+                title: "Apple",
+                mime: 0,
+                body: APPLE_HTML.as_bytes(),
+            },
+            TestEntry {
+                namespace: b'C',
+                url: "Cherry",
+                title: "Cherry",
+                mime: 0,
+                body: CHERRY_HTML.as_bytes(),
+            },
         ];
-        std::fs::write(dir.path().join("a.zim"), build_archive(&["text/html"], &content_a, &[], 0, Some(&index_a))).unwrap();
-        std::fs::write(dir.path().join("b.zim"), build_archive(&["text/html"], &content_b, &[], 0, Some(&index_b))).unwrap();
+        std::fs::write(
+            dir.path().join("a.zim"),
+            build_archive(&["text/html"], &content_a, &[], 0, Some(&index_a)),
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("b.zim"),
+            build_archive(&["text/html"], &content_b, &[], 0, Some(&index_b)),
+        )
+        .unwrap();
         let library = Arc::new(ZimLibrary::scan(dir.path()).unwrap());
         assert_eq!(library.archives.len(), 2);
         (dir, library)
@@ -2112,8 +2374,14 @@ Scientists measure the flow from observatories.
         // order first).
         let hits = search(&server, "apple");
         assert_eq!(hits.len(), 2, "{hits:?}");
-        assert_eq!((hits[0].zim.as_str(), hits[0].path.as_str()), ("a.zim", "C/Apple"));
-        assert_eq!((hits[1].zim.as_str(), hits[1].path.as_str()), ("b.zim", "C/Apple"));
+        assert_eq!(
+            (hits[0].zim.as_str(), hits[0].path.as_str()),
+            ("a.zim", "C/Apple")
+        );
+        assert_eq!(
+            (hits[1].zim.as_str(), hits[1].path.as_str()),
+            ("b.zim", "C/Apple")
+        );
 
         // Distinct matches rank by the pooled re-score, not by archive
         // rank rotation: re-scored with one BM25 over the pooled
@@ -2122,8 +2390,14 @@ Scientists measure the flow from observatories.
         // reported the archives' best matches in library order.
         let hits = search(&server, "banana cherry");
         assert_eq!(hits.len(), 2, "{hits:?}");
-        assert_eq!((hits[0].zim.as_str(), hits[0].path.as_str()), ("b.zim", "C/Cherry"));
-        assert_eq!((hits[1].zim.as_str(), hits[1].path.as_str()), ("a.zim", "C/Banana"));
+        assert_eq!(
+            (hits[0].zim.as_str(), hits[0].path.as_str()),
+            ("b.zim", "C/Cherry")
+        );
+        assert_eq!(
+            (hits[1].zim.as_str(), hits[1].path.as_str()),
+            ("a.zim", "C/Banana")
+        );
     }
 
     #[test]
@@ -2145,10 +2419,34 @@ Scientists measure the flow from observatories.
             ("C/Four", "banana glacier", "Four"),
         ]);
         let content = [
-            TestEntry { namespace: b'C', url: "One", title: "One", mime: 0, body: b"<html><body><h1>One</h1><p>One text.</p></body></html>" },
-            TestEntry { namespace: b'C', url: "Two", title: "Two", mime: 0, body: b"<html><body><h1>Two</h1><p>Two text.</p></body></html>" },
-            TestEntry { namespace: b'C', url: "Three", title: "Three", mime: 0, body: b"<html><body><h1>Three</h1><p>Three text.</p></body></html>" },
-            TestEntry { namespace: b'C', url: "Four", title: "Four", mime: 0, body: b"<html><body><h1>Four</h1><p>Four text.</p></body></html>" },
+            TestEntry {
+                namespace: b'C',
+                url: "One",
+                title: "One",
+                mime: 0,
+                body: b"<html><body><h1>One</h1><p>One text.</p></body></html>",
+            },
+            TestEntry {
+                namespace: b'C',
+                url: "Two",
+                title: "Two",
+                mime: 0,
+                body: b"<html><body><h1>Two</h1><p>Two text.</p></body></html>",
+            },
+            TestEntry {
+                namespace: b'C',
+                url: "Three",
+                title: "Three",
+                mime: 0,
+                body: b"<html><body><h1>Three</h1><p>Three text.</p></body></html>",
+            },
+            TestEntry {
+                namespace: b'C',
+                url: "Four",
+                title: "Four",
+                mime: 0,
+                body: b"<html><body><h1>Four</h1><p>Four text.</p></body></html>",
+            },
         ];
         let bytes = build_archive(&["text/html"], &content, &[], 0, Some(&index));
         std::fs::write(dir.path().join("test.zim"), &bytes).unwrap();
@@ -2167,7 +2465,11 @@ Scientists measure the flow from observatories.
             assert!((ft.avlen - 2.75).abs() < 1e-9);
             assert_eq!(
                 ft.terms,
-                [("appl".to_string(), 2), ("cherri".to_string(), 1), ("kazakhstan".to_string(), 1)]
+                [
+                    ("appl".to_string(), 2),
+                    ("cherri".to_string(), 1),
+                    ("kazakhstan".to_string(), 1)
+                ]
             );
             assert_eq!(ft.dfs, [3, 1, 1]);
             let paths: Vec<&str> = ft.candidates.iter().map(|c| c.path.as_str()).collect();
@@ -2214,10 +2516,16 @@ Scientists measure the flow from observatories.
         // its exclusive article is the sole hit, the other archive nothing.
         let hits = search_one(&server, "a.zim", "banana cherry");
         assert_eq!(hits.len(), 1, "{hits:?}");
-        assert_eq!((hits[0].zim.as_str(), hits[0].path.as_str()), ("a.zim", "C/Banana"));
+        assert_eq!(
+            (hits[0].zim.as_str(), hits[0].path.as_str()),
+            ("a.zim", "C/Banana")
+        );
         let hits = search_one(&server, "b.zim", "banana cherry");
         assert_eq!(hits.len(), 1, "{hits:?}");
-        assert_eq!((hits[0].zim.as_str(), hits[0].path.as_str()), ("b.zim", "C/Cherry"));
+        assert_eq!(
+            (hits[0].zim.as_str(), hits[0].path.as_str()),
+            ("b.zim", "C/Cherry")
+        );
 
         // A title both archives carry is not deduped across archives, so the
         // filter still reports the named archive's own copy - exactly one
@@ -2225,10 +2533,16 @@ Scientists measure the flow from observatories.
         assert_eq!(search(&server, "apple").len(), 2);
         let hits = search_one(&server, "a.zim", "apple");
         assert_eq!(hits.len(), 1, "{hits:?}");
-        assert_eq!((hits[0].zim.as_str(), hits[0].path.as_str()), ("a.zim", "C/Apple"));
+        assert_eq!(
+            (hits[0].zim.as_str(), hits[0].path.as_str()),
+            ("a.zim", "C/Apple")
+        );
         let hits = search_one(&server, "b.zim", "apple");
         assert_eq!(hits.len(), 1, "{hits:?}");
-        assert_eq!((hits[0].zim.as_str(), hits[0].path.as_str()), ("b.zim", "C/Apple"));
+        assert_eq!(
+            (hits[0].zim.as_str(), hits[0].path.as_str()),
+            ("b.zim", "C/Apple")
+        );
 
         // A "./" prefix is trimmed like every archive name lookup.
         let hits = search_one(&server, "./a.zim", "banana cherry");
@@ -2244,12 +2558,15 @@ Scientists measure the flow from observatories.
         // Unknown, traversal, and absolute names are all refused, with the
         // same NotFound message the article lookups report.
         for name in ["nope.zim", "../a.zim", "/etc/a.zim"] {
-            let err = super::search(&server.library, Some(name), "apple", DEFAULT_SEARCH_LIMIT).unwrap_err();
+            let err = super::search(&server.library, Some(name), "apple", DEFAULT_SEARCH_LIMIT)
+                .unwrap_err();
             let ToolError::NotFound(msg) = err else {
                 panic!("expected NotFound for {name}: {err:?}");
             };
             assert!(
-                msg.contains(&format!("ZIM file not found: {name} (loaded: a.zim, b.zim)")),
+                msg.contains(&format!(
+                    "ZIM file not found: {name} (loaded: a.zim, b.zim)"
+                )),
                 "{msg}"
             );
         }
@@ -2295,13 +2612,19 @@ Other transition metals are described elsewhere.
     #[test]
     fn e2e_search_and_section_markdown() {
         let dir = tempfile::tempdir().unwrap();
-        let index = make_index(
-            &[
-                ("C/Zinc", "zinc chemic element symbol smelt ancient india", "Zinc"),
-                ("C/Banana", "banana tree tall herbaceou plant growth", "Banana"),
-                ("C/Glacier", "glacier ice dens movem weight flow", "Glacier"),
-            ],
-        );
+        let index = make_index(&[
+            (
+                "C/Zinc",
+                "zinc chemic element symbol smelt ancient india",
+                "Zinc",
+            ),
+            (
+                "C/Banana",
+                "banana tree tall herbaceou plant growth",
+                "Banana",
+            ),
+            ("C/Glacier", "glacier ice dens movem weight flow", "Glacier"),
+        ]);
         let content = [
             TestEntry {
                 namespace: b'C',
@@ -2369,7 +2692,10 @@ Other transition metals are described elsewhere.
             "{:?}",
             hits[0]
         );
-        assert_eq!(hits[0].preview, "Zinc is a chemical element with the symbol Zn.");
+        assert_eq!(
+            hits[0].preview,
+            "Zinc is a chemical element with the symbol Zn."
+        );
         // includes the subsection, reports the heading as written.
         let params = serde_json::from_value::<ZimGetSectionDirParams>(
             serde_json::json!({ "zim": "md.zim", "path": "Zinc", "section": "history" }),
@@ -2377,7 +2703,11 @@ Other transition metals are described elsewhere.
         .unwrap();
         let result = block_on(ZimGetSectionDirTool::invoke(&server, params)).unwrap();
         assert_eq!(result.section, "History");
-        assert!(result.content.contains("ancient times"), "{:?}", result.content);
+        assert!(
+            result.content.contains("ancient times"),
+            "{:?}",
+            result.content
+        );
         assert!(result.content.contains("Ancient India smelted zinc early"));
 
         // The reserved intro name: the raw Markdown between the leading
@@ -2389,11 +2719,17 @@ Other transition metals are described elsewhere.
         let result = block_on(ZimGetSectionDirTool::invoke(&server, params)).unwrap();
         assert_eq!(result.section, "_intro");
         assert!(
-            result.content.contains("For other uses, see [[Zinc (disambiguation)]]."),
+            result
+                .content
+                .contains("For other uses, see [[Zinc (disambiguation)]]."),
             "{:?}",
             result.content
         );
-        assert!(result.content.contains("with the symbol **Zn**"), "{:?}", result.content);
+        assert!(
+            result.content.contains("with the symbol **Zn**"),
+            "{:?}",
+            result.content
+        );
         assert!(!result.content.starts_with('#'), "{:?}", result.content);
         assert!(!result.content.contains("History"), "{:?}", result.content);
 

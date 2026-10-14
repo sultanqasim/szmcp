@@ -35,7 +35,12 @@ fn find_archive(library: &ZimLibrary, name: &str) -> Result<Arc<Archive>, ToolEr
     library.archive(name).cloned().ok_or_else(|| {
         ToolError::NotFound(format!(
             "ZIM file not found: {name} (loaded: {})",
-            library.archives.iter().map(|a| a.name.as_str()).collect::<Vec<_>>().join(", ")
+            library
+                .archives
+                .iter()
+                .map(|a| a.name.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
         ))
     })
 }
@@ -53,9 +58,7 @@ const MAX_ZIM_GET_BYTES: usize = 16 * 1024 * 1024;
 /// convert.
 fn article_path(raw: &str) -> String {
     let bytes = raw.as_bytes();
-    if bytes.len() >= 2
-        && bytes[1] == b'/'
-        && (bytes[0].is_ascii_alphabetic() || bytes[0] == b'-')
+    if bytes.len() >= 2 && bytes[1] == b'/' && (bytes[0].is_ascii_alphabetic() || bytes[0] == b'-')
     {
         return raw.to_string();
     }
@@ -192,7 +195,11 @@ pub fn get_section(
     // Markdown, and anything else takes the HTML extractor.
     let found = if !raw && is_html(article.mime_type.as_deref()) {
         markdown::section_content(&convert_html(&arc, &article, text), section)
-    } else if article.mime_type.as_deref().is_some_and(|m| m.contains("markdown")) {
+    } else if article
+        .mime_type
+        .as_deref()
+        .is_some_and(|m| m.contains("markdown"))
+    {
         markdown::section_content(text, section)
     } else {
         html::section_content(text, section)
@@ -219,8 +226,7 @@ mod tests {
     use super::*;
     use crate::search::tests::test_server;
     use crate::tools::{
-        ZimGetDirParams, ZimGetDirTool, ZimGetSectionDirParams, ZimGetSectionDirTool,
-        ZimMcpServer,
+        ZimGetDirParams, ZimGetDirTool, ZimGetSectionDirParams, ZimGetSectionDirTool, ZimMcpServer,
     };
     use crate::zim::testutil::{build_archive, TestEntry};
     use rmcp::handler::server::router::tool::AsyncTool;
@@ -253,7 +259,9 @@ mod tests {
         assert_eq!(result.mime_type.as_deref(), Some("text/html"));
         assert_eq!(result.content_encoding, "utf-8");
         assert!(
-            result.content.starts_with("# Apple\n\nAn **apple** is the fruit of <rosaceae> trees."),
+            result
+                .content
+                .starts_with("# Apple\n\nAn **apple** is the fruit of <rosaceae> trees."),
             "{:?}",
             result.content
         );
@@ -272,12 +280,18 @@ mod tests {
             serde_json::json!({ "zim": "test.zim", "path": "Nope" }),
         )
         .unwrap();
-        assert!(matches!(block_on(ZimGetDirTool::invoke(&server, params)), Err(ToolError::NotFound(_))));
+        assert!(matches!(
+            block_on(ZimGetDirTool::invoke(&server, params)),
+            Err(ToolError::NotFound(_))
+        ));
         let params = serde_json::from_value::<ZimGetDirParams>(
             serde_json::json!({ "zim": "other.zim", "path": "Apple" }),
         )
         .unwrap();
-        assert!(matches!(block_on(ZimGetDirTool::invoke(&server, params)), Err(ToolError::NotFound(_))));
+        assert!(matches!(
+            block_on(ZimGetDirTool::invoke(&server, params)),
+            Err(ToolError::NotFound(_))
+        ));
     }
     #[test]
     fn e2e_get_accepts_article_titles() {
@@ -295,7 +309,8 @@ mod tests {
                 url: "Dishwasher_salt",
                 title: "Dishwasher salt",
                 mime: 0,
-                body: b"<html><body><h1>Dishwasher salt</h1><p>Dishwasher salt is coarse-grained.</p>",
+                body:
+                    b"<html><body><h1>Dishwasher salt</h1><p>Dishwasher salt is coarse-grained.</p>",
             },
         ];
         let bytes = build_archive(&["text/html"], &content, &[], 0, None);
@@ -332,7 +347,11 @@ mod tests {
         assert_eq!(result.section, "_intro");
         // Dirent title "Salt" == path (omitted by the writer) -> full path.
         assert_eq!(result.title, "C/Salt");
-        assert!(result.content.contains("Salt is a mineral"), "{:?}", result.content);
+        assert!(
+            result.content.contains("Salt is a mineral"),
+            "{:?}",
+            result.content
+        );
 
         // A title that matches nothing errors with the converted path.
         let params = serde_json::from_value::<ZimGetDirParams>(
@@ -362,7 +381,13 @@ mod tests {
         // Content larger than the response cap is rejected cleanly.
         let dir = tempfile::tempdir().unwrap();
         let big: &'static [u8] = Box::leak(vec![b'a'; 17 * 1024 * 1024].into_boxed_slice());
-        let content = [TestEntry { namespace: b'C', url: "Big", title: "Big", mime: 0, body: big }];
+        let content = [TestEntry {
+            namespace: b'C',
+            url: "Big",
+            title: "Big",
+            mime: 0,
+            body: big,
+        }];
         let bytes = build_archive(&["text/html"], &content, &[], 0, None);
         std::fs::write(dir.path().join("big.zim"), &bytes).unwrap();
         let library = Arc::new(ZimLibrary::scan(dir.path()).unwrap());
@@ -397,7 +422,10 @@ mod tests {
         )
         .unwrap();
         let result = block_on(ZimGetDirTool::invoke(&server, params)).unwrap();
-        assert_eq!(result.mime_type.as_deref(), Some("application/octet-stream"));
+        assert_eq!(
+            result.mime_type.as_deref(),
+            Some("application/octet-stream")
+        );
         assert_eq!(result.content_encoding, "base64");
         // Decoding the payload with the standard engine round-trips the
         // original (non-UTF-8) bytes.
@@ -419,7 +447,11 @@ mod tests {
         // Dirent title "Apple" == path (omitted by the writer) -> full path.
         assert_eq!(result.title, "C/Apple");
         assert_eq!(result.section, "History");
-        assert!(result.content.contains("10,000 years"), "{:?}", result.content);
+        assert!(
+            result.content.contains("10,000 years"),
+            "{:?}",
+            result.content
+        );
         // Includes the subsection, stops at the next h2.
         assert!(result.content.contains("Kazakhstan"));
         assert!(!result.content.contains("Computing devices"));
@@ -446,7 +478,11 @@ mod tests {
             "{:?}",
             result.content
         );
-        assert!(!result.content.contains("10,000 years"), "{:?}", result.content);
+        assert!(
+            !result.content.contains("10,000 years"),
+            "{:?}",
+            result.content
+        );
 
         // Missing section.
         let params = serde_json::from_value::<ZimGetSectionDirParams>(
@@ -458,5 +494,4 @@ mod tests {
             Err(ToolError::SectionNotFound(_))
         ));
     }
-
 }

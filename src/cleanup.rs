@@ -1,9 +1,7 @@
 //! The final cleanup pass and section assembly of the converter (ports
 //! wikizim_parser/html2md.py's `_cleanup` / `_assemble` / `_repair_line`).
 
-use crate::util::{
-    collapse_ws, html_unescape, prev_char, re, run_end,
-};
+use crate::util::{collapse_ws, html_unescape, prev_char, re, run_end};
 
 /// Section headings whose entire section is dropped (English Wikipedia
 /// names; wikil10n adds the per-language ones).
@@ -123,9 +121,8 @@ pub(crate) fn assemble(body_md: &str, lang: Option<&str>) -> String {
 /// so it cannot create or destroy the sequence).
 fn has_close_table(ln: &str) -> bool {
     let b = ln.as_bytes();
-    (0..b.len().saturating_sub(6)).any(|i| {
-        b[i] == b'<' && b[i + 1] == b'/' && b[i + 2..i + 7].eq_ignore_ascii_case(b"table")
-    })
+    (0..b.len().saturating_sub(6))
+        .any(|i| b[i] == b'<' && b[i + 1] == b'/' && b[i + 2..i + 7].eq_ignore_ascii_case(b"table"))
 }
 
 /// Step the shared ```-fence state machine (``` only); true for fence lines.
@@ -335,11 +332,7 @@ fn mask_code_dests(ln: &str) -> (String, Vec<String>) {
 /// `s[p..stop]` with the single char `emit` and resume the scan at
 /// `stop`; a miss resumes one char past the candidate, so overlapping
 /// candidates are still tried.
-fn sub_scan(
-    s: &str,
-    token: &str,
-    hit: impl Fn(&str, usize) -> Option<(usize, char)>,
-) -> String {
+fn sub_scan(s: &str, token: &str, hit: impl Fn(&str, usize) -> Option<(usize, char)>) -> String {
     let mut out = String::with_capacity(s.len());
     let mut last = 0usize;
     let mut from = 0usize;
@@ -437,10 +430,15 @@ fn sub_dot_pair(s: &str) -> String {
 /// at start of line stay.  Candidates are the maximal runs of spaces
 /// (the core matches only `' '`), needing two or more.
 fn sub_double_space(s: &str) -> String {
-    sub_ws_runs(s, |c: char| c == ' ', ' ', |s, start, end| {
-        (end - start >= 2 && prev_char(s, start).is_some_and(|c| !c.is_whitespace()))
-            .then_some(end)
-    })
+    sub_ws_runs(
+        s,
+        |c: char| c == ' ',
+        ' ',
+        |s, start, end| {
+            (end - start >= 2 && prev_char(s, start).is_some_and(|c| !c.is_whitespace()))
+                .then_some(end)
+        },
+    )
 }
 
 /// `,\s*\.(?![.\w])` -> `.` (", ." becomes ".", ", .x" stays) and
@@ -464,17 +462,20 @@ fn sub_comma_before(s: &str, punct: char, forbidden: &'static str) -> String {
 /// a dot; the lookbehind class is pure ASCII, so it is tested on the
 /// last byte of the char before the run.
 fn sub_cls_space_dot(s: &str) -> String {
-    sub_ws_runs(s, |c: char| c == ' ', '.', |s, start, end| {
-        let lookbehind = start > 0
-            && matches!(
-                s.as_bytes()[start - 1],
-                b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9' | b')' | b']' | b'"' | b'\'' | b'*'
-            );
-        (s[end..].starts_with('.')
-            && lookbehind
-            && !re("^[.\\w]").is_match(&s[end + 1..]))
-        .then_some(end + 1)
-    })
+    sub_ws_runs(
+        s,
+        |c: char| c == ' ',
+        '.',
+        |s, start, end| {
+            let lookbehind = start > 0
+                && matches!(
+                    s.as_bytes()[start - 1],
+                    b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9' | b')' | b']' | b'"' | b'\'' | b'*'
+                );
+            (s[end..].starts_with('.') && lookbehind && !re("^[.\\w]").is_match(&s[end + 1..]))
+                .then_some(end + 1)
+        },
+    )
 }
 
 /// `(?<=[a-z0-9\)])\.([A-Z])` -> `. X`: "end.He" becomes "end. He" (the
@@ -690,7 +691,8 @@ mod tests {
     /// `example. NET`).
     #[test]
     fn period_upper_repair_keeps_url_dots() {
-        let md = "See [x](https://example.com/Page.Us) and <https://example.NET>. Then end.He said.";
+        let md =
+            "See [x](https://example.com/Page.Us) and <https://example.NET>. Then end.He said.";
         assert_eq!(
             cleanup(md, None),
             "See [x](https://example.com/Page.Us) and <https://example.NET>. Then end. He said.\n"
@@ -703,7 +705,8 @@ mod tests {
     /// decodes (`&notit;` -> `¬it;`).
     #[test]
     fn fenced_code_keeps_entities() {
-        let md = "Prose &notit; here.\n\n```html\n&lt;?php\n$a = &amp;lt;b&gt;;\n```\n\nAfter &notit;.";
+        let md =
+            "Prose &notit; here.\n\n```html\n&lt;?php\n$a = &amp;lt;b&gt;;\n```\n\nAfter &notit;.";
         assert_eq!(
             cleanup(md, None),
             "Prose ¬it; here.\n\n```html\n&lt;?php\n$a = &amp;lt;b&gt;;\n```\n\nAfter ¬it;.\n"
@@ -727,12 +730,24 @@ mod tests {
     #[test]
     fn edit_marker_removal_is_localized() {
         assert_eq!(cleanup("Prose [edit] more.", None), "Prose more.\n");
-        assert_eq!(cleanup("Prose [modifier] more.", Some("fra")), "Prose more.\n");
-        assert_eq!(cleanup("Prose [editar] more.", Some("spa")), "Prose more.\n");
+        assert_eq!(
+            cleanup("Prose [modifier] more.", Some("fra")),
+            "Prose more.\n"
+        );
+        assert_eq!(
+            cleanup("Prose [editar] more.", Some("spa")),
+            "Prose more.\n"
+        );
         // The English marker stays a safety net for every language; a
         // marker of another language is content and survives.
-        assert_eq!(cleanup("Prose [edit] [editar] more.", None), "Prose [editar] more.\n");
-        assert_eq!(cleanup("Prose [edit] [modifier] more.", Some("spa")), "Prose [modifier] more.\n");
+        assert_eq!(
+            cleanup("Prose [edit] [editar] more.", None),
+            "Prose [editar] more.\n"
+        );
+        assert_eq!(
+            cleanup("Prose [edit] [modifier] more.", Some("spa")),
+            "Prose [modifier] more.\n"
+        );
     }
 
     /// A link destination keeps its literal `&...;` query text while the

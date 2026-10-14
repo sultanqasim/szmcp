@@ -23,12 +23,9 @@ use crate::zimcommon::MIME_REDIRECT;
 use crate::zimwrite::{BlobRef, DirentOut, ZimCreator};
 use std::path::Path;
 use std::sync::atomic::{AtomicU32, AtomicU64, AtomicU8, Ordering};
-use std::sync::{Arc, Mutex, mpsc::Receiver};
+use std::sync::{mpsc::Receiver, Arc, Mutex};
 use std::time::Instant;
-use xapian2::{
-    Document, Stem, StemStrategy, TermGenerator, WritableDatabase,
-    tg_flags, wdb_flags,
-};
+use xapian2::{tg_flags, wdb_flags, Document, Stem, StemStrategy, TermGenerator, WritableDatabase};
 
 /// The longest title libzim's title indexer can safely handle: a title of
 /// at most 238 UTF-8 bytes can never trip the title-indexer abort (which
@@ -211,8 +208,14 @@ impl IndexLang {
             indexer
                 .set_stemmer(lang2)
                 .map_err(|e| format!("stemmer {lang2}: {e}"))?;
-            let strategy = if all { StemStrategy::All } else { StemStrategy::Some };
-            indexer.set_stemming_strategy(strategy).map_err(|e| e.to_string())?;
+            let strategy = if all {
+                StemStrategy::All
+            } else {
+                StemStrategy::Some
+            };
+            indexer
+                .set_stemming_strategy(strategy)
+                .map_err(|e| e.to_string())?;
         }
         Ok(())
     }
@@ -236,7 +239,9 @@ fn build_fulltext_document(
     folded_content: &str,
 ) -> Result<Document, String> {
     let mut indexer = TermGenerator::new().map_err(|e| e.to_string())?;
-    indexer.set_flags(tg_flags::FLAG_NGRAMS).map_err(|e| e.to_string())?;
+    indexer
+        .set_flags(tg_flags::FLAG_NGRAMS)
+        .map_err(|e| e.to_string())?;
     lang.set_stemmer(&mut indexer, true)?;
     // No stopper: zim2zim's 3-letter language codes never load a stopword
     // resource in libzim either ("stopwords/<raw>" misses) - matching
@@ -244,10 +249,12 @@ fn build_fulltext_document(
 
     let mut doc = Document::new().map_err(|e| e.to_string())?;
     indexer.set_document(&doc).map_err(|e| e.to_string())?;
-    doc.set_data(format!("C/{path}")).map_err(|e| e.to_string())?;
+    doc.set_data(format!("C/{path}"))
+        .map_err(|e| e.to_string())?;
     doc.set_value(0, folded_title).map_err(|e| e.to_string())?;
     let wordcount = folded_content.split_whitespace().count();
-    doc.set_value(1, wordcount.to_string()).map_err(|e| e.to_string())?;
+    doc.set_value(1, wordcount.to_string())
+        .map_err(|e| e.to_string())?;
 
     if !folded_content.is_empty() {
         indexer
@@ -278,13 +285,18 @@ fn build_title_document(
     target_path: Option<&str>,
 ) -> Result<Document, String> {
     let mut indexer = TermGenerator::new().map_err(|e| e.to_string())?;
-    indexer.set_max_word_length(240).map_err(|e| e.to_string())?;
-    indexer.set_flags(tg_flags::FLAG_NGRAMS).map_err(|e| e.to_string())?;
+    indexer
+        .set_max_word_length(240)
+        .map_err(|e| e.to_string())?;
+    indexer
+        .set_flags(tg_flags::FLAG_NGRAMS)
+        .map_err(|e| e.to_string())?;
     lang.set_stemmer(&mut indexer, false)?;
 
     let mut doc = Document::new().map_err(|e| e.to_string())?;
     indexer.set_document(&doc).map_err(|e| e.to_string())?;
-    doc.set_data(format!("C/{path}")).map_err(|e| e.to_string())?;
+    doc.set_data(format!("C/{path}"))
+        .map_err(|e| e.to_string())?;
     doc.set_value(0, title).map_err(|e| e.to_string())?;
     match target_path {
         Some(target) => doc.set_value(1, target).map_err(|e| e.to_string())?,
@@ -294,7 +306,9 @@ fn build_title_document(
     let unaccented_title = crate::search::fold_accents(title);
     if !unaccented_title.is_empty() {
         let anchored_title = format!("{ANCHOR_TERM}{unaccented_title}");
-        indexer.index_text(&anchored_title, 1).map_err(|e| e.to_string())?;
+        indexer
+            .index_text(&anchored_title, 1)
+            .map_err(|e| e.to_string())?;
         // libzim aborts the whole build when >= 239 title bytes end up
         // unindexed (TitleIndexingError). zim2zim pre-trims titles to 238
         // bytes, which can never fire this - surface it as a hard error if
@@ -317,7 +331,8 @@ fn build_title_document(
             doc.remove_term(&first_term).map_err(|e| e.to_string())?;
             if unaccented_title.len() <= 240 {
                 // libzim's add_term default: wdf increment 1.
-                doc.add_term(&unaccented_title, 1).map_err(|e| e.to_string())?;
+                doc.add_term(&unaccented_title, 1)
+                    .map_err(|e| e.to_string())?;
             }
         }
     }
@@ -405,8 +420,12 @@ fn copy_illustration(z: &Zim, creator: &mut ZimCreator) -> Result<(), String> {
         eprintln!("warning: illustration: the source's 48x48 illustration has no content");
         return Ok(());
     };
-    let bytes = z.read_blob(cluster, blob).map_err(|e| format!("illustration: {e}"))?;
-    creator.add_illustration(48, &bytes).map_err(|e| format!("illustration: {e}"))
+    let bytes = z
+        .read_blob(cluster, blob)
+        .map_err(|e| format!("illustration: {e}"))?;
+    creator
+        .add_illustration(48, &bytes)
+        .map_err(|e| format!("illustration: {e}"))
 }
 
 // ---------------------------------------------------------------------------
@@ -617,9 +636,11 @@ fn add_and_pace(
     path: &str,
 ) -> Result<(), String> {
     let Some(doc) = doc else { return Ok(()) };
-    db.add_document(doc).map_err(|e| format!("{add} {path:?}: {e}"))?;
+    db.add_document(doc)
+        .map_err(|e| format!("{add} {path:?}: {e}"))?;
     if (docs.fetch_add(1, Ordering::Relaxed) + 1) % COMMIT_EVERY == 0 {
-        db.commit().map_err(|e| format!("{what} index commit: {e}"))?;
+        db.commit()
+            .map_err(|e| format!("{what} index commit: {e}"))?;
     }
     Ok(())
 }
@@ -633,11 +654,27 @@ fn run_indexer(
 ) -> (WritableDatabase, WritableDatabase, Result<(), String>) {
     let result = (|| -> Result<(), String> {
         while let Ok((ft_doc, ti_doc, path)) = rx.recv() {
-            add_and_pace(&mut ft, ft_doc.as_ref(), ft_docs, "fulltext", "indexing", &path)?;
-            add_and_pace(&mut ti, ti_doc.as_ref(), ti_docs, "title", "title indexing", &path)?;
+            add_and_pace(
+                &mut ft,
+                ft_doc.as_ref(),
+                ft_docs,
+                "fulltext",
+                "indexing",
+                &path,
+            )?;
+            add_and_pace(
+                &mut ti,
+                ti_doc.as_ref(),
+                ti_docs,
+                "title",
+                "title indexing",
+                &path,
+            )?;
         }
-        ft.commit().map_err(|e| format!("fulltext index commit: {e}"))?;
-        ti.commit().map_err(|e| format!("title index commit: {e}"))?;
+        ft.commit()
+            .map_err(|e| format!("fulltext index commit: {e}"))?;
+        ti.commit()
+            .map_err(|e| format!("title index commit: {e}"))?;
         Ok(())
     })();
     (ft, ti, result)
@@ -745,8 +782,7 @@ pub fn convert(
 ) -> Result<(), String> {
     let t0 = Instant::now();
     eprintln!("Opening source ZIM: {}", zimfile.display());
-    let z = Zim::open(zimfile)
-        .map_err(|e| format!("failed to open {}: {e}", zimfile.display()))?;
+    let z = Zim::open(zimfile).map_err(|e| format!("failed to open {}: {e}", zimfile.display()))?;
     let entry_count = z.entry_count();
     // The MIME list runs from id 0 up to the first unknown id.
     let mut mime_count = 0u16;
@@ -785,7 +821,10 @@ pub fn convert(
         .join(format!(
             ".szmcp-convert-{}-{n}-{}",
             std::process::id(),
-            outfile.file_name().and_then(|n| n.to_str()).unwrap_or("zim")
+            outfile
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("zim")
         ));
     if tmp.exists() {
         let _ = std::fs::remove_dir_all(&tmp);
@@ -808,7 +847,9 @@ pub fn convert(
         // MIME list at begin_write, so registration order is irrelevant).
         let metadata_language = copy_metadata(&z, &mut creator, &conv_lang)?;
         copy_illustration(&z, &mut creator)?;
-        creator.register_mime("text/markdown").map_err(|e| format!("mime: {e}"))?;
+        creator
+            .register_mime("text/markdown")
+            .map_err(|e| format!("mime: {e}"))?;
         // The preamble is done; from here the workers share the creator
         // behind its mutex (short blob adds only).
         let creator = Mutex::new(creator);
@@ -840,13 +881,19 @@ pub fn convert(
             .ok()
             .and_then(|v| v.parse::<usize>().ok())
             .filter(|n| *n > 0)
-            .unwrap_or_else(|| std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1));
+            .unwrap_or_else(|| {
+                std::thread::available_parallelism()
+                    .map(|n| n.get())
+                    .unwrap_or(1)
+            });
         eprintln!("  {threads} conversion threads");
 
         let mut shared = Shared::default();
         // One skip-tally slot per id in the archive's MIME list: skips
         // stay a single relaxed fetch-add.
-        shared.skipped = (0..mime_count as usize).map(|_| AtomicU64::new(0)).collect();
+        shared.skipped = (0..mime_count as usize)
+            .map(|_| AtomicU64::new(0))
+            .collect();
         // Per-entry records, preallocated exactly once for the LIMIT (not
         // the full entry count): 12 bytes per entry is the dominant
         // constant-RAM structure (600 MB at 50M entries).
@@ -903,9 +950,9 @@ pub fn convert(
                     let slot = &recs[idx as usize];
                     match z.redirect_terminal(idx) {
                         Some(t) => {
-                            let (tmime, _) = z
-                                .entry_head(t)
-                                .map_err(|e| format!("reading redirect target of entry {idx}: {e}"))?;
+                            let (tmime, _) = z.entry_head(t).map_err(|e| {
+                                format!("reading redirect target of entry {idx}: {e}")
+                            })?;
                             slot.a.store(t, Ordering::Relaxed);
                             slot.flags.store(
                                 REC_REDIRECT
@@ -924,7 +971,10 @@ pub fn convert(
                     }
                     continue;
                 }
-                if !z.mime_type(mime).is_some_and(|m| m.starts_with("text/html")) {
+                if !z
+                    .mime_type(mime)
+                    .is_some_and(|m| m.starts_with("text/html"))
+                {
                     // Media/metadata/whatever: skipped, tallied by MIME.
                     if let Some(c) = shared.skipped.get(mime as usize) {
                         c.fetch_add(1, Ordering::Relaxed);
@@ -940,7 +990,9 @@ pub fn convert(
                 let Target::Cluster(cluster, blob) = target else {
                     continue;
                 };
-                let entry = z.get_entry(idx).map_err(|e| format!("reading entry {idx}: {e}"))?;
+                let entry = z
+                    .get_entry(idx)
+                    .map_err(|e| format!("reading entry {idx}: {e}"))?;
                 // mwoffliner paginates large categories into
                 // `_categories_partials_*` text/html fragments (a 200-member
                 // `div#mw-pages` list slice, empty <title>; e.g.
@@ -966,7 +1018,9 @@ pub fn convert(
                     title: (title_off, entry.title.len() as u32),
                 });
             }
-            shared.processed.fetch_add((stop - start) as u64, Ordering::Relaxed);
+            shared
+                .processed
+                .fetch_add((stop - start) as u64, Ordering::Relaxed);
             // One lock acquisition per 512-entry chunk, not per entry:
             // rebase the chunk-local offsets onto the shared arena, then
             // extend both under the same lock so coordinates and strings
@@ -1004,7 +1058,11 @@ pub fn convert(
         skipped.sort_by_key(|&(_, n)| std::cmp::Reverse(n));
         let skipped_total: u64 = skipped.iter().map(|&(_, n)| n).sum();
         let partials = shared.category_partials.load(Ordering::Relaxed);
-        let partials_note = if partials > 0 { format!(", {partials} category partials") } else { String::new() };
+        let partials_note = if partials > 0 {
+            format!(", {partials} category partials")
+        } else {
+            String::new()
+        };
         eprintln!(
             "  classified {end} entries in {dt:.1}s: {articles} articles, {redirects} redirects, {skipped_total} skipped{partials_note}"
         );
@@ -1207,7 +1265,9 @@ pub fn convert(
                             Ordering::Relaxed,
                         );
                     }
-                    shared.md_bytes.fetch_add(md.len() as u64, Ordering::Relaxed);
+                    shared
+                        .md_bytes
+                        .fetch_add(md.len() as u64, Ordering::Relaxed);
                 }
                 Ok(())
             })
@@ -1220,8 +1280,9 @@ pub fn convert(
         // ft_docs keeps rising until then, so the summary below must follow
         // this join.
         drop(doc_tx);
-        let (ft, mut ti, index_result) =
-            indexer.join().unwrap_or_else(|p| std::panic::resume_unwind(p));
+        let (ft, mut ti, index_result) = indexer
+            .join()
+            .unwrap_or_else(|p| std::panic::resume_unwind(p));
         // The indexer's specific error surfaces before the walk's: worker
         // sends only fail with the generic "indexer stopped" text.
         index_result?;
@@ -1284,7 +1345,8 @@ pub fn convert(
                 {
                     continue;
                 }
-                let entry = z.get_entry(idx)
+                let entry = z
+                    .get_entry(idx)
                     .map_err(|e| format!("reading entry {idx}: {e}"))?;
                 let title = entry_title(&entry.title, &entry.url);
                 if title.is_empty() {
@@ -1294,7 +1356,8 @@ pub fn convert(
                     build_title_document(&lang, &entry.url, &title, None)
                 } else {
                     let t = recs[idx as usize].a.load(Ordering::Relaxed);
-                    let t_entry = z.get_entry(t)
+                    let t_entry = z
+                        .get_entry(t)
                         .map_err(|e| format!("reading entry {t}: {e}"))?;
                     build_title_document(&lang, &entry.url, &title, Some(&t_entry.url))
                 }
@@ -1303,11 +1366,13 @@ pub fn convert(
                     .map_err(|e| format!("title indexing {:?}: {e}", entry.url))?;
                 added += 1;
                 if added % COMMIT_EVERY == 0 {
-                    ti.commit().map_err(|e| format!("title index commit: {e}"))?;
+                    ti.commit()
+                        .map_err(|e| format!("title index commit: {e}"))?;
                 }
             }
             shared.ti_docs.fetch_add(added, Ordering::Relaxed);
-            ti.commit().map_err(|e| format!("title index commit: {e}"))?;
+            ti.commit()
+                .map_err(|e| format!("title index commit: {e}"))?;
         }
 
         // Compaction postlude: single-file databases (DBCOMPACT_SINGLE_FILE |
@@ -1368,7 +1433,8 @@ pub fn convert(
                 continue;
             }
             let rec = &recs[idx as usize];
-            let entry = z.get_entry(idx)
+            let entry = z
+                .get_entry(idx)
                 .map_err(|e| format!("reading entry {idx}: {e}"))?;
             let title = entry_title(&entry.title, &entry.url);
             let out_idx = rank.rank(idx as usize);
@@ -1417,7 +1483,8 @@ pub fn convert(
         rows.sort_unstable_by(|&a, &b| {
             let ta = arena_title(&arena, (a >> 32) as usize);
             let tb = arena_title(&arena, (b >> 32) as usize);
-            ta.cmp(tb).then_with(|| (a & 0xFFFF_FFFF).cmp(&(b & 0xFFFF_FFFF)))
+            ta.cmp(tb)
+                .then_with(|| (a & 0xFFFF_FFFF).cmp(&(b & 0xFFFF_FFFF)))
         });
         let mut listing_blob = Vec::with_capacity(rows.len() * 4);
         for &r in &rows {
@@ -1450,7 +1517,10 @@ pub fn convert(
         eprintln!("SUMMARY");
         eprintln!("  entries processed  : {processed} of {entry_count}");
         eprintln!("  articles converted : {converted}");
-        eprintln!("  language           : {} (metadata: {})", conv_lang, metadata_language);
+        eprintln!(
+            "  language           : {} (metadata: {})",
+            conv_lang, metadata_language
+        );
         eprintln!("  conversion failures: {failed}");
         eprintln!("  skipped entries by MIME:");
         for (mime, count) in skipped {
@@ -1546,7 +1616,9 @@ mod tests {
         // Token equality only: ns-140 is not ns-14.
         assert!(!is_category_page(b"<body class=\"ns-140 ns-subject\">"));
         // No body tag at all, or no category-namespace token on it.
-        assert!(!is_category_page(b"<html><head><title>t</title></head></html>"));
+        assert!(!is_category_page(
+            b"<html><head><title>t</title></head></html>"
+        ));
         assert!(!is_category_page(b"<html><body><p>x</p></body></html>"));
         assert!(!is_category_page(b"<body class=\"ns-0 ns-subject\">"));
         // A delimited attribute name only (data-class=… is not class=).
@@ -1572,7 +1644,8 @@ mod e2e {
 <p>Apples have been cultivated for 10,000 years.</p>\
 <h3>Domestication</h3><p>Wild apples grew in Kazakhstan.</p></body></html>";
 
-    const BANANA_HTML: &str = "<html><body><h1>Banana</h1><p>A banana is an elongated fruit.</p></body></html>";
+    const BANANA_HTML: &str =
+        "<html><body><h1>Banana</h1><p>A banana is an elongated fruit.</p></body></html>";
 
     const REV_HTML: &str = "<html><body><h1>Révolution</h1>\
 <p>Une révolution est un changement politique majeur.</p></body></html>";
@@ -1581,26 +1654,95 @@ mod e2e {
     const FAKE_PNG: &[u8] = b"\x89PNG\r\n\x1a\n-fake-48x48-illustration-";
 
     /// The archive MIME list of the main fixture (and its variants).
-    const FIXTURE_MIMES: [&str; 4] = ["text/html", "text/css", "text/plain;charset=UTF-8", "image/png"];
+    const FIXTURE_MIMES: [&str; 4] = [
+        "text/html",
+        "text/css",
+        "text/plain;charset=UTF-8",
+        "image/png",
+    ];
 
     /// The synthetic source: three HTML articles (one accented), one CSS
     /// asset, two redirects (one to Apple, one to Banana), core metadata
     /// with Language=fra, and a 48x48 illustration. The main page is Apple.
     fn fixture() -> Vec<u8> {
         let content = [
-            TestEntry { namespace: b'C', url: "Apple", title: "Apple", mime: 0, body: APPLE_HTML.as_bytes() },
-            TestEntry { namespace: b'C', url: "Banana", title: "Banana", mime: 0, body: BANANA_HTML.as_bytes() },
-            TestEntry { namespace: b'C', url: "Révolution", title: "Révolution française", mime: 0, body: REV_HTML.as_bytes() },
-            TestEntry { namespace: b'C', url: "style.css", title: "style.css", mime: 1, body: CSS },
-            TestEntry { namespace: b'M', url: "Name", title: "", mime: 2, body: b"wikipedia_en_mini" },
-            TestEntry { namespace: b'M', url: "Title", title: "", mime: 2, body: "Chemistry \u{2014} Mini".as_bytes() },
-            TestEntry { namespace: b'M', url: "Language", title: "", mime: 2, body: b"fra" },
-            TestEntry { namespace: b'M', url: "Description", title: "", mime: 2, body: b"A miniature encyclopedia" },
-            TestEntry { namespace: b'M', url: "Illustration_48x48@1", title: "", mime: 3, body: FAKE_PNG },
+            TestEntry {
+                namespace: b'C',
+                url: "Apple",
+                title: "Apple",
+                mime: 0,
+                body: APPLE_HTML.as_bytes(),
+            },
+            TestEntry {
+                namespace: b'C',
+                url: "Banana",
+                title: "Banana",
+                mime: 0,
+                body: BANANA_HTML.as_bytes(),
+            },
+            TestEntry {
+                namespace: b'C',
+                url: "Révolution",
+                title: "Révolution française",
+                mime: 0,
+                body: REV_HTML.as_bytes(),
+            },
+            TestEntry {
+                namespace: b'C',
+                url: "style.css",
+                title: "style.css",
+                mime: 1,
+                body: CSS,
+            },
+            TestEntry {
+                namespace: b'M',
+                url: "Name",
+                title: "",
+                mime: 2,
+                body: b"wikipedia_en_mini",
+            },
+            TestEntry {
+                namespace: b'M',
+                url: "Title",
+                title: "",
+                mime: 2,
+                body: "Chemistry \u{2014} Mini".as_bytes(),
+            },
+            TestEntry {
+                namespace: b'M',
+                url: "Language",
+                title: "",
+                mime: 2,
+                body: b"fra",
+            },
+            TestEntry {
+                namespace: b'M',
+                url: "Description",
+                title: "",
+                mime: 2,
+                body: b"A miniature encyclopedia",
+            },
+            TestEntry {
+                namespace: b'M',
+                url: "Illustration_48x48@1",
+                title: "",
+                mime: 3,
+                body: FAKE_PNG,
+            },
         ];
         let redirects = [
-            TestRedirect { namespace: b'C', url: "Apple_fruit", title: "", target_content: 0 },
-            TestRedirect { namespace: b'C', url: "Alt_Banana", title: "Alternate Banana", target_content: 1 },
+            TestRedirect {
+                namespace: b'C',
+                url: "Apple_fruit",
+                title: "",
+                target_content: 0,
+            },
+            TestRedirect {
+                namespace: b'C',
+                url: "Alt_Banana",
+                title: "Alternate Banana",
+                target_content: 1,
+            },
         ];
         // main page: Apple
         build_archive(&FIXTURE_MIMES, &content, &redirects, 0, None)
@@ -1614,17 +1756,42 @@ mod e2e {
     /// The shared convert-and-open boilerplate: write `bytes` as the source
     /// ZIM into a fresh temp dir, convert it with the given arguments, and
     /// open the output. The returned TempDir must outlive the opened Zim.
-    fn convert_in_dir(bytes: &[u8], limit: i64, intro_only: bool, redirect_titles: bool, exclude_categories: bool) -> (tempfile::TempDir, Zim) {
+    fn convert_in_dir(
+        bytes: &[u8],
+        limit: i64,
+        intro_only: bool,
+        redirect_titles: bool,
+        exclude_categories: bool,
+    ) -> (tempfile::TempDir, Zim) {
         let dir = tempfile::tempdir().unwrap();
         let src = dir.path().join("src.zim");
         std::fs::write(&src, bytes).unwrap();
         let out = dir.path().join("out.zim");
-        convert(&src, &out, limit, intro_only, redirect_titles, exclude_categories).unwrap();
+        convert(
+            &src,
+            &out,
+            limit,
+            intro_only,
+            redirect_titles,
+            exclude_categories,
+        )
+        .unwrap();
         (dir, Zim::open(&out).unwrap())
     }
 
-    fn convert_fixture(limit: i64, intro_only: bool, redirect_titles: bool, exclude_categories: bool) -> Converted {
-        let (dir, zim) = convert_in_dir(&fixture(), limit, intro_only, redirect_titles, exclude_categories);
+    fn convert_fixture(
+        limit: i64,
+        intro_only: bool,
+        redirect_titles: bool,
+        exclude_categories: bool,
+    ) -> Converted {
+        let (dir, zim) = convert_in_dir(
+            &fixture(),
+            limit,
+            intro_only,
+            redirect_titles,
+            exclude_categories,
+        );
         Converted { _dir: dir, zim }
     }
 
@@ -1714,10 +1881,34 @@ mod e2e {
     /// English language metadata.
     fn category_fixture() -> Vec<u8> {
         let content = [
-            TestEntry { namespace: b'C', url: "Apple", title: "Apple", mime: 0, body: APPLE_CAT_HTML.as_bytes() },
-            TestEntry { namespace: b'C', url: "Category:Fruits", title: "Category:Fruits", mime: 0, body: CAT_FRUITS_HTML.as_bytes() },
-            TestEntry { namespace: b'C', url: "_categories_partials_Category:Fruits_pages_2", title: "", mime: 0, body: FRUITS_PARTIAL_HTML.as_bytes() },
-            TestEntry { namespace: b'M', url: "Language", title: "", mime: 1, body: b"eng" },
+            TestEntry {
+                namespace: b'C',
+                url: "Apple",
+                title: "Apple",
+                mime: 0,
+                body: APPLE_CAT_HTML.as_bytes(),
+            },
+            TestEntry {
+                namespace: b'C',
+                url: "Category:Fruits",
+                title: "Category:Fruits",
+                mime: 0,
+                body: CAT_FRUITS_HTML.as_bytes(),
+            },
+            TestEntry {
+                namespace: b'C',
+                url: "_categories_partials_Category:Fruits_pages_2",
+                title: "",
+                mime: 0,
+                body: FRUITS_PARTIAL_HTML.as_bytes(),
+            },
+            TestEntry {
+                namespace: b'M',
+                url: "Language",
+                title: "",
+                mime: 1,
+                body: b"eng",
+            },
         ];
         let redirects = [TestRedirect {
             namespace: b'C',
@@ -1809,7 +2000,11 @@ mod e2e {
                 let entry = z.get_entry(idx).unwrap();
                 assert_eq!(z.mime_type(entry.mime), Some("text/markdown"));
             } else {
-                assert!(z.find_entry(b'C', &e.url).unwrap().is_none(), "{} skipped", e.url);
+                assert!(
+                    z.find_entry(b'C', &e.url).unwrap().is_none(),
+                    "{} skipped",
+                    e.url
+                );
             }
         }
         for r in &redirects {
@@ -1819,7 +2014,10 @@ mod e2e {
                 redirects.iter().position(|x| std::ptr::eq(x, r)).unwrap(),
                 "aliases sort among themselves in numeric order"
             );
-            assert_eq!(z.get_entry(idx).unwrap().mime, crate::zimcommon::MIME_REDIRECT);
+            assert_eq!(
+                z.get_entry(idx).unwrap().mime,
+                crate::zimcommon::MIME_REDIRECT
+            );
         }
 
         // The counter and both indexes know exactly the article count.
@@ -1857,8 +2055,7 @@ mod e2e {
             Target::Cluster(cluster, blob) => z.read_blob(cluster, blob).unwrap(),
             _ => panic!("article has no content"),
         };
-        let expected =
-            crate::html2md::html_to_md(APPLE_HTML, Some("Apple"), Some("fra"), false);
+        let expected = crate::html2md::html_to_md(APPLE_HTML, Some("Apple"), Some("fra"), false);
         assert_eq!(md, expected.into_bytes());
         assert!(String::from_utf8_lossy(&md).contains("rosaceae"));
 
@@ -1874,15 +2071,30 @@ mod e2e {
         assert!(z.resolve_path("C/style.css").unwrap().is_none());
 
         // Core metadata is copied verbatim (Language stays "fra").
-        assert_eq!(blob_of(z, b'M', "Title"), Some("Chemistry \u{2014} Mini".into()));
+        assert_eq!(
+            blob_of(z, b'M', "Title"),
+            Some("Chemistry \u{2014} Mini".into())
+        );
         assert_eq!(blob_of(z, b'M', "Language"), Some(b"fra".to_vec()));
-        assert_eq!(blob_of(z, b'M', "Name"), Some(b"wikipedia_en_mini".to_vec()));
-        assert_eq!(blob_of(z, b'M', "Description"), Some(b"A miniature encyclopedia".to_vec()));
+        assert_eq!(
+            blob_of(z, b'M', "Name"),
+            Some(b"wikipedia_en_mini".to_vec())
+        );
+        assert_eq!(
+            blob_of(z, b'M', "Description"),
+            Some(b"A miniature encyclopedia".to_vec())
+        );
 
         // The illustration, the counter and the listing exist.
-        assert_eq!(blob_of(z, b'M', "Illustration_48x48@1"), Some(FAKE_PNG.to_vec()));
+        assert_eq!(
+            blob_of(z, b'M', "Illustration_48x48@1"),
+            Some(FAKE_PNG.to_vec())
+        );
         let counter = blob_of(z, b'M', "Counter").unwrap();
-        assert!(String::from_utf8_lossy(&counter).contains("text/markdown=3"), "{counter:?}");
+        assert!(
+            String::from_utf8_lossy(&counter).contains("text/markdown=3"),
+            "{counter:?}"
+        );
         let listing = blob_of(z, b'X', "listing/titleOrdered/v1").unwrap();
         // Three front articles (redirect titles excluded by default).
         assert_eq!(listing.len() / 4, 3);
@@ -1922,7 +2134,10 @@ mod e2e {
         assert_eq!(title.get_metadata("data").unwrap(), "fullPath");
         // The RAW indexing language code is stored (not the ICU mapping).
         assert_eq!(title.get_metadata("language").unwrap(), "fra");
-        assert_eq!(title.get_metadata("valuesmap").unwrap(), "title:0;targetPath:1");
+        assert_eq!(
+            title.get_metadata("valuesmap").unwrap(),
+            "title:0;targetPath:1"
+        );
         assert_eq!(title.get_metadata("stopwords").unwrap(), "");
 
         let mut doc = title.get_document(1).unwrap();
@@ -1988,12 +2203,8 @@ mod e2e {
         // Value 0 is the FOLDED title, value 1 the wordcount of the folded
         // indexed content.
         assert_eq!(doc.value(0).unwrap(), b"revolution francaise");
-        let md = crate::html2md::html_to_md(
-            REV_HTML,
-            Some("Révolution française"),
-            Some("fra"),
-            false,
-        );
+        let md =
+            crate::html2md::html_to_md(REV_HTML, Some("Révolution française"), Some("fra"), false);
         let wordcount = crate::search::fold_accents(&md).split_whitespace().count();
         assert_eq!(doc.value(1).unwrap(), wordcount.to_string().into_bytes());
 
@@ -2015,8 +2226,20 @@ mod e2e {
         // The Language metadata is copied VERBATIM even when it is a
         // multi-code value; the indexing language is its first code.
         let mut content = vec![
-            TestEntry { namespace: b'C', url: "Apple", title: "Apple", mime: 0, body: APPLE_HTML.as_bytes() },
-            TestEntry { namespace: b'M', url: "Language", title: "", mime: 2, body: b"fra,eng" },
+            TestEntry {
+                namespace: b'C',
+                url: "Apple",
+                title: "Apple",
+                mime: 0,
+                body: APPLE_HTML.as_bytes(),
+            },
+            TestEntry {
+                namespace: b'M',
+                url: "Language",
+                title: "",
+                mime: 2,
+                body: b"fra,eng",
+            },
         ];
         let redirects: Vec<TestRedirect> = vec![];
         let bytes = build_archive(&FIXTURE_MIMES, &content, &redirects, 0, None);
@@ -2059,7 +2282,13 @@ mod e2e {
         // The wordcount shrank with the indexed text.
         let mut doc = ft.get_document(1).unwrap();
         let wc_intro = String::from_utf8(doc.value(1).unwrap()).unwrap();
-        let mut doc = full.zim.open_fulltext_xapian().unwrap().unwrap().get_document(1).unwrap();
+        let mut doc = full
+            .zim
+            .open_fulltext_xapian()
+            .unwrap()
+            .unwrap()
+            .get_document(1)
+            .unwrap();
         let wc_full = String::from_utf8(doc.value(1).unwrap()).unwrap();
         assert!(
             wc_intro.parse::<usize>().unwrap() < wc_full.parse::<usize>().unwrap(),
@@ -2074,9 +2303,27 @@ mod e2e {
     /// meta-refresh redirect stub).
     fn stub_fixture() -> Vec<u8> {
         let content = [
-            TestEntry { namespace: b'C', url: "Apple", title: "Apple", mime: 0, body: APPLE_HTML.as_bytes() },
-            TestEntry { namespace: b'C', url: "Stub", title: "Stub", mime: 0, body: STUB_HTML.as_bytes() },
-            TestEntry { namespace: b'M', url: "Language", title: "", mime: 2, body: b"eng" },
+            TestEntry {
+                namespace: b'C',
+                url: "Apple",
+                title: "Apple",
+                mime: 0,
+                body: APPLE_HTML.as_bytes(),
+            },
+            TestEntry {
+                namespace: b'C',
+                url: "Stub",
+                title: "Stub",
+                mime: 0,
+                body: STUB_HTML.as_bytes(),
+            },
+            TestEntry {
+                namespace: b'M',
+                url: "Language",
+                title: "",
+                mime: 2,
+                body: b"eng",
+            },
         ];
         build_archive(&FIXTURE_MIMES, &content, &[], 0, None)
     }
@@ -2139,7 +2386,10 @@ mod e2e {
         let z = &c.zim;
         assert!(z.resolve_path("C/Category:Fruits").unwrap().is_none());
         assert!(z.resolve_path("C/All_fruits").unwrap().is_none());
-        assert_eq!(md_of(z, "Apple"), "# Apple\n\nAn **apple** is the fruit of trees.\n");
+        assert_eq!(
+            md_of(z, "Apple"),
+            "# Apple\n\nAn **apple** is the fruit of trees.\n"
+        );
 
         // The category page still counted as a processed walk item, but only
         // the regular article is indexed (fulltext and title).
@@ -2164,7 +2414,10 @@ mod e2e {
             .resolve_path("C/_categories_partials_Category:Fruits_pages_2")
             .unwrap()
             .unwrap();
-        assert_eq!(z.mime_type(z.get_entry(idx).unwrap().mime), Some("text/markdown"));
+        assert_eq!(
+            z.mime_type(z.get_entry(idx).unwrap().mime),
+            Some("text/markdown")
+        );
         let partial_md = md_of(z, "_categories_partials_Category:Fruits_pages_2");
         assert!(partial_md.contains("[[Banana]]"), "{partial_md}");
         // The counter records exactly the markdown dirents written: the
@@ -2192,11 +2445,10 @@ mod e2e {
         // remains, indexed 1/1.
         let c = convert_category_fixture(true);
         let z = &c.zim;
-        assert!(
-            z.resolve_path("C/_categories_partials_Category:Fruits_pages_2")
-                .unwrap()
-                .is_none()
-        );
+        assert!(z
+            .resolve_path("C/_categories_partials_Category:Fruits_pages_2")
+            .unwrap()
+            .is_none());
         assert!(z.resolve_path("C/Category:Fruits").unwrap().is_none());
         let counter = blob_of(z, b'M', "Counter").unwrap();
         assert_eq!(String::from_utf8_lossy(&counter), "text/markdown=1");
@@ -2221,8 +2473,14 @@ mod e2e {
         assert_eq!(z.mime_type(cat_entry.mime), Some("text/markdown"));
         let cat_md = md_of(z, "Category:Fruits");
         assert!(cat_md.contains("## Subcategories"), "{cat_md}");
-        assert!(cat_md.contains("- [[Category:Rosaceae genera|Rosaceae genera]]"), "{cat_md}");
-        assert!(cat_md.contains("## Pages in category \"Fruits\""), "{cat_md}");
+        assert!(
+            cat_md.contains("- [[Category:Rosaceae genera|Rosaceae genera]]"),
+            "{cat_md}"
+        );
+        assert!(
+            cat_md.contains("## Pages in category \"Fruits\""),
+            "{cat_md}"
+        );
         assert!(cat_md.contains("- [[Apple]]"), "{cat_md}");
 
         // The article gains the localized Categories section, whose category
@@ -2249,7 +2507,10 @@ mod e2e {
             .map(|d| ti.get_document(d).unwrap().data_str().unwrap())
             .collect();
         assert!(ti_data.contains(&"C/Apple".to_string()), "{ti_data:?}");
-        assert!(ti_data.contains(&"C/Category:Fruits".to_string()), "{ti_data:?}");
+        assert!(
+            ti_data.contains(&"C/Category:Fruits".to_string()),
+            "{ti_data:?}"
+        );
     }
 
     #[test]

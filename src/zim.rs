@@ -18,8 +18,8 @@ use xapian2::Database as XapianDatabase;
 
 use crate::zimcommon::{
     dirent_order, u16le, u32le, u64le, CLUSTER_COMPRESSION_MASK, CLUSTER_EXTENDED_BIT,
-    CLUSTER_LZMA, CLUSTER_UNCOMPRESSED, CLUSTER_ZSTD, MIME_DELETED, MIME_LINKTARGET,
-    MIME_REDIRECT, ZIM_MAGIC,
+    CLUSTER_LZMA, CLUSTER_UNCOMPRESSED, CLUSTER_ZSTD, MIME_DELETED, MIME_LINKTARGET, MIME_REDIRECT,
+    ZIM_MAGIC,
 };
 
 const MAX_REDIRECT_HOPS: u32 = 50;
@@ -69,10 +69,19 @@ impl Store {
         if path.is_file() {
             let file = File::open(path)?;
             let len = file.metadata()?.len();
-            let mmap = unsafe { Mmap::map(&file) }
-                .map_err(|e| io::Error::new(ErrorKind::InvalidData, format!("cannot map {}: {e}", path.display())))?;
+            let mmap = unsafe { Mmap::map(&file) }.map_err(|e| {
+                io::Error::new(
+                    ErrorKind::InvalidData,
+                    format!("cannot map {}: {e}", path.display()),
+                )
+            })?;
             return Ok(Store {
-                parts: vec![Part { path: path.to_path_buf(), file, mmap, start: 0 }],
+                parts: vec![Part {
+                    path: path.to_path_buf(),
+                    file,
+                    mmap,
+                    start: 0,
+                }],
                 len,
             });
         }
@@ -94,14 +103,23 @@ impl Store {
                 }
                 let file = File::open(&chunk)?;
                 let len = file.metadata()?.len();
-                let mmap = unsafe { Mmap::map(&file) }
-                    .map_err(|e| io::Error::new(ErrorKind::InvalidData, format!("cannot map {chunk:?}: {e}")))?;
-                parts.push(Part { path: chunk, file, mmap, start });
+                let mmap = unsafe { Mmap::map(&file) }.map_err(|e| {
+                    io::Error::new(ErrorKind::InvalidData, format!("cannot map {chunk:?}: {e}"))
+                })?;
+                parts.push(Part {
+                    path: chunk,
+                    file,
+                    mmap,
+                    start,
+                });
                 start += len;
             }
         }
         if parts.is_empty() {
-            return Err(io::Error::new(ErrorKind::NotFound, format!("no such archive: {}", path.display())));
+            return Err(io::Error::new(
+                ErrorKind::NotFound,
+                format!("no such archive: {}", path.display()),
+            ));
         }
         Ok(Store { parts, len: start })
     }
@@ -117,7 +135,10 @@ impl Store {
     /// pages the kernel only reclaims under pressure).
     fn read<'a>(&'a self, off: u64, len: u64) -> io::Result<std::borrow::Cow<'a, [u8]>> {
         if off > self.len || len > self.len - off {
-            return Err(io::Error::new(ErrorKind::InvalidData, "read out of bounds in ZIM archive"));
+            return Err(io::Error::new(
+                ErrorKind::InvalidData,
+                "read out of bounds in ZIM archive",
+            ));
         }
         if len == 0 {
             return Ok(std::borrow::Cow::Borrowed(&[]));
@@ -132,7 +153,9 @@ impl Store {
             return Ok(std::borrow::Cow::Owned(part.pread(off - part.start, len)?));
         }
         if rel + len as usize <= part_len {
-            return Ok(std::borrow::Cow::Borrowed(&part.mmap[rel..rel + len as usize]));
+            return Ok(std::borrow::Cow::Borrowed(
+                &part.mmap[rel..rel + len as usize],
+            ));
         }
         // Spans part boundaries: pread the needed ranges.
         let mut buf: Vec<u8> = Vec::with_capacity(len as usize);
@@ -151,7 +174,10 @@ impl Store {
             need -= take;
         }
         if need > 0 {
-            return Err(io::Error::new(ErrorKind::InvalidData, "read out of bounds in ZIM archive"));
+            return Err(io::Error::new(
+                ErrorKind::InvalidData,
+                "read out of bounds in ZIM archive",
+            ));
         }
         Ok(std::borrow::Cow::Owned(buf))
     }
@@ -160,7 +186,10 @@ impl Store {
         if voff >= self.len {
             return None;
         }
-        let idx = self.parts.partition_point(|p| p.start > voff).saturating_sub(1);
+        let idx = self
+            .parts
+            .partition_point(|p| p.start > voff)
+            .saturating_sub(1);
         let part = &self.parts[idx];
         (voff >= part.start && voff < part.start + part.mmap.len() as u64).then_some(idx)
     }
@@ -170,7 +199,11 @@ impl Store {
     fn file_location(&self, voff: u64) -> Option<(&Path, u64, u64)> {
         let idx = self.part_index(voff)?;
         let part = &self.parts[idx];
-        Some((part.path.as_path(), voff - part.start, part.mmap.len() as u64))
+        Some((
+            part.path.as_path(),
+            voff - part.start,
+            part.mmap.len() as u64,
+        ))
     }
 }
 
@@ -267,11 +300,17 @@ fn table_int(d: &[u8], off: usize, sz: usize) -> u64 {
 /// parsing, no file IO.
 fn parse_blob_spans(data: &[u8], sz: usize) -> io::Result<Vec<(u64, u64)>> {
     if data.len() < sz {
-        return Err(io::Error::new(ErrorKind::InvalidData, "malformed cluster blob table"));
+        return Err(io::Error::new(
+            ErrorKind::InvalidData,
+            "malformed cluster blob table",
+        ));
     }
     let tbl_size = table_int(data, 0, sz);
     if tbl_size < sz as u64 || tbl_size % sz as u64 != 0 || tbl_size as usize > data.len() {
-        return Err(io::Error::new(ErrorKind::InvalidData, "malformed cluster blob table"));
+        return Err(io::Error::new(
+            ErrorKind::InvalidData,
+            "malformed cluster blob table",
+        ));
     }
     let n = (tbl_size / sz as u64) as usize; // offsets including the end sentinel
     let mut spans = Vec::with_capacity(n.saturating_sub(1));
@@ -279,7 +318,10 @@ fn parse_blob_spans(data: &[u8], sz: usize) -> io::Result<Vec<(u64, u64)>> {
         let s = table_int(data, i * sz, sz);
         let e = table_int(data, (i + 1) * sz, sz);
         if s > e {
-            return Err(io::Error::new(ErrorKind::InvalidData, "malformed cluster blob table"));
+            return Err(io::Error::new(
+                ErrorKind::InvalidData,
+                "malformed cluster blob table",
+            ));
         }
         spans.push((s, e));
     }
@@ -308,7 +350,10 @@ impl<'a> ClusterDecoder<'a> {
                 ))
             }
         };
-        Ok(ClusterDecoder { stream, buf: Vec::new() })
+        Ok(ClusterDecoder {
+            stream,
+            buf: Vec::new(),
+        })
     }
 
     /// Decode until at least `len` bytes are buffered. A stream that ends
@@ -321,7 +366,10 @@ impl<'a> ClusterDecoder<'a> {
             self.buf.resize((filled + 1024 * 1024).min(len as usize), 0);
             match self.stream.read(&mut self.buf[filled..]) {
                 Ok(0) => {
-                    return Err(io::Error::new(ErrorKind::InvalidData, "malformed decompressed cluster"));
+                    return Err(io::Error::new(
+                        ErrorKind::InvalidData,
+                        "malformed decompressed cluster",
+                    ));
                 }
                 Ok(n) => self.buf.truncate(filled + n),
                 Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
@@ -339,10 +387,9 @@ impl<'a> ClusterDecoder<'a> {
 
 /// Read a NUL-terminated string at `off`; returns (string, offset-after-NUL).
 fn cstr(b: &[u8], off: usize) -> io::Result<(&str, usize)> {
-    let nul = b[off..]
-        .iter()
-        .position(|&c| c == 0)
-        .ok_or_else(|| io::Error::new(ErrorKind::InvalidData, "unterminated string in ZIM entry"))?;
+    let nul = b[off..].iter().position(|&c| c == 0).ok_or_else(|| {
+        io::Error::new(ErrorKind::InvalidData, "unterminated string in ZIM entry")
+    })?;
     let s = std::str::from_utf8(&b[off..off + nul])
         .map_err(|_| io::Error::new(ErrorKind::InvalidData, "non-UTF-8 string in ZIM entry"))?;
     Ok((s, off + nul + 1))
@@ -369,7 +416,10 @@ impl Zim {
         let hlen = 80u64.min(store.len());
         let hdr = store.read(0, hlen)?;
         if hlen < 80 || u32le(&hdr[0..4]) != ZIM_MAGIC {
-            return Err(io::Error::new(ErrorKind::InvalidData, format!("not a ZIM file: {}", path.display())));
+            return Err(io::Error::new(
+                ErrorKind::InvalidData,
+                format!("not a ZIM file: {}", path.display()),
+            ));
         }
         let header = ZimHeader::parse(&hdr);
         if !(5..=6).contains(&header.major) {
@@ -379,13 +429,25 @@ impl Zim {
             ));
         }
         if header.mime_list_pos != 80 {
-            return Err(io::Error::new(ErrorKind::InvalidData, "bad mimeListPos in ZIM header"));
+            return Err(io::Error::new(
+                ErrorKind::InvalidData,
+                "bad mimeListPos in ZIM header",
+            ));
         }
         if header.checksum_pos + 16 > store.len()
-            || header.url_ptr_pos.saturating_add(8u64 * header.entry_count as u64) > store.len()
-            || header.cluster_ptr_pos.saturating_add(8u64 * header.cluster_count as u64) > store.len()
+            || header
+                .url_ptr_pos
+                .saturating_add(8u64 * header.entry_count as u64)
+                > store.len()
+            || header
+                .cluster_ptr_pos
+                .saturating_add(8u64 * header.cluster_count as u64)
+                > store.len()
         {
-            return Err(io::Error::new(ErrorKind::InvalidData, "inconsistent ZIM header"));
+            return Err(io::Error::new(
+                ErrorKind::InvalidData,
+                "inconsistent ZIM header",
+            ));
         }
 
         // MIME type list: NUL-terminated strings, ended by an empty string.
@@ -404,7 +466,11 @@ impl Zim {
             off = next;
         }
 
-        Ok(Zim { store, header, mime_types })
+        Ok(Zim {
+            store,
+            header,
+            mime_types,
+        })
     }
 
     pub fn entry_count(&self) -> u32 {
@@ -413,7 +479,9 @@ impl Zim {
 
     /// The MIME type string for mime id `id`, if known.
     pub fn mime_type(&self, id: u16) -> Option<&str> {
-        (id < MIME_DELETED).then_some(id as usize).and_then(|i| self.mime_types.get(i).map(String::as_str))
+        (id < MIME_DELETED)
+            .then_some(id as usize)
+            .and_then(|i| self.mime_types.get(i).map(String::as_str))
     }
 
     /// One 8-byte pointer from a pointer list.
@@ -427,7 +495,10 @@ impl Zim {
     /// Offset of the directory entry at `idx` in the URL pointer list.
     fn dirent_offset(&self, idx: u32) -> io::Result<u64> {
         if idx >= self.header.entry_count {
-            return Err(io::Error::new(ErrorKind::InvalidData, "entry index out of bounds"));
+            return Err(io::Error::new(
+                ErrorKind::InvalidData,
+                "entry index out of bounds",
+            ));
         }
         self.ptr(self.header.url_ptr_pos, idx)
     }
@@ -436,11 +507,19 @@ impl Zim {
     pub fn get_entry(&self, idx: u32) -> io::Result<Entry> {
         let off = self.dirent_offset(idx)?;
         if off >= self.store.len() {
-            return Err(io::Error::new(ErrorKind::InvalidData, "entry offset out of bounds"));
+            return Err(io::Error::new(
+                ErrorKind::InvalidData,
+                "entry offset out of bounds",
+            ));
         }
-        let window = self.store.read(off, DIRENT_WINDOW.min(self.store.len() - off))?;
+        let window = self
+            .store
+            .read(off, DIRENT_WINDOW.min(self.store.len() - off))?;
         if window.len() < 8 {
-            return Err(io::Error::new(ErrorKind::InvalidData, "truncated directory entry"));
+            return Err(io::Error::new(
+                ErrorKind::InvalidData,
+                "truncated directory entry",
+            ));
         }
         let mime = u16le(&window[0..2]);
         let namespace = window[3];
@@ -526,7 +605,10 @@ impl Zim {
 
     fn cluster_range(&self, cluster: u32) -> io::Result<(u64, u64)> {
         if cluster >= self.header.cluster_count {
-            return Err(io::Error::new(ErrorKind::InvalidData, "cluster index out of bounds"));
+            return Err(io::Error::new(
+                ErrorKind::InvalidData,
+                "cluster index out of bounds",
+            ));
         }
         let start = self.ptr(self.header.cluster_ptr_pos, cluster)?;
         let end = if cluster + 1 < self.header.cluster_count {
@@ -535,7 +617,10 @@ impl Zim {
             self.header.checksum_pos
         };
         if start >= end {
-            return Err(io::Error::new(ErrorKind::InvalidData, "malformed cluster range"));
+            return Err(io::Error::new(
+                ErrorKind::InvalidData,
+                "malformed cluster range",
+            ));
         }
         Ok((start, end))
     }
@@ -547,20 +632,34 @@ impl Zim {
         let info = self.store.read(start, 1)?[0];
         let compression = info & CLUSTER_COMPRESSION_MASK;
         if compression != 0 && compression != CLUSTER_UNCOMPRESSED {
-            return Ok(BlobLocation { compression, file_offset: None, length: 0 });
+            return Ok(BlobLocation {
+                compression,
+                file_offset: None,
+                length: 0,
+            });
         }
-        let sz = if (info & CLUSTER_EXTENDED_BIT) != 0 { 8 } else { 4 }; // 64-bit blob offsets
+        let sz = if (info & CLUSTER_EXTENDED_BIT) != 0 {
+            8
+        } else {
+            4
+        }; // 64-bit blob offsets
         let tbl0 = start + 1 + blob as u64 * sz;
         let (s0, s1) = if sz == 8 {
             let a = u64le(&self.store.read(tbl0, 8)?);
             let b = u64le(&self.store.read(tbl0 + 8, 8)?);
             (a, b)
         } else {
-            (u32le(&self.store.read(tbl0, 4)?) as u64, u32le(&self.store.read(tbl0 + 4, 4)?) as u64)
+            (
+                u32le(&self.store.read(tbl0, 4)?) as u64,
+                u32le(&self.store.read(tbl0 + 4, 4)?) as u64,
+            )
         };
         let body_len = end - (start + 1);
         if s0 > body_len || s1 > body_len || s0 > s1 {
-            return Err(io::Error::new(ErrorKind::InvalidData, "malformed cluster blob table"));
+            return Err(io::Error::new(
+                ErrorKind::InvalidData,
+                "malformed cluster blob table",
+            ));
         }
         Ok(BlobLocation {
             compression,
@@ -586,24 +685,37 @@ impl Zim {
         let (start, end) = self.cluster_range(cluster)?;
         let body = self.store.read(start + 1, end - start - 1)?;
         let info = self.store.read(start, 1)?[0];
-        let sz = if (info & CLUSTER_EXTENDED_BIT) != 0 { 8 } else { 4 }; // 64-bit blob offsets
+        let sz = if (info & CLUSTER_EXTENDED_BIT) != 0 {
+            8
+        } else {
+            4
+        }; // 64-bit blob offsets
         let mut dec = ClusterDecoder::new(loc.compression, body.as_ref())?;
         // The decompressed data starts with the blob-offset table, whose
         // first entry gives the table's own byte size; blob data follows.
         let tbl_size = table_int(dec.decode_to(sz as u64)?, 0, sz);
         if tbl_size < sz as u64 || tbl_size % sz as u64 != 0 {
-            return Err(io::Error::new(ErrorKind::InvalidData, "malformed cluster blob table"));
+            return Err(io::Error::new(
+                ErrorKind::InvalidData,
+                "malformed cluster blob table",
+            ));
         }
         let n = tbl_size / sz as u64; // offsets including the end sentinel
         let bi = blob as u64;
         if bi + 1 >= n {
-            return Err(io::Error::new(ErrorKind::InvalidData, "blob index out of bounds"));
+            return Err(io::Error::new(
+                ErrorKind::InvalidData,
+                "blob index out of bounds",
+            ));
         }
         let tbl = dec.decode_to(tbl_size)?;
         let s = table_int(tbl, bi as usize * sz, sz);
         let e = table_int(tbl, (bi as usize + 1) * sz, sz);
         if s > e {
-            return Err(io::Error::new(ErrorKind::InvalidData, "malformed cluster blob table"));
+            return Err(io::Error::new(
+                ErrorKind::InvalidData,
+                "malformed cluster blob table",
+            ));
         }
         let take = (e - s).min(max);
         let data = dec.decode_to(s + take)?;
@@ -616,24 +728,36 @@ impl Zim {
     pub fn entry_head(&self, idx: u32) -> io::Result<(u16, Target)> {
         let off = self.dirent_offset(idx)?;
         if off >= self.store.len() {
-            return Err(io::Error::new(ErrorKind::InvalidData, "entry offset out of bounds"));
+            return Err(io::Error::new(
+                ErrorKind::InvalidData,
+                "entry offset out of bounds",
+            ));
         }
         let window = self.store.read(off, 16.min(self.store.len() - off))?;
         if window.len() < 8 {
-            return Err(io::Error::new(ErrorKind::InvalidData, "truncated directory entry"));
+            return Err(io::Error::new(
+                ErrorKind::InvalidData,
+                "truncated directory entry",
+            ));
         }
         let mime = u16le(&window[0..2]);
         let target = match mime {
             MIME_REDIRECT => {
                 if window.len() < 12 {
-                    return Err(io::Error::new(ErrorKind::InvalidData, "truncated directory entry"));
+                    return Err(io::Error::new(
+                        ErrorKind::InvalidData,
+                        "truncated directory entry",
+                    ));
                 }
                 Target::Redirect(u32le(&window[8..12]))
             }
             MIME_LINKTARGET | MIME_DELETED => Target::None,
             _ => {
                 if window.len() < 16 {
-                    return Err(io::Error::new(ErrorKind::InvalidData, "truncated directory entry"));
+                    return Err(io::Error::new(
+                        ErrorKind::InvalidData,
+                        "truncated directory entry",
+                    ));
                 }
                 Target::Cluster(u32le(&window[8..12]), u32le(&window[12..16]))
             }
@@ -669,7 +793,11 @@ impl Zim {
         let (start, end) = self.cluster_range(cluster)?;
         let info = self.store.read(start, 1)?[0];
         let compression = info & CLUSTER_COMPRESSION_MASK;
-        let sz = if (info & CLUSTER_EXTENDED_BIT) != 0 { 8usize } else { 4usize };
+        let sz = if (info & CLUSTER_EXTENDED_BIT) != 0 {
+            8usize
+        } else {
+            4usize
+        };
         let data = if compression == 0 || compression == CLUSTER_UNCOMPRESSED {
             self.store.read(start + 1, end - start - 1)?[..].to_vec()
         } else {
@@ -681,12 +809,18 @@ impl Zim {
             // the full decode length is known from the table alone.
             let tbl_size = table_int(dec.decode_to(sz as u64)?, 0, sz);
             if tbl_size < sz as u64 || tbl_size % sz as u64 != 0 {
-                return Err(io::Error::new(ErrorKind::InvalidData, "malformed cluster blob table"));
+                return Err(io::Error::new(
+                    ErrorKind::InvalidData,
+                    "malformed cluster blob table",
+                ));
             }
             let tbl = dec.decode_to(tbl_size)?;
             let total = table_int(tbl, tbl_size as usize - sz, sz);
             if total < tbl_size {
-                return Err(io::Error::new(ErrorKind::InvalidData, "malformed cluster blob table"));
+                return Err(io::Error::new(
+                    ErrorKind::InvalidData,
+                    "malformed cluster blob table",
+                ));
             }
             dec.decode_to(total)?.to_vec()
         };
@@ -734,8 +868,7 @@ impl Zim {
 
     /// Directory names under which a ZIM may store its `Language` metadata
     /// (current openZIM layout first, historical variant second).
-    const LANGUAGE_METADATA_NAMES: &[(u8, &str)] =
-        &[(b'M', "Language"), (b'M', "M/Language")];
+    const LANGUAGE_METADATA_NAMES: &[(u8, &str)] = &[(b'M', "Language"), (b'M', "M/Language")];
 
     /// The directory index of the full-text Xapian index entry, if the
     /// archive carries one.
@@ -756,9 +889,13 @@ impl Zim {
     /// small blob read.
     fn language_metadata(&self) -> io::Result<Option<String>> {
         for (ns, url) in Self::LANGUAGE_METADATA_NAMES {
-            let Some(idx) = self.find_entry(*ns, url)? else { continue };
+            let Some(idx) = self.find_entry(*ns, url)? else {
+                continue;
+            };
             let entry = self.get_entry(idx)?;
-            let Target::Cluster(cluster, blob) = entry.target else { continue };
+            let Target::Cluster(cluster, blob) = entry.target else {
+                continue;
+            };
             let bytes = self.read_blob(cluster, blob)?;
             let value = String::from_utf8_lossy(&bytes);
             return Ok(value
@@ -806,7 +943,12 @@ impl Zim {
         }
         xapian2::Database::open_at(path, off_in_file, xapian2::DbFlags::NONE)
             .map(Some)
-            .map_err(|e| io::Error::new(ErrorKind::InvalidData, format!("embedded {what} index: {e}")))
+            .map_err(|e| {
+                io::Error::new(
+                    ErrorKind::InvalidData,
+                    format!("embedded {what} index: {e}"),
+                )
+            })
     }
 
     /// Open the archive's full-text Xapian index.
@@ -869,7 +1011,12 @@ pub struct Archive {
 
 impl Archive {
     pub fn new(name: String, zim: Zim) -> Self {
-        Self { name, zim, language: OnceLock::new(), xapian_pool: Mutex::new(Vec::new()) }
+        Self {
+            name,
+            zim,
+            language: OnceLock::new(),
+            xapian_pool: Mutex::new(Vec::new()),
+        }
     }
 
     /// The archive's Language metadata (first code, lowercased - see
@@ -900,7 +1047,10 @@ impl Archive {
     /// Whether this archive carries a full-text Xapian index - a cheap
     /// directory-existence probe; no database is opened.
     pub fn searchable(&self) -> bool {
-        self.zim.fulltext_index_entry().map(|idx| idx.is_some()).unwrap_or(false)
+        self.zim
+            .fulltext_index_entry()
+            .map(|idx| idx.is_some())
+            .unwrap_or(false)
     }
 
     /// Run `f` with handles on this archive's Xapian search indexes (full
@@ -1010,11 +1160,18 @@ impl Archive {
     /// Resolve `path` (following redirects) and read the article's content.
     pub fn get_article(&self, path: &str) -> io::Result<Article> {
         let Some(idx) = self.zim.resolve_path(path)? else {
-            return Err(io::Error::new(ErrorKind::NotFound, format!("article not found: {path}")));
+            return Err(io::Error::new(
+                ErrorKind::NotFound,
+                format!("article not found: {path}"),
+            ));
         };
         let (entry, bytes) = self.content_of(idx)?;
         Ok(Article {
-            title: if entry.title.is_empty() { full_path(&entry) } else { entry.title.clone() },
+            title: if entry.title.is_empty() {
+                full_path(&entry)
+            } else {
+                entry.title.clone()
+            },
             full_path: full_path(&entry),
             mime_type: self.zim.mime_type(entry.mime).map(String::from),
             bytes,
@@ -1051,7 +1208,10 @@ impl Archive {
                 _ => return Ok(entry),
             }
         }
-        Err(io::Error::new(ErrorKind::InvalidData, "redirect chain did not terminate"))
+        Err(io::Error::new(
+            ErrorKind::InvalidData,
+            "redirect chain did not terminate",
+        ))
     }
 
     /// Resolve `idx` (following redirects) and read the full content.
@@ -1062,7 +1222,7 @@ impl Archive {
             _ => {
                 return Err(io::Error::new(
                     ErrorKind::InvalidData,
-                    "entry has no content (redirect loop or deleted entry)"
+                    "entry has no content (redirect loop or deleted entry)",
                 ));
             }
         };
@@ -1100,7 +1260,10 @@ impl ZimLibrary {
     /// directory is not fatal at scan time.
     pub fn scan(root: &Path) -> io::Result<ZimLibrary> {
         if !root.is_dir() {
-            return Err(io::Error::new(ErrorKind::NotFound, format!("not a directory: {}", root.display())));
+            return Err(io::Error::new(
+                ErrorKind::NotFound,
+                format!("not a directory: {}", root.display()),
+            ));
         }
         let mut names: Vec<String> = Vec::new();
         scan_dir(root, root, &mut names)?;
@@ -1113,7 +1276,11 @@ impl ZimLibrary {
                 Err(e) => eprintln!("szmcp: skipping {}: {e}", name),
             }
         }
-        Ok(ZimLibrary { root: root.to_path_buf(), archives, mode: Mode::Directory })
+        Ok(ZimLibrary {
+            root: root.to_path_buf(),
+            archives,
+            mode: Mode::Directory,
+        })
     }
 
     /// Open the single ZIM archive at `file` (`*.zim`, or the first
@@ -1124,7 +1291,10 @@ impl ZimLibrary {
     /// scanned directory.
     pub fn single(file: &Path) -> io::Result<ZimLibrary> {
         let name = file.file_name().and_then(zim_archive_name).ok_or_else(|| {
-            io::Error::new(ErrorKind::InvalidInput, format!("not a ZIM file: {}", file.display()))
+            io::Error::new(
+                ErrorKind::InvalidInput,
+                format!("not a ZIM file: {}", file.display()),
+            )
         })?;
         // "x.zimaa" normalizes to "x.zim", whose (nonexistent) path makes
         // Store::open pick up the chunked form x.zimaa, x.zimab, ...
@@ -1226,7 +1396,13 @@ pub(crate) mod testutil {
     /// real archive uses), for pairing with a hand-built index to simulate
     /// any language. Append it to `content`; it is not an article.
     pub fn language_metadata_entry(code: &'static str) -> TestEntry {
-        TestEntry { namespace: b'M', url: "Language", title: "", mime: 0, body: code.as_bytes() }
+        TestEntry {
+            namespace: b'M',
+            url: "Language",
+            title: "",
+            mime: 0,
+            body: code.as_bytes(),
+        }
     }
 
     /// Build a minimal archive whose only cluster stores `blobs` under
@@ -1253,7 +1429,9 @@ pub(crate) mod testutil {
                 )
                 .unwrap();
             }
-            CLUSTER_ZSTD => cluster.extend_from_slice(&zstd::encode_all(data.as_slice(), 0).unwrap()),
+            CLUSTER_ZSTD => {
+                cluster.extend_from_slice(&zstd::encode_all(data.as_slice(), 0).unwrap())
+            }
             _ => cluster.extend_from_slice(&data),
         }
         // Header for one cluster and no directory entries; `read_blob_prefix`
@@ -1286,7 +1464,14 @@ pub(crate) mod testutil {
         main_page_content: usize,
         index: Option<&[u8]>,
     ) -> Vec<u8> {
-        build_archive_indexes(mime_types, content, redirects, main_page_content, index, None)
+        build_archive_indexes(
+            mime_types,
+            content,
+            redirects,
+            main_page_content,
+            index,
+            None,
+        )
     }
 
     /// Assemble a complete in-memory ZIM by writing it with the crate's own
@@ -1398,7 +1583,10 @@ pub(crate) mod testutil {
     fn get_article_content() {
         let (a, _f) = sample_archive();
         let art = a.get_article("Banana").unwrap();
-        assert_eq!(art.bytes, b"<html><body><h2>Bananas</h2><p>A delicious fruit.</p></body></html>");
+        assert_eq!(
+            art.bytes,
+            b"<html><body><h2>Bananas</h2><p>A delicious fruit.</p></body></html>"
+        );
         // The dirent title "Banana" equals the path, so the writer's
         // tiny-string packing omits it; `get_article` falls back to the
         // full path (same value a modern openZIM archive yields).
@@ -1581,9 +1769,15 @@ pub(crate) mod testutil {
 
         // Plain and nested relative names resolve to the scanned archive.
         assert!(Arc::ptr_eq(lib.archive("a.zim").unwrap(), &lib.archives[0]));
-        assert!(Arc::ptr_eq(lib.archive("sub/b.zim").unwrap(), &lib.archives[1]));
+        assert!(Arc::ptr_eq(
+            lib.archive("sub/b.zim").unwrap(),
+            &lib.archives[1]
+        ));
         // A "./" prefix is trimmed.
-        assert!(Arc::ptr_eq(lib.archive("./a.zim").unwrap(), &lib.archives[0]));
+        assert!(Arc::ptr_eq(
+            lib.archive("./a.zim").unwrap(),
+            &lib.archives[0]
+        ));
         // Names leaving the ZIM directory are refused, unknown ones too.
         assert!(lib.archive("../a.zim").is_none());
         assert!(lib.archive("/etc/a.zim").is_none());
@@ -1602,5 +1796,4 @@ pub(crate) mod testutil {
         assert_eq!(lib.mode, Mode::Directory);
         assert!(lib.single_archive().is_none());
     }
-
 }

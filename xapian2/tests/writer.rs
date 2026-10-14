@@ -75,14 +75,18 @@ fn set_metadata_roundtrip() {
     {
         let mut wdb = WritableDatabase::create(&db_dir).unwrap();
         wdb.set_metadata("kind", "title").unwrap();
-        wdb.set_metadata("valuesmap", "title:0;targetPath:1").unwrap();
+        wdb.set_metadata("valuesmap", "title:0;targetPath:1")
+            .unwrap();
         wdb.set_metadata("language", "eng").unwrap();
         wdb.commit().unwrap();
     }
 
     let db = Database::open(&db_dir).unwrap();
     assert_eq!(db.get_metadata("kind").unwrap(), "title");
-    assert_eq!(db.get_metadata("valuesmap").unwrap(), "title:0;targetPath:1");
+    assert_eq!(
+        db.get_metadata("valuesmap").unwrap(),
+        "title:0;targetPath:1"
+    );
     assert_eq!(db.get_metadata("language").unwrap(), "eng");
     assert_eq!(db.get_metadata("absent").unwrap(), "");
     drop(db);
@@ -240,7 +244,8 @@ fn indexed_text_size_hand_computed() {
     tg.set_stemming_strategy(StemStrategy::Some).unwrap();
     let doc = Document::new().unwrap();
     tg.set_document(&doc).unwrap();
-    tg.index_text_without_positions("0posanchor Hello World").unwrap();
+    tg.index_text_without_positions("0posanchor Hello World")
+        .unwrap();
     let doc = tg.get_document().unwrap();
     assert_eq!(doc.termlist_count(), 5);
     assert_eq!(doc.indexed_text_size().unwrap(), 20);

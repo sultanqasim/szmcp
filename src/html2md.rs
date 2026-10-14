@@ -25,7 +25,10 @@ const DROP_LINK_NS: &[&str] = &["file", "image", "media", "category"];
 
 /// The namespace head of a wiki target: before the first ':' past leading colons.
 fn ns_head(target: &str) -> Option<&str> {
-    target.trim_start_matches(':').split_once(':').map(|(head, _)| head)
+    target
+        .trim_start_matches(':')
+        .split_once(':')
+        .map(|(head, _)| head)
 }
 
 fn in_dropped_ns(target: &str) -> bool {
@@ -34,20 +37,60 @@ fn in_dropped_ns(target: &str) -> bool {
 
 /// Wiki language name -> markdown fence language.
 const LANG_MAP: &[(&str, &str)] = &[
-    ("c++", "cpp"), ("cxx", "cpp"), ("python", "python"), ("py", "python"),
-    ("javascript", "javascript"), ("js", "javascript"), ("typescript", "typescript"),
-    ("ts", "typescript"), ("c#", "csharp"), ("csharp", "csharp"), ("cs", "csharp"),
-    ("c", "c"), ("cpp", "cpp"), ("java", "java"), ("kotlin", "kotlin"),
-    ("scala", "scala"), ("swift", "swift"), ("go", "go"), ("rust", "rust"),
-    ("ruby", "ruby"), ("perl", "perl"), ("php", "php"), ("lua", "lua"),
-    ("r", "r"), ("matlab", "matlab"), ("haskell", "haskell"), ("fortran", "fortran"),
-    ("pascal", "pascal"), ("html", "html"), ("xml", "xml"), ("css", "css"),
-    ("json", "json"), ("yaml", "yaml"), ("yml", "yaml"), ("toml", "toml"),
-    ("ini", "ini"), ("bash", "bash"), ("sh", "bash"), ("shell", "bash"),
-    ("zsh", "bash"), ("sql", "sql"), ("makefile", "makefile"), ("cmake", "cmake"),
-    ("diff", "diff"), ("dockerfile", "docker"), ("nginx", "nginx"),
-    ("tex", "latex"), ("latex", "latex"), ("plain", ""), ("text", ""),
-    ("wikitext", ""), ("wiki", ""), ("console", "console"), ("output", "text"),
+    ("c++", "cpp"),
+    ("cxx", "cpp"),
+    ("python", "python"),
+    ("py", "python"),
+    ("javascript", "javascript"),
+    ("js", "javascript"),
+    ("typescript", "typescript"),
+    ("ts", "typescript"),
+    ("c#", "csharp"),
+    ("csharp", "csharp"),
+    ("cs", "csharp"),
+    ("c", "c"),
+    ("cpp", "cpp"),
+    ("java", "java"),
+    ("kotlin", "kotlin"),
+    ("scala", "scala"),
+    ("swift", "swift"),
+    ("go", "go"),
+    ("rust", "rust"),
+    ("ruby", "ruby"),
+    ("perl", "perl"),
+    ("php", "php"),
+    ("lua", "lua"),
+    ("r", "r"),
+    ("matlab", "matlab"),
+    ("haskell", "haskell"),
+    ("fortran", "fortran"),
+    ("pascal", "pascal"),
+    ("html", "html"),
+    ("xml", "xml"),
+    ("css", "css"),
+    ("json", "json"),
+    ("yaml", "yaml"),
+    ("yml", "yaml"),
+    ("toml", "toml"),
+    ("ini", "ini"),
+    ("bash", "bash"),
+    ("sh", "bash"),
+    ("shell", "bash"),
+    ("zsh", "bash"),
+    ("sql", "sql"),
+    ("makefile", "makefile"),
+    ("cmake", "cmake"),
+    ("diff", "diff"),
+    ("dockerfile", "docker"),
+    ("nginx", "nginx"),
+    ("tex", "latex"),
+    ("latex", "latex"),
+    ("plain", ""),
+    ("text", ""),
+    ("wikitext", ""),
+    ("wiki", ""),
+    ("console", "console"),
+    ("output", "text"),
 ];
 
 fn fence_lang(raw: &str) -> String {
@@ -68,13 +111,35 @@ fn heading_level(tag: &str) -> Option<u32> {
 
 /// Elements dropped with their entire contents (citation/maintenance/metadata).
 const DROP_CLASSES: &[&str] = &[
-    "reference", "noprint", "mw-editsection", "metadata", "shortdescription",
-    "mw-jump-link", "mw-indicators", "catlinks", "printfooter",
-    "mw-references-wrap", "reflist", "refbegin", "navbox", "sistersitebox",
-    "sidebar", "side-box", "ambox", "mw-empty-elt", "toc", "navbox-styles",
-    "thumb", "mw-editsection-bracket", "mw-ref", "referencetooltip",
-    "mw-cite-backlink", "hatnote-dummy", "ext-phonos",
-    "ext-phonos-PhonosButton", "ext-phonos-attribution",
+    "reference",
+    "noprint",
+    "mw-editsection",
+    "metadata",
+    "shortdescription",
+    "mw-jump-link",
+    "mw-indicators",
+    "catlinks",
+    "printfooter",
+    "mw-references-wrap",
+    "reflist",
+    "refbegin",
+    "navbox",
+    "sistersitebox",
+    "sidebar",
+    "side-box",
+    "ambox",
+    "mw-empty-elt",
+    "toc",
+    "navbox-styles",
+    "thumb",
+    "mw-editsection-bracket",
+    "mw-ref",
+    "referencetooltip",
+    "mw-cite-backlink",
+    "hatnote-dummy",
+    "ext-phonos",
+    "ext-phonos-PhonosButton",
+    "ext-phonos-attribution",
     // mwoffliner's JS-pagination placeholders around a category page's
     // member lists ("Next items are not visible in browsers without
     // Javascript"): browser noise, never content.
@@ -82,8 +147,18 @@ const DROP_CLASSES: &[&str] = &[
 ];
 
 const DROP_TAGS: &[&str] = &[
-    "style", "script", "link", "figcaption", "figure", "img", "gallery",
-    "input", "button", "audio", "video", "source",
+    "style",
+    "script",
+    "link",
+    "figcaption",
+    "figure",
+    "img",
+    "gallery",
+    "input",
+    "button",
+    "audio",
+    "video",
+    "source",
 ];
 
 /// True when `el` is a <math> element or contains one with a LaTeX source
@@ -93,9 +168,9 @@ fn carries_math(el: NodeRef) -> bool {
     if el.tag() == Some("math") {
         return true;
     }
-    el.find_all("math").iter().any(|m| {
-        m.attr("alttext").is_some() || m.attr("alt").is_some()
-    })
+    el.find_all("math")
+        .iter()
+        .any(|m| m.attr("alttext").is_some() || m.attr("alt").is_some())
 }
 
 /// True when this element and its contents vanish entirely.
@@ -122,15 +197,17 @@ pub(crate) fn is_dropped(el: NodeRef) -> bool {
     if el.has_any_class(DROP_CLASSES) {
         return true;
     }
-    if type_of.unwrap_or("").split_whitespace().any(|t| t == "mw:File") {
+    if type_of
+        .unwrap_or("")
+        .split_whitespace()
+        .any(|t| t == "mw:File")
+    {
         return true;
     }
     if let Some(sty) = style {
         // Only styled elements with a `display` in the style reach the
         // de-spaced copy the check needs.
-        if sty.contains("display")
-            && sty.replace(' ', "").contains("display:none")
-        {
+        if sty.contains("display") && sty.replace(' ', "").contains("display:none") {
             // MediaWiki renders formulas twice: a visible image fallback plus a
             // hidden MathML twin; a display:none element carrying <math>
             // survives so its alttext LaTeX can be extracted.
@@ -145,7 +222,10 @@ pub(crate) fn is_dropped(el: NodeRef) -> bool {
     if tag == "sup" {
         // Note-reference superscripts vanish with the References machinery.
         let ident = format!("{} {}", id.unwrap_or(""), class.unwrap_or(""));
-        if ["cite", "citation", "ref"].iter().any(|w| ident.contains(w)) {
+        if ["cite", "citation", "ref"]
+            .iter()
+            .any(|w| ident.contains(w))
+        {
             return true;
         }
         if el.find_all("a").iter().any(|a| {
@@ -174,7 +254,10 @@ fn is_wikidata_badge(el: NodeRef) -> bool {
         return false;
     }
     let parts = urlsplit(href);
-    if !matches!(parts.netloc.to_lowercase().as_str(), "wikidata.org" | "www.wikidata.org") {
+    if !matches!(
+        parts.netloc.to_lowercase().as_str(),
+        "wikidata.org" | "www.wikidata.org"
+    ) {
         return false;
     }
     if !parts.path.starts_with("/wiki/") {
@@ -186,9 +269,7 @@ fn is_wikidata_badge(el: NodeRef) -> bool {
 }
 
 /// Direct children of `el` that are rendered at all.
-pub(crate) fn renderable_children<'a>(
-    el: NodeRef<'a>,
-) -> impl Iterator<Item = NodeRef<'a>> + 'a {
+pub(crate) fn renderable_children<'a>(el: NodeRef<'a>) -> impl Iterator<Item = NodeRef<'a>> + 'a {
     el.children().filter(|c| c.is_element() && !is_dropped(*c))
 }
 
@@ -207,7 +288,11 @@ fn md_link_url(url: &str) -> String {
 
 /// (lead, core, trail) of `s`: the edge whitespace `s.trim()` cuts off.
 fn split_sides(s: &str) -> (&str, &str, &str) {
-    (&s[..s.len() - s.trim_start().len()], s.trim(), &s[s.trim_end().len()..])
+    (
+        &s[..s.len() - s.trim_start().len()],
+        s.trim(),
+        &s[s.trim_end().len()..],
+    )
 }
 
 /// Wrap contents in Markdown emphasis markers; edge whitespace moves
@@ -313,8 +398,8 @@ fn href_scheme(href: &str) -> Option<String> {
 
 /// URL-path extensions treated as media files: such anchors drop entirely.
 const MEDIA_URL_EXTS: &[&str] = &[
-    ".mp3", ".ogg", ".oga", ".spx", ".flac", ".wav", ".mid", ".midi",
-    ".opus", ".ogv", ".webm", ".mp4",
+    ".mp3", ".ogg", ".oga", ".spx", ".flac", ".wav", ".mid", ".midi", ".opus", ".ogv", ".webm",
+    ".mp4",
 ];
 
 fn seg_is_media(seg: &str) -> bool {
@@ -531,18 +616,50 @@ fn emph_is_whole(label: &str) -> Option<(&'static str, &str)> {
 
 /// Whitespace stranded before dropped-element punctuation is pulled up.
 fn drop_boundary_punct(tail: &str) -> bool {
-    tail.chars()
-        .next()
-        .map_or(false, |c| matches!(c, ';' | ':' | ',' | '.' | ')' | ']' | '!' | '?'))
+    tail.chars().next().map_or(false, |c| {
+        matches!(c, ';' | ':' | ',' | '.' | ')' | ']' | '!' | '?')
+    })
 }
 
 /// HTML block-level tags (what would start a new block when rendered).
 const BLOCK_LEVEL_TAGS: &[&str] = &[
-    "address", "article", "aside", "blockquote", "center", "details",
-    "dialog", "dir", "div", "dl", "dd", "dt", "fieldset", "figcaption",
-    "figure", "footer", "form", "h1", "h2", "h3", "h4", "h5", "h6",
-    "header", "hgroup", "hr", "li", "main", "menu", "nav", "ol", "p",
-    "pre", "section", "summary", "table", "ul",
+    "address",
+    "article",
+    "aside",
+    "blockquote",
+    "center",
+    "details",
+    "dialog",
+    "dir",
+    "div",
+    "dl",
+    "dd",
+    "dt",
+    "fieldset",
+    "figcaption",
+    "figure",
+    "footer",
+    "form",
+    "h1",
+    "h2",
+    "h3",
+    "h4",
+    "h5",
+    "h6",
+    "header",
+    "hgroup",
+    "hr",
+    "li",
+    "main",
+    "menu",
+    "nav",
+    "ol",
+    "p",
+    "pre",
+    "section",
+    "summary",
+    "table",
+    "ul",
 ];
 
 /// Classes whose template CSS overrides the tag's block display.
@@ -590,14 +707,22 @@ struct InlineCtx {
 impl InlineCtx {
     /// Inline text: verbatim when `no_escape` is set, else asterisk-escaped.
     fn text(&self, t: &str) -> String {
-        if self.no_escape { t.to_string() } else { escape_plain_asterisks(t) }
+        if self.no_escape {
+            t.to_string()
+        } else {
+            escape_plain_asterisks(t)
+        }
     }
 }
 
 /// The fresh context a link's own label renders in: verbatim text,
 /// emphasis stripped, no nested-link handling.
 fn link_label_ctx() -> InlineCtx {
-    InlineCtx { no_escape: true, in_link: true, ..Default::default() }
+    InlineCtx {
+        no_escape: true,
+        in_link: true,
+        ..Default::default()
+    }
 }
 
 /// Render one element (or text node) in inline context.
@@ -654,7 +779,13 @@ fn render_inline(node: NodeRef, ctx: InlineCtx) -> String {
         }
         "code" => {
             // fresh context: '*' verbatim, never inside a link label
-            let inner = render_children(node, InlineCtx { no_escape: true, ..Default::default() });
+            let inner = render_children(
+                node,
+                InlineCtx {
+                    no_escape: true,
+                    ..Default::default()
+                },
+            );
             let inner = inner.replace('\n', " ");
             let inner = inner.trim();
             if inner.is_empty() {
@@ -695,7 +826,11 @@ fn render_children(el: NodeRef, ctx: InlineCtx) -> String {
         if child.is_text() {
             continue; // the leading text or a tail consumed below
         }
-        let piece = if child.is_element() { render_inline(child, ctx) } else { String::new() };
+        let piece = if child.is_element() {
+            render_inline(child, ctx)
+        } else {
+            String::new()
+        };
         let tail = child.tail().unwrap_or("");
         // A block-level child starts a new block: keep one space between
         // the inline content before it and the block unless the HTML
@@ -754,7 +889,13 @@ fn anchor_md(
         if label_stripped.is_empty() || label_stripped == href {
             return format!("<{}>", href);
         }
-        return format!("{}[{}]({}){}", lead, label_stripped, md_link_url(href), trail);
+        return format!(
+            "{}[{}]({}){}",
+            lead,
+            label_stripped,
+            md_link_url(href),
+            trail
+        );
     }
 
     // internal link (or interwiki / fragment-only); the citation-residue
@@ -824,7 +965,14 @@ fn render_anchor(el: NodeRef, ctx: InlineCtx) -> String {
         }
     }
 
-    anchor_md(el, href, &label, emph_mark, ctx.in_link, ctx.keep_category_links)
+    anchor_md(
+        el,
+        href,
+        &label,
+        emph_mark,
+        ctx.in_link,
+        ctx.keep_category_links,
+    )
 }
 
 /// Render an element in inline context to markdown text (links,
@@ -882,8 +1030,19 @@ fn alpha_label(n: u64) -> String {
 /// 1 -> i, 4 -> iv, 9 -> ix, 14 -> xiv, 1994 -> mcmxciv, ...
 fn roman_label(n: u64) -> String {
     let table = [
-        (1000, "m"), (900, "cm"), (500, "d"), (400, "cd"), (100, "c"), (90, "xc"),
-        (50, "l"), (40, "xl"), (10, "x"), (9, "ix"), (5, "v"), (4, "iv"), (1, "i"),
+        (1000, "m"),
+        (900, "cm"),
+        (500, "d"),
+        (400, "cd"),
+        (100, "c"),
+        (90, "xc"),
+        (50, "l"),
+        (40, "xl"),
+        (10, "x"),
+        (9, "ix"),
+        (5, "v"),
+        (4, "iv"),
+        (1, "i"),
     ];
     let mut n = n.max(1);
     let mut out = String::new();
@@ -926,7 +1085,12 @@ pub(crate) fn list_item_lines_ctx(
     }
     let indent = "  ".repeat(depth);
     let br_mode = if raw { BrMode::Keep } else { BrMode::Space };
-    let ctx = InlineCtx { no_escape: raw, br_mode, keep_category_links, ..Default::default() };
+    let ctx = InlineCtx {
+        no_escape: raw,
+        br_mode,
+        keep_category_links,
+        ..Default::default()
+    };
     let mut out: Vec<String> = Vec::new();
     for li in list_el.children() {
         // Loose nesting (invalid HTML browsers still render as a nested
@@ -977,7 +1141,12 @@ pub(crate) fn list_item_lines_ctx(
             out.push(format!("{}{}{}", indent, marker, text));
         }
         for sub in subs {
-            out.extend(list_item_lines_ctx(sub, depth + 1, raw, keep_category_links));
+            out.extend(list_item_lines_ctx(
+                sub,
+                depth + 1,
+                raw,
+                keep_category_links,
+            ));
         }
     }
     out
@@ -996,7 +1165,13 @@ pub(crate) fn render_list_ctx(el: NodeRef, depth: usize, keep_category_links: bo
 
 /// [`inline_text`] carrying the enclosing render's keep-category-links flag.
 fn inline_text_keep(el: NodeRef, keep_category_links: bool) -> String {
-    render_inline(el, InlineCtx { keep_category_links, ..Default::default() })
+    render_inline(
+        el,
+        InlineCtx {
+            keep_category_links,
+            ..Default::default()
+        },
+    )
 }
 
 /// Definition list: <dt> -> `- **term**`, <dt>+<dd> -> `- **term**: def`,
@@ -1045,8 +1220,11 @@ pub(crate) fn render_dl_ctx(el: NodeRef, depth: usize, keep_category_links: bool
                 for sub in ch.children() {
                     match sub.kind() {
                         NodeKind::Text(t) => parts.push(escape_plain_asterisks(t)),
-                        NodeKind::Element { .. } if matches!(sub.tag(), Some("ul") | Some("ol")) => {}
-                        NodeKind::Element { .. } => parts.push(inline_text_keep(sub, keep_category_links)),
+                        NodeKind::Element { .. }
+                            if matches!(sub.tag(), Some("ul") | Some("ol")) => {}
+                        NodeKind::Element { .. } => {
+                            parts.push(inline_text_keep(sub, keep_category_links))
+                        }
                         _ => {}
                     }
                 }
@@ -1063,12 +1241,18 @@ pub(crate) fn render_dl_ctx(el: NodeRef, depth: usize, keep_category_links: bool
                 }
                 for sub in ch.element_children() {
                     if matches!(sub.tag(), Some("ul") | Some("ol")) && !is_dropped(sub) {
-                        push_sub(&mut out, render_list_ctx(sub, depth + 1, keep_category_links));
+                        push_sub(
+                            &mut out,
+                            render_list_ctx(sub, depth + 1, keep_category_links),
+                        );
                     }
                 }
             }
             Some("ul") | Some("ol") => {
-                push_sub(&mut out, render_list_ctx(ch, depth + 1, keep_category_links));
+                push_sub(
+                    &mut out,
+                    render_list_ctx(ch, depth + 1, keep_category_links),
+                );
             }
             Some("dl") => {
                 push_sub(&mut out, render_dl_ctx(ch, depth + 1, keep_category_links));
@@ -1085,7 +1269,11 @@ pub(crate) fn render_dl_ctx(el: NodeRef, depth: usize, keep_category_links: bool
 /// into the paragraph's inline context.
 fn render_paragraph(p: NodeRef, in_blockquote: bool, keep_category_links: bool) -> Vec<String> {
     let ctx = InlineCtx {
-        br_mode: if in_blockquote { BrMode::Nl } else { BrMode::Space },
+        br_mode: if in_blockquote {
+            BrMode::Nl
+        } else {
+            BrMode::Space
+        },
         keep_category_links,
         ..Default::default()
     };
@@ -1101,7 +1289,11 @@ fn render_paragraph(p: NodeRef, in_blockquote: bool, keep_category_links: bool) 
             segs.push(escape_plain_asterisks(ch.tail().unwrap_or("")));
             continue;
         }
-        let piece = if ch.is_element() { render_inline(ch, ctx) } else { String::new() };
+        let piece = if ch.is_element() {
+            render_inline(ch, ctx)
+        } else {
+            String::new()
+        };
         let tail = ch.tail().unwrap_or("");
         if piece.is_empty()
             && !tail.is_empty()
@@ -1114,7 +1306,9 @@ fn render_paragraph(p: NodeRef, in_blockquote: bool, keep_category_links: bool) 
         }
         segs.last_mut().unwrap().push_str(&piece);
         if !tail.is_empty() {
-            segs.last_mut().unwrap().push_str(&escape_plain_asterisks(tail));
+            segs.last_mut()
+                .unwrap()
+                .push_str(&escape_plain_asterisks(tail));
         }
     }
     let mut out: Vec<String> = Vec::new();
@@ -1171,17 +1365,17 @@ fn render_blockquote(bq: NodeRef, keep_category_links: bool) -> String {
 /// pruning then deleted the section's heading with it); rendering the nodes
 /// as separate blocks would instead mangle one sentence into one block per
 /// inline element. Everything else recurses into its children as blocks.
-fn render_block_container(
-    el: NodeRef,
-    in_blockquote: bool,
-    keep_category_links: bool,
-) -> String {
+fn render_block_container(el: NodeRef, in_blockquote: bool, keep_category_links: bool) -> String {
     if el.attr("role") == Some("note") || el.has_class("hatnote") {
         return render_hatnote(el, keep_category_links);
     }
     if !contains_block(el) {
         let p_lines = render_paragraph(el, in_blockquote, keep_category_links);
-        return if in_blockquote { p_lines.join("\n") } else { p_lines.join("\n\n") };
+        return if in_blockquote {
+            p_lines.join("\n")
+        } else {
+            p_lines.join("\n\n")
+        };
     }
     block_children_md(el, None, in_blockquote, keep_category_links)
 }
@@ -1218,7 +1412,11 @@ fn render_hatnote(el: NodeRef, keep_category_links: bool) -> String {
         .find_all("a")
         .iter()
         .any(|a| wiki_edit_target(a.attr("href").unwrap_or("")).is_some());
-    let txt = if has_edit { absorb_hatnote_mentions(&txt).trim().to_string() } else { txt };
+    let txt = if has_edit {
+        absorb_hatnote_mentions(&txt).trim().to_string()
+    } else {
+        txt
+    };
     if txt.is_empty() {
         return String::new();
     }
@@ -1277,7 +1475,9 @@ pub(crate) fn block_md_in(ch: NodeRef, in_blockquote: bool, keep_category_links:
         "blockquote" => render_blockquote(ch, keep_category_links),
         "pre" => render_pre(ch),
         "table" => tables::render_table(ch),
-        "span" => collapse_ws(&inline_text_keep(ch, keep_category_links)).trim().to_string(),
+        "span" => collapse_ws(&inline_text_keep(ch, keep_category_links))
+            .trim()
+            .to_string(),
         // Block-level anchor: inline anchor semantics (via anchor_md) with
         // the content rendered as inline text, the span arm's mechanism —
         // block containers walk element children only, so a bare <a> (a
@@ -1289,7 +1489,9 @@ pub(crate) fn block_md_in(ch: NodeRef, in_blockquote: bool, keep_category_links:
             if is_media_href(href) {
                 return String::new();
             }
-            let label = collapse_ws(&render_children(ch, link_label_ctx())).trim().to_string();
+            let label = collapse_ws(&render_children(ch, link_label_ctx()))
+                .trim()
+                .to_string();
             anchor_md(ch, href, &label, None, false, keep_category_links)
         }
         _ => render_block_container(ch, in_blockquote, keep_category_links),
@@ -1367,8 +1569,12 @@ fn get_parser_output(root: NodeRef) -> Option<NodeRef> {
 /// Normalize Parsoid-sectioned HTML back to the legacy flat shape: replace
 /// every <section> wrapper under the body container by its children.
 fn flatten_parsoid_sections(dom: &mut Dom, body: NodeId) {
-    let sections: Vec<NodeId> =
-        dom.ref_(body).find_all("section").into_iter().map(|n| n.id()).collect();
+    let sections: Vec<NodeId> = dom
+        .ref_(body)
+        .find_all("section")
+        .into_iter()
+        .map(|n| n.id())
+        .collect();
     for sec in sections {
         dom.replace_with_children(sec);
     }
@@ -1386,7 +1592,9 @@ fn first_h1_title(dom: &Dom) -> Option<String> {
 /// The rendered infoboxes as a '## Key facts' block ('' when none).
 fn key_facts_of(dom: &Dom, lang: Option<&str>) -> String {
     let boxes = crate::infobox_html::extract_infoboxes(dom);
-    crate::infobox_html::infoboxes_to_markdown(dom, &boxes, lang).trim().to_string()
+    crate::infobox_html::infoboxes_to_markdown(dom, &boxes, lang)
+        .trim()
+        .to_string()
 }
 
 /// First descendant element carrying the given id attribute.
@@ -1453,7 +1661,11 @@ fn categories_section(root: NodeRef, lang: Option<&str>) -> String {
     if bullets.is_empty() {
         return String::new();
     }
-    format!("## {}\n\n{}", crate::wikil10n::categories_title(lang), bullets.join("\n"))
+    format!(
+        "## {}\n\n{}",
+        crate::wikil10n::categories_title(lang),
+        bullets.join("\n")
+    )
 }
 
 /// Render the article body around the already-located container: Parsoid
@@ -1474,8 +1686,7 @@ fn render_article(
     lang: Option<&str>,
 ) -> String {
     flatten_parsoid_sections(&mut dom, body);
-    let body_md =
-        block_children_md(dom.ref_(body), Some(&key_facts), false, keep_category_links);
+    let body_md = block_children_md(dom.ref_(body), Some(&key_facts), false, keep_category_links);
     let content = cleanup::assemble(&body_md, lang);
     // The category page's member/subcategory section renders through the
     // same block walker as the body: its own <h2>Subcategories</h2> /
@@ -1490,7 +1701,9 @@ fn render_article(
     let generated = category_generated
         .map(|id| block_children_md(dom.ref_(id), None, false, true))
         .unwrap_or_default();
-    let title = title.map(|t| t.to_string()).or_else(|| first_h1_title(&dom));
+    let title = title
+        .map(|t| t.to_string())
+        .or_else(|| first_h1_title(&dom));
     let mut parts: Vec<String> = Vec::new();
     if let Some(t) = &title {
         parts.push(format!("# {}", t.trim()));
@@ -1542,12 +1755,19 @@ pub fn html_to_md(
 ) -> String {
     let mut dom = Dom::parse(html_str);
     let key_facts = key_facts_of(&dom, lang);
-    let categories =
-        if include_categories { categories_section(dom.root(), lang) } else { String::new() };
+    let categories = if include_categories {
+        categories_section(dom.root(), lang)
+    } else {
+        String::new()
+    };
     // The category page's member section: its node id must be located
     // before `dom` moves into render_article (only rendered when the flag
     // is on — the page's lists live outside the render root).
-    let category_generated = if include_categories { category_generated_id(&dom) } else { None };
+    let category_generated = if include_categories {
+        category_generated_id(&dom)
+    } else {
+        None
+    };
     // The wiki article container, else the page's <body>.
     let wiki_body = get_parser_output(dom.root()).map(|b| b.id());
     let body =
@@ -1667,7 +1887,10 @@ mod tests {
             None,
             false,
         );
-        assert_eq!(md, "# Head\n\nPara **bold**.\n\nSee [link](https://x.example/a?b=1&c=2).\n");
+        assert_eq!(
+            md,
+            "# Head\n\nPara **bold**.\n\nSee [link](https://x.example/a?b=1&c=2).\n"
+        );
     }
 
     #[test]
@@ -1721,7 +1944,8 @@ mod tests {
     /// must not also leak (flattened) into the definition text.
     #[test]
     fn dd_text_and_sublist_define_on_the_term_line_then_the_sublist() {
-        let md = wiki_doc("<dl><dt>T</dt><dd>Def <i>x</i><ul><li>s1</li><li>s2</li></ul></dd></dl>");
+        let md =
+            wiki_doc("<dl><dt>T</dt><dd>Def <i>x</i><ul><li>s1</li><li>s2</li></ul></dd></dl>");
         assert_eq!(md, "# T\n\n- **T**: Def *x*\n  - s1\n  - s2\n");
     }
 
@@ -1769,9 +1993,7 @@ mod tests {
     /// sub-items — only the item's own text survives.
     #[test]
     fn dropped_nested_list_in_a_li_is_dropped() {
-        let md = wiki_doc(
-            "<ul><li>a<ul style=\"display:none\"><li>h</li></ul></li></ul>",
-        );
+        let md = wiki_doc("<ul><li>a<ul style=\"display:none\"><li>h</li></ul></li></ul>");
         assert_eq!(md, "# T\n\n- a\n");
     }
 
@@ -1799,10 +2021,7 @@ mod tests {
         let md = wiki_doc(
             "<table><caption>Line one<br>Line two</caption><tr><th>H</th></tr><tr><td>a</td></tr></table>",
         );
-        assert_eq!(
-            md,
-            "# T\n\n*Line one Line two*\n\n| H |\n| --- |\n| a |\n"
-        );
+        assert_eq!(md, "# T\n\n*Line one Line two*\n\n| H |\n| --- |\n| a |\n");
     }
 
     /// Small tables are real content: a lone non-empty cell renders as a
@@ -1941,7 +2160,12 @@ mod tests {
     /// A non-wiki page renders from <body>; the text goes through the same
     /// block_children_md walk.
     fn body_doc(inner: &str) -> String {
-        html_to_md(&format!("<html><body>{inner}</body></html>"), Some("T"), None, false)
+        html_to_md(
+            &format!("<html><body>{inner}</body></html>"),
+            Some("T"),
+            None,
+            false,
+        )
     }
 
     /// Bare text directly inside a block container renders as its own
@@ -1964,10 +2188,7 @@ mod tests {
             "# T\n\n> Quoted without any p wrapper.\n"
         );
         // literal asterisks in unwrapped text still escape
-        assert_eq!(
-            body_doc("<div>2 * 3 = 6</div>"),
-            "# T\n\n2 \\* 3 = 6\n"
-        );
+        assert_eq!(body_doc("<div>2 * 3 = 6</div>"), "# T\n\n2 \\* 3 = 6\n");
     }
 
     /// A heading's section body of bare `<br>`-separated text survives:
@@ -2019,7 +2240,10 @@ mod tests {
             "# T\n\n- higher risk if you:\n  - overweight\n  - over 35\n\
              - gestational risk if you:\n  - after the 28th week\n"
         );
-        assert_eq!(body_doc("<ul><ul><li>orphan</li></ul></ul>"), "# T\n\n- orphan\n");
+        assert_eq!(
+            body_doc("<ul><ul><li>orphan</li></ul></ul>"),
+            "# T\n\n- orphan\n"
+        );
     }
 
     /// <ol> items number with a real counter honoring start/type/value the
@@ -2030,7 +2254,10 @@ mod tests {
             body_doc("<ol><li>First</li><li>Second</li></ol>"),
             "# T\n\n1. First\n2. Second\n"
         );
-        assert_eq!(body_doc("<ol start=\"3\"><li>Third</li></ol>"), "# T\n\n3. Third\n");
+        assert_eq!(
+            body_doc("<ol start=\"3\"><li>Third</li></ol>"),
+            "# T\n\n3. Third\n"
+        );
         assert_eq!(
             body_doc("<ol type=\"a\"><li>x</li><li>y</li></ol>"),
             "# T\n\na. x\nb. y\n"
@@ -2046,7 +2273,10 @@ mod tests {
             "# T\n\n1. a\n5. b\n6. c\n"
         );
         // unknown type falls back to decimal; alpha wraps past z
-        assert_eq!(body_doc("<ol type=\"?\" start=\"27\"><li>x</li></ol>"), "# T\n\n27. x\n");
+        assert_eq!(
+            body_doc("<ol type=\"?\" start=\"27\"><li>x</li></ol>"),
+            "# T\n\n27. x\n"
+        );
         assert_eq!(
             body_doc("<ol type=\"a\" start=\"26\"><li>x</li><li>y</li></ol>"),
             "# T\n\nz. x\naa. y\n"
@@ -2485,7 +2715,10 @@ mod tests {
         assert_eq!(md, "# T\n");
         let md = wiki_doc_with_tail(
             "",
-            &format!("<div class=\"mw-category-generated\">{}</div>", cat_pagination()),
+            &format!(
+                "<div class=\"mw-category-generated\">{}</div>",
+                cat_pagination()
+            ),
             None,
             true,
         );

@@ -330,8 +330,10 @@ pub static HTML5_ENTITIES: &[(&str, &str)] = &[
     ("NegativeVeryThinSpace;", "​"),
     ("NestedGreaterGreater;", "≫"),
     ("NestedLessLess;", "≪"),
-    ("NewLine;", "
-"),
+    (
+        "NewLine;", "
+",
+    ),
     ("Nfr;", "𝔑"),
     ("NoBreak;", "⁠"),
     ("NonBreakingSpace;", " "),

@@ -2,11 +2,11 @@
 //! (pipe/HTML tables, wrapper tables with nested tables, and the multicol
 //! layout-table flattening).
 
-use crate::htmldom::{NodeKind, NodeRef};
 use crate::html2md::{
     block_md, escape_plain_asterisks, inline_raw, inline_text, is_dropped, is_infobox_table,
     is_infobox_wrapper, list_item_lines, render_dl, renderable_children,
 };
+use crate::htmldom::{NodeKind, NodeRef};
 use crate::util::{collapse_ws, re};
 
 pub(crate) fn is_infobox_container(el: NodeRef) -> bool {
@@ -310,7 +310,11 @@ fn dl_bare_term_lines(dl: NodeRef) -> Option<Vec<String>> {
             lines.push(format!("**{}**", term));
         }
     }
-    if lines.is_empty() { None } else { Some(lines) }
+    if lines.is_empty() {
+        None
+    } else {
+        Some(lines)
+    }
 }
 
 /// One multicol table cell as block Markdown: the cell is a plain block
@@ -320,7 +324,9 @@ fn dl_bare_term_lines(dl: NodeRef) -> Option<Vec<String>> {
 fn cell_blocks_md(cell: NodeRef) -> String {
     let mut out: Vec<String> = Vec::new();
     let add_prose = |txt: Option<&str>, out: &mut Vec<String>| {
-        let t = txt.map(|t| collapse_ws(&escape_plain_asterisks(t))).unwrap_or_default();
+        let t = txt
+            .map(|t| collapse_ws(&escape_plain_asterisks(t)))
+            .unwrap_or_default();
         let t = t.trim();
         if !t.is_empty() {
             out.push(t.to_string());
@@ -410,7 +416,10 @@ pub(crate) fn render_table(tbl: NodeRef) -> String {
         .unzip();
     if rows.is_empty()
         || (as_html
-            && texts.iter().flatten().all(|t| t.split("<br>").all(|p| p.trim().is_empty())))
+            && texts
+                .iter()
+                .flatten()
+                .all(|t| t.split("<br>").all(|p| p.trim().is_empty())))
     {
         return nested_md;
     }

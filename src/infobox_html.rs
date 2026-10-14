@@ -4,8 +4,8 @@
 use std::collections::HashSet;
 
 use crate::cleanup;
-use crate::htmldom::{Dom, NodeId, NodeRef};
 use crate::html2md::{escape_plain_asterisks, is_dropped, render_inline_default, render_list};
+use crate::htmldom::{Dom, NodeId, NodeRef};
 use crate::tables::{own_table_rows, render_table, row_cells, top_level_tables};
 use crate::util::{collapse_ws, re};
 use crate::wikil10n;
@@ -23,8 +23,14 @@ const CAPTION_CLASSES: &[&str] = &[
 
 /// Class tokens marking map/media container structures.
 const MAP_CLASSES: &[&str] = &[
-    "maptable", "locmap", "switcher-container", "ib-settlement-cols",
-    "multiimageinner", "thumbinner", "legend", "legend-color",
+    "maptable",
+    "locmap",
+    "switcher-container",
+    "ib-settlement-cols",
+    "multiimageinner",
+    "thumbinner",
+    "legend",
+    "legend-color",
 ];
 
 /// Class tokens of MediaWiki's collapse-widget markup.
@@ -34,8 +40,12 @@ const EMPH_TAGS: &[&str] = &["b", "strong", "i", "em"];
 
 /// Class tokens marking an embedded table as office-group structured.
 const INFOBOX_ROW_CLASSES: &[&str] = &[
-    "infobox-above", "infobox-subheader", "infobox-header", "infobox-label",
-    "infobox-full-data", "infobox-below",
+    "infobox-above",
+    "infobox-subheader",
+    "infobox-header",
+    "infobox-label",
+    "infobox-full-data",
+    "infobox-below",
 ];
 
 fn is_media_el(el: NodeRef) -> bool {
@@ -47,7 +57,10 @@ fn is_media_el(el: NodeRef) -> bool {
     {
         return true;
     }
-    matches!(el.tag(), Some("img") | Some("figure") | Some("figcaption") | Some("audio") | Some("video"))
+    matches!(
+        el.tag(),
+        Some("img") | Some("figure") | Some("figcaption") | Some("audio") | Some("video")
+    )
 }
 
 /// Content excluded from visible-text walks: dropped elements, media
@@ -89,8 +102,7 @@ fn is_toggle_anchor(el: NodeRef) -> bool {
         return false;
     }
     let txt = collapse_ws(&el.text_content()).trim().to_string();
-    !txt.is_empty()
-        && re(r"(?i)^\(?\[?(?:more|less)(?:\.\.\.|…)?\)?\]?$").is_match(&txt)
+    !txt.is_empty() && re(r"(?i)^\(?\[?(?:more|less)(?:\.\.\.|…)?\)?\]?$").is_match(&txt)
 }
 
 /// A collapse-widget element: a classed toggle span or a
@@ -107,7 +119,10 @@ fn is_toggle_el(el: NodeRef) -> bool {
 fn is_residue_only(s: &str) -> bool {
     s.chars().all(|c| {
         c.is_whitespace()
-            || matches!(c, '(' | ')' | '[' | ']' | '\u{200b}' | '\u{200c}' | '\u{200d}' | '\u{feff}')
+            || matches!(
+                c,
+                '(' | ')' | '[' | ']' | '\u{200b}' | '\u{200c}' | '\u{200d}' | '\u{feff}'
+            )
     })
 }
 
@@ -117,7 +132,9 @@ fn is_residue_only(s: &str) -> bool {
 fn strip_toggles(dom: &mut Dom) {
     let root = dom.root().id();
     for tgl in element_ids(dom, is_toggle_el) {
-        let Some(par) = dom.parent_of(tgl) else { continue };
+        let Some(par) = dom.parent_of(tgl) else {
+            continue;
+        };
         dom.detach(tgl);
         dom.merge_text(par);
         let mut par = par;
@@ -144,17 +161,16 @@ fn element_ids(dom: &Dom, pred: impl Fn(NodeRef) -> bool) -> Vec<NodeId> {
 
 /// True when `el` carries inline emphasis or a collapse-widget element.
 fn needs_plain_copy(el: NodeRef) -> bool {
-    el.self_and_descendants()
-        .any(|e| {
-            if !e.is_element() {
-                return false;
-            }
-            let tag = e.tag().unwrap_or("");
-            if EMPH_TAGS.contains(&tag) || e.has_any_class(TOGGLE_CLASS_TOKENS) {
-                return true;
-            }
-            tag == "a" && is_toggle_anchor(e)
-        })
+    el.self_and_descendants().any(|e| {
+        if !e.is_element() {
+            return false;
+        }
+        let tag = e.tag().unwrap_or("");
+        if EMPH_TAGS.contains(&tag) || e.has_any_class(TOGGLE_CLASS_TOKENS) {
+            return true;
+        }
+        tag == "a" && is_toggle_anchor(e)
+    })
 }
 
 /// Unwrap all <b>/<strong>/<i>/<em> emphasis in the standalone copy.
@@ -193,16 +209,13 @@ fn top_lists<'a>(cell: NodeRef<'a>) -> Vec<NodeRef<'a>> {
             continue;
         }
         // nested when an ancestor below `cell` is itself list-ish
-        let nested = el
-            .ancestors()
-            .take_while(|p| p.id() != cell.id())
-            .any(|p| {
-                p.is_element()
-                    && matches!(
-                        p.tag(),
-                        Some("ul") | Some("ol") | Some("li") | Some("dl") | Some("dd") | Some("dt")
-                    )
-            });
+        let nested = el.ancestors().take_while(|p| p.id() != cell.id()).any(|p| {
+            p.is_element()
+                && matches!(
+                    p.tag(),
+                    Some("ul") | Some("ol") | Some("li") | Some("dl") | Some("dd") | Some("dt")
+                )
+        });
         if !nested {
             out.push(el);
         }
@@ -221,7 +234,10 @@ fn is_map_row(cell: NodeRef) -> bool {
 fn is_office_table(tbl: NodeRef) -> bool {
     let mut hits = 0;
     for tr in own_table_rows(tbl) {
-        if row_cells(tr).iter().any(|c| c.has_any_class(INFOBOX_ROW_CLASSES)) {
+        if row_cells(tr)
+            .iter()
+            .any(|c| c.has_any_class(INFOBOX_ROW_CLASSES))
+        {
             hits += 1;
             if hits >= 2 {
                 return true;
@@ -324,14 +340,11 @@ fn is_context_row(cell: NodeRef) -> bool {
     if parts.iter().all(|(_, b, _)| *b) {
         return true;
     }
-    let lead: Vec<&(String, bool, bool)> =
-        parts.iter().filter(|(_, _, after)| !*after).collect();
+    let lead: Vec<&(String, bool, bool)> = parts.iter().filter(|(_, _, after)| !*after).collect();
     if saw_br && !lead.is_empty() && lead.iter().all(|(_, b, _)| *b) {
-        let lead_txt = collapse_ws(
-            &lead.iter().map(|(t, _, _)| t.as_str()).collect::<String>(),
-        )
-        .trim()
-        .to_string();
+        let lead_txt = collapse_ws(&lead.iter().map(|(t, _, _)| t.as_str()).collect::<String>())
+            .trim()
+            .to_string();
         return !lead_txt.is_empty();
     }
     false
@@ -398,7 +411,9 @@ fn subbox_title(tbl: NodeRef, above_text: &str, fallback: &str) -> String {
                     .map(|w| {
                         let mut c = w.chars();
                         match c.next() {
-                            Some(f) => f.to_uppercase().collect::<String>() + &c.as_str().to_lowercase(),
+                            Some(f) => {
+                                f.to_uppercase().collect::<String>() + &c.as_str().to_lowercase()
+                            }
                             None => String::new(),
                         }
                     })
@@ -503,7 +518,11 @@ fn v3_bloc_rows(wrapper: NodeRef) -> Vec<Row> {
 /// Cells of `rows[i + 1]`, or None (used for header/value lookahead).
 fn next_row_cells<'a>(rows: &'a [NodeRef<'a>], i: usize) -> Option<Vec<NodeRef<'a>>> {
     let cells = row_cells(*rows.get(i + 1)?);
-    if cells.is_empty() { None } else { Some(cells) }
+    if cells.is_empty() {
+        None
+    } else {
+        Some(cells)
+    }
 }
 
 /// True when `nxt` is ONE non-empty td value cell (not a context row):
@@ -617,7 +636,10 @@ fn collect_rows(
                 skip_next = true;
                 continue;
             }
-            items.push(Item::Header(Header { level: header_level, text: header_text(c0) }));
+            items.push(Item::Header(Header {
+                level: header_level,
+                text: header_text(c0),
+            }));
             for md in embedded_md {
                 items.push(Item::RawTable(md));
             }
@@ -645,7 +667,11 @@ fn collect_rows(
                         // the cell text ahead of the first sub-table
                         let lead = leading_text_before(c0, st.id());
                         if !lead.is_empty() {
-                            title = Some(collapse_ws(&escape_plain_asterisks(&lead)).trim().to_string());
+                            title = Some(
+                                collapse_ws(&escape_plain_asterisks(&lead))
+                                    .trim()
+                                    .to_string(),
+                            );
                         }
                     }
                     match title {
@@ -654,7 +680,10 @@ fn collect_rows(
                             collect_rows(&own, items, fallback_title, false, header_level);
                         }
                         Some(text) => {
-                            items.push(Item::Header(Header { level: header_level, text }));
+                            items.push(Item::Header(Header {
+                                level: header_level,
+                                text,
+                            }));
                             let own: Vec<NodeRef> = own_table_rows(*st)
                                 .into_iter()
                                 .filter(|tr| Some(tr.id()) != skip_tr)
@@ -672,7 +701,11 @@ fn collect_rows(
             continue;
         }
         // unknown row layout: try label/data, then full-data, else skip
-        let row = if cells.len() >= 2 { fact_row(c0, &cells[1..]) } else { full_data_row(c0) };
+        let row = if cells.len() >= 2 {
+            fact_row(c0, &cells[1..])
+        } else {
+            full_data_row(c0)
+        };
         if let Some(row) = row {
             items.push(Item::Row(row));
         }
@@ -689,7 +722,11 @@ fn parse_infobox_table(tbl: NodeRef, fallback_title: &str, above_text: &str) -> 
     Infobox {
         title: subbox_title(
             tbl,
-            if row_above_text.is_empty() { above_text } else { &row_above_text },
+            if row_above_text.is_empty() {
+                above_text
+            } else {
+                &row_above_text
+            },
             fallback_title,
         ),
         items,
@@ -760,7 +797,8 @@ pub(crate) fn extract_infoboxes(dom: &Dom) -> Vec<Infobox> {
         }
         if !top_tables.is_empty() {
             for (n, tbl) in top_tables.into_iter().enumerate() {
-                let mut b = parse_infobox_table(tbl, &fallback_title, if n == 0 { &above } else { "" });
+                let mut b =
+                    parse_infobox_table(tbl, &fallback_title, if n == 0 { &above } else { "" });
                 if n == 0 {
                     b.items.extend(bloc_rows.iter().cloned().map(Item::Row));
                 }
@@ -768,7 +806,11 @@ pub(crate) fn extract_infoboxes(dom: &Dom) -> Vec<Infobox> {
             }
         } else if !bloc_rows.is_empty() {
             boxes.push(Infobox {
-                title: if above.is_empty() { fallback_title.clone() } else { above.clone() },
+                title: if above.is_empty() {
+                    fallback_title.clone()
+                } else {
+                    above.clone()
+                },
                 items: bloc_rows.into_iter().map(Item::Row).collect(),
             });
         }
@@ -848,7 +890,11 @@ fn append_row(dom: &Dom, lines: &mut Vec<String>, row: &Row, indent: usize) {
                 render_list(dom.ref_(*le), 0)
             };
             if !md.is_empty() {
-                items.extend(md.split('\n').filter(|l| !l.trim().is_empty()).map(String::from));
+                items.extend(
+                    md.split('\n')
+                        .filter(|l| !l.trim().is_empty())
+                        .map(String::from),
+                );
             }
         }
         if items.is_empty() {
@@ -930,7 +976,10 @@ fn emit_items(dom: &Dom, lines: &mut Vec<String>, items: &[&Item]) {
         match item {
             Item::Header(h) => {
                 if !h.text.is_empty() {
-                    emit_heading(lines, format!("{} {}", "#".repeat(h.level as usize), &h.text));
+                    emit_heading(
+                        lines,
+                        format!("{} {}", "#".repeat(h.level as usize), &h.text),
+                    );
                 }
                 anchor_open = false;
                 context_open = false;
@@ -988,7 +1037,10 @@ pub(crate) fn infoboxes_to_markdown(dom: &Dom, boxes: &[Infobox], lang: Option<&
     let rendered: Vec<(&Infobox, Vec<String>)> = boxes
         .iter()
         .map(|b| (b, box_lines(dom, &b.items)))
-        .filter(|(_, ln)| ln.iter().any(|l| !l.trim().is_empty() && !l.starts_with('#')))
+        .filter(|(_, ln)| {
+            ln.iter()
+                .any(|l| !l.trim().is_empty() && !l.starts_with('#'))
+        })
         .collect();
     if rendered.is_empty() {
         return String::new();
@@ -1003,7 +1055,11 @@ pub(crate) fn infoboxes_to_markdown(dom: &Dom, boxes: &[Infobox], lang: Option<&
                 &mut lines,
                 format!(
                     "### {}",
-                    if b.title.is_empty() { wikil10n::details_title(lang) } else { &b.title }
+                    if b.title.is_empty() {
+                        wikil10n::details_title(lang)
+                    } else {
+                        &b.title
+                    }
                 ),
             );
             lines.extend(b_lines.iter().cloned());
