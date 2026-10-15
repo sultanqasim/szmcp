@@ -7,7 +7,7 @@
 use html5ever::interface::tree_builder::{ElementFlags, NodeOrText, QuirksMode, TreeSink};
 use html5ever::tendril::{StrTendril, TendrilSink};
 use html5ever::{parse_document, Attribute, ExpandedName, ParseOpts, QualName};
-use std::cell::UnsafeCell;
+use std::cell::RefCell;
 use std::collections::HashMap;
 
 pub type NodeId = usize;
@@ -452,17 +452,38 @@ fn collect_text(node: &NodeRef<'_>, out: &mut String) {
 // copy pass used to normalize), template contents kept in a detached
 // fragment invisible to the converter, comments/PIs/doctypes as ignorable
 // nodes, element/attr names lower-cased for the consumer while the original
-// QualNames are kept beside the arena for the tree builder (foreign content
-// needs the case, e.g. svg foreignObject integration points).
+// QualName rides on each tree-builder handle for `elem_name` (foreign
+// content needs the case, e.g. svg foreignObject integration points).
 // ---------------------------------------------------------------------------
 
-#[derive(Clone, Copy, PartialEq, Eq)]
-struct H(NodeId);
+/// A tree-builder handle. Element handles carry the element's original
+/// (case-preserving) [`QualName`] so [`TreeSink::elem_name`] can return the
+/// trait's borrowed `ExpandedName<'a>`: that borrow is tied to `&self` as
+/// well as to the handle, so it cannot be read out of sink state behind a
+/// `RefCell` guard (a guard cannot outlive its scope) — it must be
+/// reachable through the handle itself. This is exactly the trick `RcDom`'s
+/// `Rc<Node>` handles play, minus the reference counting. Handles for the
+/// document, comments, PIs and template-contents fragments carry a
+/// placeholder the tree builder never reads.
+#[derive(Clone)]
+struct H(NodeId, QualName);
+
+/// Handles are identified by their node id alone; the carried name is
+/// immutable per id, so it can never make two same-node handles differ.
+impl PartialEq for H {
+    fn eq(&self, other: &Self) -> bool {
+        self.0 == other.0
+    }
+}
+impl Eq for H {}
+impl std::hash::Hash for H {
+    fn hash<Hs: std::hash::Hasher>(&self, state: &mut Hs) {
+        std::hash::Hash::hash(&self.0, state);
+    }
+}
 
 struct SinkInner {
     nodes: Vec<Node>,
-    /// original QualName per node (placeholder for non-elements, never read)
-    names: Vec<QualName>,
     /// element id -> detached template-contents fragment (rare)
     tcontents: HashMap<NodeId, NodeId>,
     /// element id -> MathML annotation-xml integration point (rare)
@@ -477,11 +498,6 @@ impl SinkInner {
             parent: None,
             children: Vec::new(),
         });
-        self.names.push(QualName::new(
-            None,
-            html5ever::ns!(),
-            html5ever::local_name!(""),
-        ));
         id
     }
 
@@ -490,15 +506,21 @@ impl SinkInner {
     }
 }
 
-/// The html5ever 0.39 tree builder drives every [`TreeSink`] method through
-/// `&self` while mutating the tree. That is sound here because the sink is
-/// a `parse()`-local object whose only client is the parser's single-threaded
-/// driver — no handle, reference or clone of it ever escapes, and `finish()`
-/// consumes it — so the `UnsafeCell` just provides the `&mut` access that a
-/// `&self` API hides; a `RefCell` would add per-access borrow bookkeeping to
-/// a borrow pattern that is statically exclusive anyway.
+/// html5ever's [`TreeSink`] takes `&self` on every mutating method — its own
+/// `RcDom` mutates through `Rc`/`RefCell` interior mutability — so the arena
+/// is mutated through a `RefCell` the same way. That is entirely safe here:
+/// the sink is a `parse()`-local object whose only client is the tree
+/// builder's single-threaded driver, `finish()` consumes it, and no handle
+/// or reference to it ever escapes, so every `borrow_mut()` succeeds (a
+/// nested-borrow mistake would panic loudly, never corrupt memory).
+///
+/// The one borrow the sink hands back out, `elem_name`'s `ExpandedName<'a>`,
+/// is tied to `&self` as well as to the handle — too long to be read out
+/// from behind a `RefCell` guard — so it borrows the element's original
+/// [`QualName`] on the tree builder's own handle (see [`H`]) instead of any
+/// sink state.
 struct ArenaSink {
-    inner: UnsafeCell<SinkInner>,
+    inner: RefCell<SinkInner>,
 }
 
 impl ArenaSink {
@@ -509,32 +531,21 @@ impl ArenaSink {
             parent: None,
             children: Vec::new(),
         });
-        let mut names = Vec::with_capacity(cap);
-        names.push(QualName::new(
-            None,
-            html5ever::ns!(),
-            html5ever::local_name!(""),
-        ));
         ArenaSink {
-            inner: UnsafeCell::new(SinkInner {
+            inner: RefCell::new(SinkInner {
                 nodes,
-                names,
                 tcontents: HashMap::new(),
                 mip: HashMap::new(),
             }),
         }
     }
+}
 
-    fn inner(&self) -> &SinkInner {
-        unsafe { &*self.inner.get() }
-    }
-
-    // SAFETY: `inner` is an `UnsafeCell`; all `TreeSink` methods that mutate
-    // through `mut_inner` are the only mutators and never hold an alias.
-    #[allow(clippy::mut_from_ref)]
-    fn mut_inner(&self) -> &mut SinkInner {
-        unsafe { &mut *self.inner.get() }
-    }
+/// A QualName the tree builder never reads via `elem_name` (the document,
+/// comments, PIs and template-contents fragments are never asked for a
+/// name); it just fills out the handle.
+fn placeholder_name() -> QualName {
+    QualName::new(None, html5ever::ns!(), html5ever::local_name!(""))
 }
 
 impl TreeSink for ArenaSink {
@@ -553,7 +564,7 @@ impl TreeSink for ArenaSink {
     fn parse_error(&self, _msg: std::borrow::Cow<'static, str>) {}
 
     fn get_document(&self) -> H {
-        H(0)
+        H(0, placeholder_name())
     }
 
     fn set_quirks_mode(&self, _mode: QuirksMode) {}
@@ -563,18 +574,19 @@ impl TreeSink for ArenaSink {
     }
 
     fn elem_name<'a>(&'a self, target: &'a H) -> ExpandedName<'a> {
-        self.inner().names[target.0].expanded()
+        // The name is borrowed through the handle the tree builder itself
+        // holds, so the returned borrow needs nothing from `self` — see `H`.
+        target.1.expanded()
     }
 
     fn create_element(&self, name: QualName, attrs: Vec<Attribute>, flags: ElementFlags) -> H {
-        let inner = self.mut_inner();
+        let mut inner = self.inner.borrow_mut();
         let tag = lower_name(&name.local);
         let attrs: Vec<(String, String)> = attrs
             .into_iter()
             .map(|a| (lower_name(&a.name.local), a.value.to_string()))
             .collect();
         let id = inner.push_node(NodeKind::Element { tag, attrs });
-        inner.names[id] = name;
         if flags.template {
             let tid = inner.push_node(NodeKind::Document);
             inner.tcontents.insert(id, tid);
@@ -582,15 +594,24 @@ impl TreeSink for ArenaSink {
         if flags.mathml_annotation_xml_integration_point {
             inner.mip.insert(id, true);
         }
-        H(id)
+        // The original (case-preserving) name rides on the handle: elem_name
+        // must return a borrow tied to `&self`/`&H`, which sink state behind
+        // a RefCell cannot provide — see `H`.
+        H(id, name)
     }
 
     fn create_comment(&self, _text: StrTendril) -> H {
-        H(self.mut_inner().push_node(NodeKind::Comment))
+        H(
+            self.inner.borrow_mut().push_node(NodeKind::Comment),
+            placeholder_name(),
+        )
     }
 
     fn create_pi(&self, _target: StrTendril, _data: StrTendril) -> H {
-        H(self.mut_inner().push_node(NodeKind::Comment))
+        H(
+            self.inner.borrow_mut().push_node(NodeKind::Comment),
+            placeholder_name(),
+        )
     }
 
     fn append_doctype_to_document(
@@ -599,14 +620,14 @@ impl TreeSink for ArenaSink {
         _public_id: StrTendril,
         _system_id: StrTendril,
     ) {
-        let inner = self.mut_inner();
+        let mut inner = self.inner.borrow_mut();
         let id = inner.push_node(NodeKind::Comment);
         inner.nodes[id].parent = Some(0);
         inner.nodes[0].children.push(id);
     }
 
     fn append(&self, parent: &H, child: NodeOrText<H>) {
-        let inner = self.mut_inner();
+        let mut inner = self.inner.borrow_mut();
         let pid = parent.0;
         match child {
             NodeOrText::AppendText(text) => {
@@ -629,7 +650,7 @@ impl TreeSink for ArenaSink {
     }
 
     fn append_before_sibling(&self, sibling: &H, child: NodeOrText<H>) {
-        let inner = self.mut_inner();
+        let mut inner = self.inner.borrow_mut();
         let sid = sibling.0;
         let (pid, i) = {
             let p = inner.nodes[sid]
@@ -668,7 +689,7 @@ impl TreeSink for ArenaSink {
     }
 
     fn append_based_on_parent_node(&self, element: &H, prev_element: &H, child: NodeOrText<H>) {
-        let has_parent = self.inner().nodes[element.0].parent.is_some();
+        let has_parent = self.inner.borrow().nodes[element.0].parent.is_some();
         if has_parent {
             self.append_before_sibling(element, child);
         } else {
@@ -677,15 +698,19 @@ impl TreeSink for ArenaSink {
     }
 
     fn get_template_contents(&self, target: &H) -> H {
-        H(*self
-            .inner()
-            .tcontents
-            .get(&target.0)
-            .expect("not a template element!"))
+        H(
+            *self
+                .inner
+                .borrow()
+                .tcontents
+                .get(&target.0)
+                .expect("not a template element!"),
+            placeholder_name(),
+        )
     }
 
     fn add_attrs_if_missing(&self, target: &H, attrs: Vec<Attribute>) {
-        let inner = self.mut_inner();
+        let mut inner = self.inner.borrow_mut();
         let NodeKind::Element {
             attrs: existing, ..
         } = &mut inner.nodes[target.0].kind
@@ -702,7 +727,7 @@ impl TreeSink for ArenaSink {
     }
 
     fn remove_from_parent(&self, target: &H) {
-        let inner = self.mut_inner();
+        let mut inner = self.inner.borrow_mut();
         let Some(oldp) = inner.nodes[target.0].parent.take() else {
             return;
         };
@@ -717,7 +742,7 @@ impl TreeSink for ArenaSink {
     }
 
     fn reparent_children(&self, node: &H, new_parent: &H) {
-        let inner = self.mut_inner();
+        let mut inner = self.inner.borrow_mut();
         let children = std::mem::take(&mut inner.nodes[node.0].children);
         for &c in &children {
             inner.nodes[c].parent = Some(new_parent.0);
@@ -727,6 +752,62 @@ impl TreeSink for ArenaSink {
     }
 
     fn is_mathml_annotation_xml_integration_point(&self, handle: &H) -> bool {
-        *self.inner().mip.get(&handle.0).unwrap_or(&false)
+        *self.inner.borrow().mip.get(&handle.0).unwrap_or(&false)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A synthetic page with the shapes the sink must get right: attributes,
+    /// merged text runs, tails, nesting, entities, doctype. Sized by `divs`.
+    fn synthetic_page(divs: usize) -> String {
+        let mut html = String::with_capacity(divs * 64);
+        html.push_str("<!doctype html><html><body>");
+        for i in 0..divs {
+            html.push_str(&format!(
+                "<div class=\"c{}\" data-i=\"{}\"><p>hello <b>world</b> &amp; more</p></div>",
+                i % 7,
+                i
+            ));
+        }
+        html.push_str("</body></html>");
+        html
+    }
+
+    /// Shape parity over a tiny page (cheap; runs with the normal suite).
+    #[test]
+    fn parse_shape() {
+        let html = synthetic_page(3);
+        let dom = Dom::parse(&html);
+        assert_eq!(dom.root().find_all("div").len(), 3);
+        assert_eq!(dom.root().find_all("p").len(), 3);
+        let p = dom.root().find("p").unwrap();
+        assert_eq!(p.text(), Some("hello "));
+        let b = p.find("b").unwrap();
+        assert_eq!(b.text_content(), "world");
+        assert_eq!(b.tail(), Some(" & more"));
+    }
+
+    /// Explicit A/B timing for sink changes; never runs by default:
+    /// `cargo test --release parse_large_document -- --ignored --nocapture`
+    #[test]
+    #[ignore = "expensive; run explicitly when timing sink changes"]
+    fn parse_large_document() {
+        let html = synthetic_page(20_000);
+        let mut best = None;
+        for _ in 0..5 {
+            let t = std::time::Instant::now();
+            let dom = Dom::parse(&html);
+            let dt = t.elapsed();
+            assert_eq!(dom.root().find_all("div").len(), 20_000);
+            best = Some(best.map_or(dt, |b: std::time::Duration| b.min(dt)));
+        }
+        println!(
+            "parsed {} KiB five times; best {:?}",
+            html.len() / 1024,
+            best.unwrap()
+        );
     }
 }
