@@ -219,7 +219,7 @@ fn push_node(nodes: &mut Vec<Node>, kind: NodeKind) -> NodeId {
 
 /// Merge adjacent text children (html5ever already merges, this is a
 /// belt-and-braces pass over the materialized arena).
-fn merge_sibling_text(nodes: &mut Vec<Node>, parent: NodeId) {
+fn merge_sibling_text(nodes: &mut [Node], parent: NodeId) {
     let children = std::mem::take(&mut nodes[parent].children);
     let mut merged: Vec<NodeId> = Vec::with_capacity(children.len());
     for child in children {
@@ -529,6 +529,9 @@ impl ArenaSink {
         unsafe { &*self.inner.get() }
     }
 
+    // SAFETY: `inner` is an `UnsafeCell`; all `TreeSink` methods that mutate
+    // through `mut_inner` are the only mutators and never hold an alias.
+    #[allow(clippy::mut_from_ref)]
     fn mut_inner(&self) -> &mut SinkInner {
         unsafe { &mut *self.inner.get() }
     }

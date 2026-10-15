@@ -74,7 +74,7 @@ fn heading_level(t: &str) -> u8 {
     if (1..=6).contains(&hashes)
         && t.as_bytes()
             .get(hashes)
-            .map_or(true, |b| b.is_ascii_whitespace())
+            .is_none_or(|b| b.is_ascii_whitespace())
     {
         hashes as u8
     } else {
@@ -307,7 +307,7 @@ fn heading_key(s: &str) -> String {
     let no_markers: String = s.chars().filter(|&c| c != '*' && c != '`').collect();
     // An even number of `_` markers reads as paired emphasis (`_like this_`)
     // and is dropped; a lone one is subscript math and stays.
-    let text = if no_markers.matches('_').count() % 2 == 0 {
+    let text = if no_markers.matches('_').count().is_multiple_of(2) {
         no_markers.replace('_', "")
     } else {
         no_markers

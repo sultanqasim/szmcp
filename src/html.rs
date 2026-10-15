@@ -16,12 +16,9 @@ fn find_ci(hay: &[u8], from: usize, needle: &[u8]) -> Option<usize> {
         // byte per position instead of comparing the whole needle, which
         // keeps the long close-tag scans (a heading's `</hN>` can lie tens
         // of kilobytes away) cheap.
-        let Some(step) = hay[i..=limit]
+        let step = hay[i..=limit]
             .iter()
-            .position(|&c| c.eq_ignore_ascii_case(&first))
-        else {
-            return None;
-        };
+            .position(|&c| c.eq_ignore_ascii_case(&first))?;
         i += step;
         if hay[i..i + needle.len()].eq_ignore_ascii_case(needle) {
             return Some(i);

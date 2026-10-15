@@ -306,7 +306,8 @@ fn parse_blob_spans(data: &[u8], sz: usize) -> io::Result<Vec<(u64, u64)>> {
         ));
     }
     let tbl_size = table_int(data, 0, sz);
-    if tbl_size < sz as u64 || tbl_size % sz as u64 != 0 || tbl_size as usize > data.len() {
+    if tbl_size < sz as u64 || !tbl_size.is_multiple_of(sz as u64) || tbl_size as usize > data.len()
+    {
         return Err(io::Error::new(
             ErrorKind::InvalidData,
             "malformed cluster blob table",
@@ -591,7 +592,7 @@ impl Zim {
                 candidates.push((ns, path.to_string())); // old scheme
             }
         }
-        for ns in [b'C', b'A'] {
+        for ns in *b"CA" {
             candidates.push((ns, path.to_string()));
             candidates.push((ns, format!("{}/{}", ns as char, path)));
         }
@@ -694,7 +695,7 @@ impl Zim {
         // The decompressed data starts with the blob-offset table, whose
         // first entry gives the table's own byte size; blob data follows.
         let tbl_size = table_int(dec.decode_to(sz as u64)?, 0, sz);
-        if tbl_size < sz as u64 || tbl_size % sz as u64 != 0 {
+        if tbl_size < sz as u64 || !tbl_size.is_multiple_of(sz as u64) {
             return Err(io::Error::new(
                 ErrorKind::InvalidData,
                 "malformed cluster blob table",
@@ -808,7 +809,7 @@ impl Zim {
             // total payload size (each offset carries that size as delta), so
             // the full decode length is known from the table alone.
             let tbl_size = table_int(dec.decode_to(sz as u64)?, 0, sz);
-            if tbl_size < sz as u64 || tbl_size % sz as u64 != 0 {
+            if tbl_size < sz as u64 || !tbl_size.is_multiple_of(sz as u64) {
                 return Err(io::Error::new(
                     ErrorKind::InvalidData,
                     "malformed cluster blob table",
@@ -1009,6 +1010,10 @@ pub struct Archive {
     xapian_pool: Mutex<Vec<XapianHandles>>,
 }
 
+/// Article preview content: the raw entry title, the MIME type, and the
+/// content prefix (as returned by `Archive::article_preview`).
+type ArticlePreview = (String, Option<String>, Vec<u8>);
+
 impl Archive {
     pub fn new(name: String, zim: Zim) -> Self {
         Self {
@@ -1186,7 +1191,7 @@ impl Archive {
         &self,
         path: &str,
         max_bytes: u64,
-    ) -> io::Result<Option<(String, Option<String>, Vec<u8>)>> {
+    ) -> io::Result<Option<ArticlePreview>> {
         let Some(idx) = self.zim.resolve_path(path)? else {
             return Ok(None);
         };
@@ -1309,10 +1314,10 @@ impl ZimLibrary {
 
     /// The loaded archive whose name (relative to the ZIM directory) is `name`
     /// - the form search results report and zim_list will list. The name must
-    /// stay inside the directory: a `..` component, an absolute path, or an
-    /// empty string yields `None` (traversal outside the ZIM directory is
-    /// refused), while symlinks are fine because the scan records the
-    /// directory-entry name the symlink shows. `./` prefixes are trimmed.
+    ///   stay inside the directory: a `..` component, an absolute path, or an
+    ///   empty string yields `None` (traversal outside the ZIM directory is
+    ///   refused), while symlinks are fine because the scan records the
+    ///   directory-entry name the symlink shows. `./` prefixes are trimmed.
     pub fn archive(&self, name: &str) -> Option<&Arc<Archive>> {
         let wanted = name.trim().trim_start_matches("./");
         if wanted.is_empty()
@@ -1341,10 +1346,9 @@ fn zim_archive_name(name: &std::ffi::OsStr) -> Option<String> {
     let s = name.to_string_lossy();
     if let Some(stripped) = s.strip_suffix(".zim") {
         Some(format!("{stripped}.zim"))
-    } else if let Some(stripped) = s.strip_suffix(".zimaa") {
-        Some(format!("{stripped}.zim"))
     } else {
-        None
+        s.strip_suffix(".zimaa")
+            .map(|stripped| format!("{stripped}.zim"))
     }
 }
 

@@ -651,7 +651,7 @@ fn random_uuid() -> [u8; 16] {
 
 /// `zim::stripMimeParameters`: cut at the first `;`, space or tab.
 fn strip_mime_parameters(raw: &str) -> &str {
-    match raw.find(|c| c == ';' || c == ' ' || c == '\t') {
+    match raw.find([';', ' ', '\t']) {
         Some(i) => &raw[..i],
         None => raw,
     }
@@ -731,7 +731,7 @@ impl ZimCreator {
         let idx = self.mime_by_idx.len().try_into().map_err(|_| {
             io::Error::new(io::ErrorKind::InvalidData, "too many distinct mime types")
         })?;
-        if idx >= u16::MAX {
+        if idx == u16::MAX {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "too many distinct mime types",
@@ -746,16 +746,17 @@ impl ZimCreator {
     fn add_or_update(&mut self, ns: u8, path: &str, data: Dirent) -> io::Result<()> {
         let key = (ns, path.to_string());
         match self.dirents.get(&key) {
-            Some(existing) if !matches!(data.kind, DirentKind::Placeholder) => {
-                if !matches!(existing.kind, DirentKind::Placeholder) {
-                    return Err(io::Error::new(
-                        io::ErrorKind::AlreadyExists,
-                        format!(
-                            "Impossible to add {}/{}: a dirent with that path already exists",
-                            ns as char, path
-                        ),
-                    ));
-                }
+            Some(existing)
+                if !matches!(data.kind, DirentKind::Placeholder)
+                    && !matches!(existing.kind, DirentKind::Placeholder) =>
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::AlreadyExists,
+                    format!(
+                        "Impossible to add {}/{}: a dirent with that path already exists",
+                        ns as char, path
+                    ),
+                ));
             }
             _ => {}
         }
@@ -1057,6 +1058,7 @@ impl ZimCreator {
     /// synthetic test archives, which carry `M/` metadata and old-scheme
     /// namespace entries). libzim's user-facing `addItem` is C-only; the
     /// `M/Counter` tally therefore counts C-namespace items only.
+    #[allow(clippy::too_many_arguments)] // mirrors libzim's addItem: every parameter maps 1:1
     pub(crate) fn add_item_in_namespace(
         &mut self,
         ns: u8,
@@ -1483,18 +1485,13 @@ impl ZimCreator {
         // libzim: addOrUpdate(Dirent(NS::C, targetPath)) — creates the target
         // placeholder only when no dirent exists there yet.
         let target_key = (b'C', target_path.to_string());
-        if !self.dirents.contains_key(&target_key) {
-            self.dirents.insert(
-                target_key,
-                Dirent {
-                    kind: DirentKind::Placeholder,
-                    title: String::new(),
-                    front_article: false,
-                    idx: 0,
-                    removed: false,
-                },
-            );
-        }
+        self.dirents.entry(target_key).or_insert_with(|| Dirent {
+            kind: DirentKind::Placeholder,
+            title: String::new(),
+            front_article: false,
+            idx: 0,
+            removed: false,
+        });
         self.add_or_update(
             b'C',
             path,
@@ -1810,16 +1807,16 @@ impl ZimCreator {
         let keys: Vec<(u8, String)> = self.dirents.keys().cloned().collect();
         let mut dangling: Vec<(u8, String)> = Vec::new();
         for key in &keys {
-            match &self.dirents[key].kind {
-                DirentKind::Redirect { target } => {
-                    if let Some(t) = self.dirents.get(target) {
-                        if matches!(t.kind, DirentKind::Placeholder) {
-                            dangling.push(key.clone());
-                            dangling.push(target.clone());
-                        }
-                    }
-                }
-                _ => {}
+            let DirentKind::Redirect { target } = &self.dirents[key].kind else {
+                continue;
+            };
+            if self
+                .dirents
+                .get(target)
+                .is_some_and(|t| matches!(t.kind, DirentKind::Placeholder))
+            {
+                dangling.push(key.clone());
+                dangling.push(target.clone());
             }
         }
         for key in dangling {
@@ -1943,6 +1940,7 @@ mod tests {
     /// The header fields of a written archive, read straight from the bytes
     /// (the byte-level check on top of the shared `ZimHeader` type; the two
     /// old-scheme fields exist only in the raw layout).
+    #[allow(clippy::type_complexity)] // one flat 13-field tuple: the raw header layout
     fn raw_header(
         bytes: &[u8],
     ) -> (

@@ -438,6 +438,10 @@ fn path_title(path: &str) -> String {
         .replace('_', " ")
 }
 
+/// Title-tier results per archive: the archive plus its (path, title)
+/// candidate pairs, as gathered by `search`.
+type TitleLists<'a> = Vec<(&'a Arc<Archive>, Vec<(String, String)>)>;
+
 /// Search the ZIM files of the library - the pipeline behind the
 /// `zim_search` tool: ranked hits, best first, at most `limit` of them.
 /// `only` restricts the whole
@@ -530,7 +534,7 @@ pub fn search(
     // Tier 3 - the full-text tier: each archive's candidates are fetched
     // with its own BM25 ranking ([`FT_FETCH_PER_ARCHIVE`] of them) and
     // re-scored across archives with one BM25 over pooled statistics below.
-    let mut title_lists: Vec<(&Arc<Archive>, Vec<(String, String)>)> = Vec::new();
+    let mut title_lists: TitleLists<'_> = Vec::new();
     // Full-text tier: the archive's collection statistics plus its top
     // candidates with the per-term raw data pooled re-scoring needs
     // ([`FtArchive`]).

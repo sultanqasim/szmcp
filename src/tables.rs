@@ -44,7 +44,7 @@ pub(crate) fn top_level_tables(scope: NodeRef, keep: impl Fn(NodeRef) -> bool) -
 pub(crate) fn own_table_rows(tbl: NodeRef) -> Vec<NodeRef> {
     tbl.find_all("tr")
         .into_iter()
-        .filter(|tr| nearest_table(*tr).map_or(false, |t| t.id() == tbl.id()))
+        .filter(|tr| nearest_table(*tr).is_some_and(|t| t.id() == tbl.id()))
         .collect()
 }
 

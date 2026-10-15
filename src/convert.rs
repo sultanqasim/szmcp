@@ -638,7 +638,7 @@ fn add_and_pace(
     let Some(doc) = doc else { return Ok(()) };
     db.add_document(doc)
         .map_err(|e| format!("{add} {path:?}: {e}"))?;
-    if (docs.fetch_add(1, Ordering::Relaxed) + 1) % COMMIT_EVERY == 0 {
+    if (docs.fetch_add(1, Ordering::Relaxed) + 1).is_multiple_of(COMMIT_EVERY) {
         db.commit()
             .map_err(|e| format!("{what} index commit: {e}"))?;
     }
@@ -888,12 +888,12 @@ pub fn convert(
             });
         eprintln!("  {threads} conversion threads");
 
-        let mut shared = Shared::default();
         // One skip-tally slot per id in the archive's MIME list: skips
         // stay a single relaxed fetch-add.
-        shared.skipped = (0..mime_count as usize)
-            .map(|_| AtomicU64::new(0))
-            .collect();
+        let mut shared = Shared {
+            skipped: (0..mime_count as usize).map(|_| AtomicU64::new(0)).collect(),
+            ..Default::default()
+        };
         // Per-entry records, preallocated exactly once for the LIMIT (not
         // the full entry count): 12 bytes per entry is the dominant
         // constant-RAM structure (600 MB at 50M entries).
@@ -1180,7 +1180,7 @@ pub fn convert(
                     }
                     let Some(md) = convert_article_html(
                         &html,
-                        &item_path,
+                        item_path,
                         &title,
                         &conv_lang,
                         !exclude_categories,
@@ -1235,14 +1235,14 @@ pub fn convert(
                             Some(
                                 build_fulltext_document(
                                     &lang,
-                                    &item_path,
+                                    item_path,
                                     &folded_title,
                                     &folded_content,
                                 )
                                 .map_err(|e| format!("indexing {item_path:?}: {e}"))?,
                             )
                         };
-                        let ti_doc = build_title_document(&lang, &item_path, &title, None)
+                        let ti_doc = build_title_document(&lang, item_path, &title, None)
                             .map_err(|e| format!("title indexing {item_path:?}: {e}"))?;
                         doc_tx
                             .send((ft_doc, Some(ti_doc), item_path.to_string()))
@@ -1365,7 +1365,7 @@ pub fn convert(
                 ti.add_document(&doc)
                     .map_err(|e| format!("title indexing {:?}: {e}", entry.url))?;
                 added += 1;
-                if added % COMMIT_EVERY == 0 {
+                if added.is_multiple_of(COMMIT_EVERY) {
                     ti.commit()
                         .map_err(|e| format!("title index commit: {e}"))?;
                 }
@@ -1995,13 +1995,13 @@ mod e2e {
                 // Sorted dirent order: the 400 "Alias_" entries sort
                 // before every "Page_" entry (the archive is path-sorted;
                 // this IS the source member order, the source being sorted).
-                let idx = z.find_entry(b'C', &e.url).unwrap().unwrap();
+                let idx = z.find_entry(b'C', e.url).unwrap().unwrap();
                 assert_eq!(idx as usize, redirects.len() + i, "order for {}", e.url);
                 let entry = z.get_entry(idx).unwrap();
                 assert_eq!(z.mime_type(entry.mime), Some("text/markdown"));
             } else {
                 assert!(
-                    z.find_entry(b'C', &e.url).unwrap().is_none(),
+                    z.find_entry(b'C', e.url).unwrap().is_none(),
                     "{} skipped",
                     e.url
                 );
@@ -2537,7 +2537,7 @@ mod e2e {
         wdb.commit().unwrap();
         wdb.compact_to_path(dir.path().join("t.idx")).unwrap();
 
-        let db = xapian2::Database::open(&dir.path().join("t.idx")).unwrap();
+        let db = xapian2::Database::open(dir.path().join("t.idx")).unwrap();
         assert_eq!(db.doc_count(), 2);
         // The wordless title: collapsed to a single raw term, no anchor.
         assert_eq!(db.termfreq("!="), 1);

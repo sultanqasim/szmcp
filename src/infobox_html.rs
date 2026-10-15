@@ -947,9 +947,9 @@ fn group_segments(items: &[Item]) -> Vec<Vec<usize>> {
                     group = Some(segs.len() - 1);
                     top = None;
                     level = h.level;
-                } else {
+                } else if let Some(g) = group {
                     // deeper heading: stays inside the open group
-                    segs[group.unwrap()].push(i);
+                    segs[g].push(i);
                 }
             }
             _ => match group {
@@ -978,7 +978,7 @@ fn emit_items(dom: &Dom, lines: &mut Vec<String>, items: &[&Item]) {
                 if !h.text.is_empty() {
                     emit_heading(
                         lines,
-                        format!("{} {}", "#".repeat(h.level as usize), &h.text),
+                        format!("{} {}", "#".repeat(h.level as usize), h.text),
                     );
                 }
                 anchor_open = false;

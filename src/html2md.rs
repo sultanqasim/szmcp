@@ -382,10 +382,7 @@ fn href_scheme(href: &str) -> Option<String> {
         return None;
     }
     let head = &href[..i];
-    let ok = head
-        .chars()
-        .next()
-        .map_or(false, |c| c.is_ascii_alphabetic())
+    let ok = head.chars().next().is_some_and(|c| c.is_ascii_alphabetic())
         && head
             .chars()
             .all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.'));
@@ -616,9 +613,9 @@ fn emph_is_whole(label: &str) -> Option<(&'static str, &str)> {
 
 /// Whitespace stranded before dropped-element punctuation is pulled up.
 fn drop_boundary_punct(tail: &str) -> bool {
-    tail.chars().next().map_or(false, |c| {
-        matches!(c, ';' | ':' | ',' | '.' | ')' | ']' | '!' | '?')
-    })
+    tail.chars()
+        .next()
+        .is_some_and(|c| matches!(c, ';' | ':' | ',' | '.' | ')' | ']' | '!' | '?'))
 }
 
 /// HTML block-level tags (what would start a new block when rendered).
@@ -838,7 +835,7 @@ fn render_children(el: NodeRef, ctx: InlineCtx) -> String {
         if let Some(l) = last {
             if !piece.is_empty()
                 && !l.is_whitespace()
-                && !piece.chars().next().map_or(true, |c| c.is_whitespace())
+                && !piece.chars().next().is_none_or(|c| c.is_whitespace())
                 && child.is_element()
                 && starts_block(child)
             {
@@ -940,8 +937,8 @@ fn render_anchor(el: NodeRef, ctx: InlineCtx) -> String {
     if !ctx.in_link {
         let kids: Vec<NodeRef> = el.element_children().collect();
         if kids.len() == 1
-            && el.text().map_or(true, |t| t.trim().is_empty())
-            && kids[0].tail().map_or(true, |t| t.trim().is_empty())
+            && el.text().is_none_or(|t| t.trim().is_empty())
+            && kids[0].tail().is_none_or(|t| t.trim().is_empty())
         {
             emph_mark = match kids[0].tag() {
                 Some("i") | Some("em") => Some("*"),
@@ -1301,7 +1298,7 @@ fn render_paragraph(p: NodeRef, in_blockquote: bool, keep_category_links: bool) 
             && drop_boundary_punct(tail)
         {
             let last_seg = segs.last_mut().unwrap();
-            let keep = last_seg.trim_end_matches(|c| c == ' ' || c == '\t').len();
+            let keep = last_seg.trim_end_matches([' ', '\t']).len();
             last_seg.truncate(keep);
         }
         segs.last_mut().unwrap().push_str(&piece);
@@ -1675,6 +1672,7 @@ fn categories_section(root: NodeRef, lang: Option<&str>) -> String {
 /// inline contexts carry `keep_category_links` (true for ordinary articles
 /// when categories are included — a hatnote's "See also: Category:…"
 /// link survives; always true for the category page's member section).
+#[allow(clippy::too_many_arguments)] // flat context parameters of one HTML conversion pass
 fn render_article(
     mut dom: Dom,
     body: NodeId,

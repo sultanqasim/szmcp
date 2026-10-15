@@ -121,7 +121,7 @@ pub fn get_article(
 ) -> Result<ZimGetResult, ToolError> {
     let arc = find_archive(library, zim)?;
     // Accept a bare article title as well as a namespaced path.
-    let path = article_path(&path);
+    let path = article_path(path);
     let article = not_found_if_missing(arc.get_article(&path))?;
     if article.full_path.starts_with("X/") {
         return Err(ToolError::InvalidArgument(format!(

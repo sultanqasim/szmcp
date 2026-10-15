@@ -1054,8 +1054,8 @@ impl TermGenerator {
     /// values are kept; indexed terms accumulate on the copy the generator
     /// holds). Call this before each document's
     /// [`index_text_without_positions`][Self::index_text_without_positions]
-    /// - the generator counts every indexed term toward the current
-    /// document's length otherwise.
+    ///     - the generator counts every indexed term toward the current
+    ///       document's length otherwise.
     pub fn set_document(&mut self, doc: &Document) -> Result<()> {
         // SAFETY: both handles are valid for the duration of the call.
         let status = unsafe { ffi::xapian2_tg_set_document(self.handle(), doc.handle()) };

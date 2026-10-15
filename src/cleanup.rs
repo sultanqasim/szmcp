@@ -23,12 +23,13 @@ pub(crate) fn is_dropped_section(heading: &str, lang: Option<&str>) -> bool {
         || crate::wikil10n::extra_drop_sections(lang).contains(&norm.as_str())
 }
 
+/// The split block stream: the intro blocks plus the kept sections, each
+/// recorded as (level, heading, body lines).
+type SectionSplit = (Vec<String>, Vec<(u32, String, Vec<String>)>);
+
 /// Split the flat block stream at heading lines and drop dropped-section
 /// bodies (the heading + everything under deeper headings).
-fn drop_section_blocks(
-    body_md: &str,
-    lang: Option<&str>,
-) -> (Vec<String>, Vec<(u32, String, Vec<String>)>) {
+fn drop_section_blocks(body_md: &str, lang: Option<&str>) -> SectionSplit {
     let mut intro: Vec<String> = Vec::new();
     let mut sections: Vec<(u32, String, Vec<String>)> = Vec::new(); // (level, heading, body)
     let mut skip_until = 0u32;
